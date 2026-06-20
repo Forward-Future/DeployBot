@@ -6,6 +6,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 CANONICAL = ROOT / "skills" / "deploybot" / "SKILL.md"
+RELEASE_COMMIT = "f18dce436bae2d6b7009d9aa76b4bfc8d0aac5a8"
 
 
 class DeployBotSkillTest(unittest.TestCase):
@@ -47,6 +48,17 @@ class DeployBotSkillTest(unittest.TestCase):
         ).read_text(encoding="utf-8")
         self.assertIn("queue_plan", rule)
         self.assertIn("never freeze a queue merely to inspect it", rule)
+
+    def test_clients_pin_the_immutable_status_release(self) -> None:
+        paths = [
+            ROOT / "adapters" / "codex" / "agent-merge-queue" / ".mcp.json",
+            ROOT / "adapters" / "claude-code" / ".mcp.json",
+            ROOT / "adapters" / "cursor" / ".cursor" / "mcp.json",
+            ROOT / "examples" / "github-workflow.yml",
+        ]
+        for path in paths:
+            with self.subTest(path=path):
+                self.assertIn(RELEASE_COMMIT, path.read_text(encoding="utf-8"))
 
 
 if __name__ == "__main__":
