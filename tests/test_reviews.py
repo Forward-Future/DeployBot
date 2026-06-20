@@ -202,6 +202,33 @@ class ReviewProviderTest(unittest.TestCase):
         self.assertEqual(verdict.state, "waiting")
         self.assertIsNone(verdict.score)
 
+    def test_missing_optional_bot_score_capture_fails_closed(self) -> None:
+        policy = ReviewProviderConfig(
+            kind="bot",
+            name="Review bot",
+            login="review-bot",
+            minimum_score=4,
+            score_pattern=r"Score:(?:\s*(\d+))?",
+        )
+
+        verdict = evaluate_reviews(
+            [policy],
+            head_sha=HEAD,
+            checks={},
+            comments=[
+                {
+                    "created_at": "2026-06-20T00:00:00Z",
+                    "user": {"login": "review-bot"},
+                    "body": f"Score:\ncommit {HEAD}",
+                }
+            ],
+            reviews=[],
+            threads=[],
+        )[0]
+
+        self.assertEqual(verdict.state, "waiting")
+        self.assertIsNone(verdict.score)
+
 
 if __name__ == "__main__":
     unittest.main()
