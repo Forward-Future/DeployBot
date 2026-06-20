@@ -19,5 +19,5 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
-      # v0.1.1; keep the full commit so privileged workflows are immutable.
-      - uses: Forward-Future/DeployBot@f6bdb6ca0657a06027ed179c9075576ebd956b52
+      # v0.1.2; keep the full commit so privileged workflows are immutable.
+      - uses: Forward-Future/DeployBot@ca9e8b9a6e66e55da25794984a7b3a91fc73a64f
