@@ -1492,6 +1492,10 @@ def build_parser() -> argparse.ArgumentParser:
     inspect.add_argument("--json", action="store_true", dest="json_output")
     plan = subparsers.add_parser("plan", help="show the current ordered queue")
     plan.add_argument("--json", action="store_true", dest="json_output")
+    status = subparsers.add_parser(
+        "status", help="show queue readiness, blockers, and overlaps"
+    )
+    status.add_argument("--json", action="store_true", dest="json_output")
     freeze = subparsers.add_parser("freeze", help="persist one exact queue pass")
     freeze.add_argument("--json", action="store_true", dest="json_output")
     drain = subparsers.add_parser(
@@ -1535,7 +1539,7 @@ def main(argv: list[str] | None = None) -> int:
             print("merge queue labels are ready")
         elif arguments.command == "inspect":
             command_inspect(client, arguments.pr, json_output=arguments.json_output)
-        elif arguments.command == "plan":
+        elif arguments.command in {"plan", "status"}:
             print_plan(client.queue(), json_output=arguments.json_output)
         elif arguments.command == "freeze":
             command_freeze(client, json_output=arguments.json_output)

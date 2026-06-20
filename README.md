@@ -18,6 +18,16 @@ python3 -m pip install \
 deploybot init
 ```
 
+Invoke the bundled `$deploybot` skill to inspect or operate the queue. Typical
+requests include “show the DeployBot queue,” “why is PR 42 blocked?”, and
+“deploy this PR.” Queue-only status is read-only:
+
+```bash
+deploybot status
+deploybot status --json
+deploybot inspect 42 --json
+```
+
 For development from the Astro source tree, install
 `./packages/agent-merge-queue[mcp]` instead.
 
@@ -144,6 +154,7 @@ The `mergeq` and `mergeq-mcp` command aliases remain for compatibility.
 ## Commands
 
 ```text
+deploybot status --json
 deploybot plan --json
 deploybot inspect <pr> --json
 deploybot enqueue <pr>
@@ -154,6 +165,9 @@ deploybot unblock <pr>
 deploybot dequeue <pr> --reason "..."
 deploybot merge <pr> --batch <batch-id>
 ```
+
+`status` is a read-only alias for `plan`. It reports queue order, readiness,
+blockers, dependencies, and overlap groups without freezing a batch.
 
 `drain` merges only independent, green, exact-head-reviewed PRs. Overlapping
 source is returned as `integration_required` for an agent to resolve once. It

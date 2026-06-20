@@ -1,0 +1,13 @@
+---
+description: Inspect DeployBot queue status, blockers, dependencies, and overlap groups
+alwaysApply: false
+---
+
+Read `.mergequeue.toml` and use the `deploybot` MCP tools. For queue status,
+call `queue_plan`; for one pull request, call `inspect_pull_request`. Status
+requests must stay read-only: never freeze a queue merely to inspect it.
+
+Report queue order, readiness, exact heads, pending checks or reviews, blockers,
+dependencies, and source overlaps. Only the user's exact `deploy` instruction
+authorizes enqueueing that conversation's pull request. Only the designated
+coordinator may freeze or drain the queue.

@@ -1,6 +1,6 @@
 {
   "name": "deploybot",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "description": "Review, queue, and land pull requests through a shared GitHub merge queue",
   "author": {
     "name": "DeployBot contributors"

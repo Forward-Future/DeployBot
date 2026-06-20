@@ -26,6 +26,7 @@ from agent_merge_queue.cli import (
     latest_batch_marker,
     latest_marker,
     marker_queued_at,
+    main,
     new_batch,
     overlap_groups,
     queue_state_body,
@@ -74,6 +75,19 @@ def entry(number: int, *paths: str, state: str = "ready") -> QueueEntry:
 
 
 class QueueCoreTest(unittest.TestCase):
+    def test_status_is_a_read_only_plan_alias(self) -> None:
+        queued = [entry(1, "src/app.py")]
+        with (
+            patch("agent_merge_queue.cli.load_config", return_value=CONFIG),
+            patch("agent_merge_queue.cli.GitHub") as github,
+            patch("agent_merge_queue.cli.print_plan") as print_plan,
+        ):
+            github.return_value.queue.return_value = queued
+            result = main(["status", "--json"])
+
+        self.assertEqual(result, 0)
+        print_plan.assert_called_once_with(queued, json_output=True)
+
     def test_dependency_directive_is_configurable(self) -> None:
         body = "Queue-after: #12, #14\nBlocked by #99"
         self.assertEqual(structured_dependencies(body, "Queue-after"), [12, 14])

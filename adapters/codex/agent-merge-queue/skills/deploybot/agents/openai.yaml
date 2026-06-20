@@ -1,0 +1,9 @@
+interface:
+  display_name: "DeployBot"
+  short_description: "Inspect and manage agent merge queues"
+  default_prompt: "Use $deploybot to show the current merge queue and explain what is ready, waiting, or blocked."
+dependencies:
+  tools:
+    - type: "mcp"
+      value: "deploybot"
+      description: "Durable GitHub merge queue operations"
