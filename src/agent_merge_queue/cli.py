@@ -252,6 +252,11 @@ def queue_timestamp(
     return now
 
 
+def marker_queued_at(marker: dict[str, Any] | None) -> str | None:
+    value = marker.get("queued_at") if marker else None
+    return str(value) if value else None
+
+
 def queue_state_body(
     state: str,
     head_sha: str,
@@ -768,7 +773,7 @@ class GitHub:
             url=str(pull["url"]),
             head_sha=head_sha,
             queued_head_sha=str(marker.get("head_sha")) if marker else None,
-            queued_at=str(marker.get("queued_at")) if marker else None,
+            queued_at=marker_queued_at(marker),
             queue_state=str(marker.get("state")) if marker else None,
             is_draft=bool(pull["isDraft"]),
             base_branch=str(pull["baseRefName"]),

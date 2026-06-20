@@ -25,6 +25,7 @@ from agent_merge_queue.cli import (
     generated_only_change,
     latest_batch_marker,
     latest_marker,
+    marker_queued_at,
     new_batch,
     overlap_groups,
     queue_state_body,
@@ -76,6 +77,13 @@ class QueueCoreTest(unittest.TestCase):
     def test_dependency_directive_is_configurable(self) -> None:
         body = "Queue-after: #12, #14\nBlocked by #99"
         self.assertEqual(structured_dependencies(body, "Queue-after"), [12, 14])
+
+    def test_marker_without_queue_time_stays_missing(self) -> None:
+        self.assertIsNone(marker_queued_at({"head_sha": "a" * 40}))
+        self.assertEqual(
+            marker_queued_at({"queued_at": "2026-06-20T00:00:00Z"}),
+            "2026-06-20T00:00:00Z",
+        )
 
     def test_generated_paths_are_configurable(self) -> None:
         self.assertTrue(
