@@ -10,11 +10,11 @@ skips blockers, and reports overlapping source that needs one integration PR.
 
 ## Install
 
-Install the reviewed `v0.1.2` source commit directly from GitHub:
+Install the reviewed `v0.1.3` source commit directly from GitHub:
 
 ```bash
 python3 -m pip install \
-  'deploybot-merge-queue[mcp] @ git+https://github.com/Forward-Future/DeployBot.git@ca9e8b9a6e66e55da25794984a7b3a91fc73a64f'
+  'deploybot-merge-queue[mcp] @ git+https://github.com/Forward-Future/DeployBot.git@7fe247bd1d1994fafcea21817351b3da7e29f611'
 deploybot init
 ```
 
@@ -82,8 +82,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
-      # v0.1.2; keep the full commit so privileged workflows are immutable.
-      - uses: Forward-Future/DeployBot@ca9e8b9a6e66e55da25794984a7b3a91fc73a64f
+      # v0.1.3; keep the full commit so privileged workflows are immutable.
+      - uses: Forward-Future/DeployBot@7fe247bd1d1994fafcea21817351b3da7e29f611
 ```
 
 Keep this workflow on the default branch. Never check out or execute code from
