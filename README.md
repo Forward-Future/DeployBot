@@ -14,7 +14,7 @@ Install the reviewed `v0.1.0` source commit directly from GitHub:
 
 ```bash
 python3 -m pip install \
-  'deploybot-merge-queue[mcp] @ git+https://github.com/Forward-Future/DeployBot.git@DEPLOYBOT_RELEASE_COMMIT'
+  'deploybot-merge-queue[mcp] @ git+https://github.com/Forward-Future/DeployBot.git@0110f877423f60be04003b22561e4bfd95909491'
 deploybot init
 ```
 
@@ -83,7 +83,7 @@ jobs:
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
       # v0.1.0; keep the full commit so privileged workflows are immutable.
-      - uses: Forward-Future/DeployBot@DEPLOYBOT_RELEASE_COMMIT
+      - uses: Forward-Future/DeployBot@0110f877423f60be04003b22561e4bfd95909491
 ```
 
 Keep this workflow on the default branch. Never check out or execute code from
