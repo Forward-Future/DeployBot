@@ -93,7 +93,11 @@ def _latest_score(
         match = pattern.search(body)
         if login != expected_login or not match or head_sha.lower() not in body.lower():
             continue
-        found.append((str(comment.get("created_at") or ""), int(match.group(1))))
+        try:
+            score = int(match.group(1))
+        except (IndexError, ValueError):
+            continue
+        found.append((str(comment.get("created_at") or ""), score))
     return max(found, key=lambda item: item[0])[1] if found else None
 
 

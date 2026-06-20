@@ -1003,10 +1003,14 @@ def command_enqueue(client: GitHub, selector: str | None) -> None:
             + "; ".join(entry.reasons or ["unknown gate"])
         )
 
-    comments = client.comments(number)
-    previous = latest_marker(
-        comments,
-        client.trusted_logins,
+    previous = (
+        {
+            "head_sha": entry.queued_head_sha,
+            "queued_at": entry.queued_at,
+            "state": entry.queue_state,
+        }
+        if entry.queued_head_sha
+        else None
     )
     if (
         client.config.queue_label in entry.labels

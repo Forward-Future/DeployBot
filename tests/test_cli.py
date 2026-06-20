@@ -501,6 +501,7 @@ class QueueCoreTest(unittest.TestCase):
     def test_reenqueue_toggles_label_to_wake_event_coordinator(self) -> None:
         value = entry(1)
         old_head = "a" * 40
+        value.queued_head_sha = old_head
         marker = {
             "created_at": "2026-06-20T00:00:00Z",
             "author_association": "OWNER",
@@ -525,6 +526,7 @@ class QueueCoreTest(unittest.TestCase):
         with redirect_stdout(io.StringIO()):
             command_enqueue(client, "1")
 
+        client.comments.assert_not_called()
         client.remove_label.assert_called_once_with(1, "merge-queue")
         client.add_label.assert_called_once_with(1, "merge-queue")
 
