@@ -10,12 +10,22 @@ skips blockers, and reports overlapping source that needs one integration PR.
 
 ## Install
 
-Install the reviewed `v0.1.3` source commit directly from GitHub:
+Install the reviewed `v0.1.4` source commit directly from GitHub:
 
 ```bash
 python3 -m pip install \
-  'deploybot-merge-queue[mcp] @ git+https://github.com/Forward-Future/DeployBot.git@7fe247bd1d1994fafcea21817351b3da7e29f611'
+  'deploybot-merge-queue[mcp] @ git+https://github.com/Forward-Future/DeployBot.git@f18dce436bae2d6b7009d9aa76b4bfc8d0aac5a8'
 deploybot init
+```
+
+Invoke the bundled `$deploybot` skill to inspect or operate the queue. Typical
+requests include “show the DeployBot queue,” “why is PR 42 blocked?”, and
+“deploy this PR.” Queue-only status is read-only:
+
+```bash
+deploybot status
+deploybot status --json
+deploybot inspect 42 --json
 ```
 
 For development from the Astro source tree, install
@@ -82,8 +92,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
-      # v0.1.3; keep the full commit so privileged workflows are immutable.
-      - uses: Forward-Future/DeployBot@7fe247bd1d1994fafcea21817351b3da7e29f611
+      # v0.1.4; keep the full commit so privileged workflows are immutable.
+      - uses: Forward-Future/DeployBot@f18dce436bae2d6b7009d9aa76b4bfc8d0aac5a8
 ```
 
 Keep this workflow on the default branch. Never check out or execute code from
@@ -144,6 +154,7 @@ The `mergeq` and `mergeq-mcp` command aliases remain for compatibility.
 ## Commands
 
 ```text
+deploybot status --json
 deploybot plan --json
 deploybot inspect <pr> --json
 deploybot enqueue <pr>
@@ -154,6 +165,9 @@ deploybot unblock <pr>
 deploybot dequeue <pr> --reason "..."
 deploybot merge <pr> --batch <batch-id>
 ```
+
+`status` is a read-only alias for `plan`. It reports queue order, readiness,
+blockers, dependencies, and overlap groups without freezing a batch.
 
 `drain` merges only independent, green, exact-head-reviewed PRs. Overlapping
 source is returned as `integration_required` for an agent to resolve once. It
