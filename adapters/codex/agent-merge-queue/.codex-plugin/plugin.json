@@ -1,0 +1,25 @@
+{
+  "name": "deploybot",
+  "version": "0.1.0",
+  "description": "Review, queue, and land pull requests through a shared GitHub merge queue",
+  "author": {
+    "name": "DeployBot contributors"
+  },
+  "license": "MIT",
+  "keywords": ["github", "merge-queue", "pull-requests", "agents"],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "DeployBot",
+    "shortDescription": "Review and land pull requests safely.",
+    "longDescription": "Coordinates exact-head review, manual deploy authorization, burst merging, blockers, and overlapping pull requests.",
+    "developerName": "DeployBot contributors",
+    "category": "Productivity",
+    "capabilities": ["Interactive", "Write"],
+    "defaultPrompt": [
+      "Review this PR and prepare it for the merge queue.",
+      "Deploy this PR through the agent merge queue.",
+      "Show me what is blocking the merge queue."
+    ]
+  },
+  "mcpServers": "./.mcp.json"
+}

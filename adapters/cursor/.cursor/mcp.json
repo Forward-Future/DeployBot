@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "deploybot": {
+      "command": "uvx",
+      "args": [
+        "--from",
+        "deploybot-merge-queue[mcp] @ git+https://github.com/Forward-Future/DeployBot.git@DEPLOYBOT_RELEASE_COMMIT",
+        "deploybot-mcp"
+      ]
+    }
+  }
+}

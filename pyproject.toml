@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "deploybot-merge-queue"
+version = "0.1.0"
+description = "DeployBot: a provider-neutral GitHub merge queue for coding agents"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.11"
+dependencies = []
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+]
+
+[project.optional-dependencies]
+mcp = ["mcp>=1.10,<2"]
+dev = ["build", "mcp>=1.10,<2", "ruff"]
+
+[project.scripts]
+deploybot = "agent_merge_queue.cli:main"
+deploybot-mcp = "agent_merge_queue.mcp_server:main"
+mergeq = "agent_merge_queue.cli:main"
+mergeq-mcp = "agent_merge_queue.mcp_server:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 88
+
+[tool.ruff.lint]
+select = ["E9", "F"]

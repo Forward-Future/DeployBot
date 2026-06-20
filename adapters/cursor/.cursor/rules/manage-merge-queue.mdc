@@ -1,0 +1,13 @@
+---
+description: Review, queue, and safely land pull requests when a PR is ready or the user says deploy
+alwaysApply: true
+---
+
+Read `.mergequeue.toml` and use the `deploybot` MCP tools. Keep changing
+PRs draft and make the final ready head immutable. Address valid feedback from
+whatever review providers the repository configures.
+
+Only the user's exact `deploy` instruction authorizes enqueueing the current
+thread's PR. The queue label wakes GitHub immediately; never poll or merge an
+unlabeled PR. Merge independent ready work in order, skip blockers, honor
+dependencies, and route overlapping source through one integration PR.

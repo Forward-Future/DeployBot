@@ -1,0 +1,9 @@
+{
+  "name": "deploybot",
+  "version": "0.1.0",
+  "description": "DeployBot: a provider-neutral GitHub merge queue for coding agents",
+  "author": {
+    "name": "DeployBot contributors"
+  },
+  "license": "MIT"
+}

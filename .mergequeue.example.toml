@@ -1,0 +1,37 @@
+[queue]
+base_branch = "main"
+queue_label = "merge-queue"
+blocked_label = "merge-queue-blocked"
+merge_method = "merge"
+required_checks = ["CI"]
+dependency_directive = "Merge-queue-depends-on"
+# Add each person allowed to say deploy and enqueue a pull request.
+trusted_actors = ["@repository-owner"]
+coordinator_actors = ["@repository-owner", "github-actions[bot]"]
+
+[files]
+generated_paths = []
+generated_version_paths = [] # Glob patterns are accepted.
+asset_version_pattern = '\?v=[0-9a-f]{12}'
+
+[review]
+# No review service is required by default. Add any combination below.
+
+# [[review.providers]]
+# kind = "github-approvals"
+# name = "Human approval"
+# allowed_reviewers = ["reviewer-login"]
+# minimum_approvals = 1
+
+# [[review.providers]]
+# kind = "check"
+# name = "Agent review"
+# check_name = "Agent Review"
+
+# [[review.providers]]
+# kind = "bot"
+# name = "Review bot"
+# login = "review-bot"
+# check_name = "Review Bot"
+# require_formal_review = true
+# require_resolved_threads = true

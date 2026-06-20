@@ -1,0 +1,20 @@
+name: DeployBot
+description: Drain reviewed pull requests after the merge-queue label is added
+inputs:
+  config:
+    description: Repository-relative merge queue policy path
+    required: false
+    default: .mergequeue.toml
+runs:
+  using: composite
+  steps:
+    - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405
+      with:
+        python-version: "3.11"
+    - shell: bash
+      run: python -m pip install "${{ github.action_path }}"
+    - shell: bash
+      env:
+        DEPLOYBOT_CONFIG: ${{ inputs.config }}
+        GH_TOKEN: ${{ github.token }}
+      run: deploybot --config "$DEPLOYBOT_CONFIG" drain --json

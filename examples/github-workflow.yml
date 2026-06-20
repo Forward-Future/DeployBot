@@ -1,0 +1,23 @@
+name: DeployBot
+
+on:
+  pull_request_target:
+    types: [labeled]
+
+permissions:
+  contents: write
+  pull-requests: write
+  checks: read
+
+concurrency:
+  group: deploybot-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  drain:
+    if: github.event.label.name == 'merge-queue'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      # v0.1.0; keep the full commit so privileged workflows are immutable.
+      - uses: Forward-Future/DeployBot@DEPLOYBOT_RELEASE_COMMIT
