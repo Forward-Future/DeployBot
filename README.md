@@ -11,11 +11,11 @@ integration PRs, follows `main` through production, and pauses after failures.
 
 ## Install
 
-Install the reviewed `v0.2.4` source commit directly from GitHub:
+Install the reviewed `v0.2.5` source commit directly from GitHub:
 
 ```bash
 python3 -m pip install \
-  'deploybot-merge-queue[mcp] @ git+https://github.com/Forward-Future/DeployBot.git@9986210b077ebb4c53f2c5b1bbd461ba02dfce19'
+  'deploybot-merge-queue[mcp] @ git+https://github.com/Forward-Future/DeployBot.git@94fe042a58c731343c8bbd73d0bdfcb38a55866f'
 deploybot init
 ```
 
@@ -86,16 +86,44 @@ aligned with `pipeline.ci_workflows`. The privileged worker never checks out or
 executes pull-request code. Pin the Action to the full reviewed release commit:
 
 ```yaml
-- uses: Forward-Future/DeployBot@9986210b077ebb4c53f2c5b1bbd461ba02dfce19
+- uses: Forward-Future/DeployBot@94fe042a58c731343c8bbd73d0bdfcb38a55866f
 ```
 
 The Action uses GitHub's built-in workflow token. GitHub intentionally does not
 turn merges made by that token into ordinary `push` workflow runs, so DeployBot
-dispatches each configured CI workflow once after it merges a batch. Those CI
-workflows must accept `workflow_dispatch`; the resulting completed CI run can
-trigger the repository's normal deployment workflow. Set Action input
-`dispatch_ci: "false"` only when a caller supplies a different merge identity
-that already triggers push CI.
+dispatches each configured CI workflow once after it merges a batch. GitHub can
+also suppress the usual `workflow_run` handoff after that token-driven CI run,
+so DeployBot explicitly dispatches each configured deployment workflow after
+exact-main CI succeeds. CI workflows must accept `workflow_dispatch`.
+Deployment workflows must accept `workflow_dispatch` inputs named `ci_sha` and
+`ci_run_id`, verify that run through the GitHub API, and deploy only when it is
+successful CI for the current base-branch head. Skipped deployment wake-ups
+from pull-request CI are ignored. Set Action input `dispatch_ci: "false"` only
+when a caller supplies a different merge identity that already triggers push
+CI.
+
+The deployment workflow keeps its normal `workflow_run` trigger for push CI
+and adds this exact-input recovery path for DeployBot-dispatched CI:
+
+```yaml
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      ci_sha:
+        required: true
+        type: string
+      ci_run_id:
+        required: true
+        type: string
+```
+
+Before releasing, use `ci_run_id` to read the run from GitHub and require its
+workflow name, base branch, head SHA, event, status, and conclusion to match the
+expected successful exact-main CI run. The deployment must still pull the
+current base branch and stop if it no longer equals `ci_sha`.
 
 The workflow bot and each person allowed to request deployment must be
 explicitly listed:
