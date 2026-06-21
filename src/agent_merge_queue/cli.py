@@ -3450,6 +3450,30 @@ def command_react(
         promoted["blocked"] = promoted["blocked"] + settled["blocked"]
         promoted["waiting"] = settled["waiting"]
         captured_entries = settled_entries
+
+    drained: dict[str, Any] = {}
+    queued_integrations: set[int] = set()
+    if client.config.integration.mode == "all":
+        queued_numbers = set(client.queued_numbers())
+        queued_integrations = queued_numbers.intersection(
+            client.integration_pull_request_numbers()
+        )
+        if queued_integrations:
+            # A ready integration PR owns an earlier frozen source batch. Drain
+            # those integration PRs first, while holding newly queued sources,
+            # so the older integration cannot suppress all-mode integration of
+            # the new work or let that work merge directly.
+            integration_frozen = freeze_queue(
+                client,
+                held_numbers=queued_numbers - queued_integrations,
+            )
+            drained = command_drain(
+                client,
+                json_output=False,
+                emit=False,
+                initial_frozen=integration_frozen,
+            )
+
     overlap_holds = near_ready_overlap_holds(client, captured_entries)
     promoted["held"] = [
         {
@@ -3459,24 +3483,26 @@ def command_react(
         }
         for number, waiting in overlap_holds.items()
     ]
-    frozen = freeze_queue(
-        client,
-        known_entries=captured_entries,
-        held_numbers=set(overlap_holds),
-    )
+    merged_integrations = {
+        int(value["number"]) for value in drained.get("merged") or []
+    }
+    if queued_integrations - merged_integrations:
+        frozen = FreezeResult(None, [], [], [], [])
+    else:
+        frozen = freeze_queue(
+            client,
+            known_entries=captured_entries,
+            held_numbers=set(overlap_holds),
+        )
     integrations: list[dict[str, Any]] = []
-    if (
-        frozen.batch is not None
-        and client.config.integration.mode == "all"
-        and not promoted_integrations
-    ):
+    if frozen.batch is not None and client.config.integration.mode == "all":
         integrations.append(
             client.create_integration_pull_request(
                 batch=frozen.batch,
                 entries=frozen.queue,
             )
         )
-        drained: dict[str, Any] = {
+        deferred_drain: dict[str, Any] = {
             "batch_id": frozen.batch["batch_id"],
             "batch_ids": [frozen.batch["batch_id"]],
             "merged": [],
@@ -3484,6 +3510,11 @@ def command_react(
             "integration_required": frozen.overlap_groups,
             "next_batch": [],
         }
+        drained = (
+            combine_drain_results(drained, deferred_drain)
+            if drained
+            else deferred_drain
+        )
     else:
         if (
             frozen.batch is not None
@@ -3504,8 +3535,6 @@ def command_react(
                     entries=overlap_entries,
                 )
             )
-        drained = {}
-
     created_clean = [
         int(value["number"])
         for value in integrations

@@ -1677,6 +1677,8 @@ class QueueCoreTest(unittest.TestCase):
         client.config = config
         client.coordinator_logins = {"coordinator"}
         client.pipeline_control.return_value = {"state": "running"}
+        client.queued_numbers.return_value = []
+        client.integration_pull_request_numbers.return_value = []
         client.create_integration_pull_request.return_value = {
             "number": 99,
             "conflict": None,
@@ -1709,6 +1711,104 @@ class QueueCoreTest(unittest.TestCase):
         drain.assert_called_once_with(client, json_output=False, emit=False)
         self.assertEqual(result["integrations"][0]["number"], 99)
         self.assertEqual(result["drain"]["merged"][0]["number"], 99)
+
+    def test_reactor_drains_existing_integration_before_new_all_mode_batch(
+        self,
+    ) -> None:
+        config = parse_config(
+            {
+                "queue": {
+                    "required_checks": ["CI"],
+                    "trusted_actors": ["trusted"],
+                    "coordinator_actors": ["coordinator"],
+                },
+                "integration": {"mode": "all"},
+            }
+        )
+        existing = entry(99, "old.py")
+        source = entry(1, "new.py")
+        existing_batch = new_batch([existing], frozen_at="2026-06-20T00:00:00Z")
+        source_batch = new_batch([source], frozen_at="2026-06-20T00:01:00Z")
+        existing_frozen = FreezeResult(existing_batch, [existing], [], [], [])
+        source_frozen = FreezeResult(source_batch, [source], [], [], [])
+        old_drain = {
+            "batch_id": existing_batch["batch_id"],
+            "batch_ids": [existing_batch["batch_id"]],
+            "integration_required": [],
+            "merged": [{"number": 99, "merge_sha": "a" * 40}],
+            "next_batch": [],
+            "waiting": [],
+        }
+        new_drain = {
+            "batch_id": "new-integration",
+            "batch_ids": ["new-integration"],
+            "integration_required": [],
+            "merged": [{"number": 100, "merge_sha": "b" * 40}],
+            "next_batch": [],
+            "waiting": [],
+        }
+        client = Mock()
+        client.config = config
+        client.coordinator_logins = {"coordinator"}
+        client.pipeline_control.return_value = {"state": "running"}
+        client.queued_numbers.return_value = [1, 99]
+        client.integration_pull_request_numbers.return_value = [99]
+        client.create_integration_pull_request.return_value = {
+            "number": 100,
+            "conflict": None,
+        }
+        with (
+            patch(
+                "agent_merge_queue.cli.settle_integration_checks",
+                side_effect=[[], [{"pull_request": 100, "state": "ready"}]],
+            ),
+            patch(
+                "agent_merge_queue.cli.promote_integrations",
+                side_effect=[[], [100]],
+            ),
+            patch(
+                "agent_merge_queue.cli.command_promote",
+                return_value={"promoted": [], "waiting": [], "blocked": []},
+            ),
+            patch(
+                "agent_merge_queue.cli.freeze_queue",
+                side_effect=[existing_frozen, source_frozen],
+            ) as freeze,
+            patch(
+                "agent_merge_queue.cli.command_drain",
+                side_effect=[old_drain, new_drain],
+            ) as drain,
+            redirect_stdout(io.StringIO()),
+        ):
+            result = command_react(client, follow=False, timeout_seconds=10)
+
+        self.assertEqual(
+            freeze.call_args_list,
+            [
+                call(client, held_numbers={1}),
+                call(client, known_entries=[], held_numbers=set()),
+            ],
+        )
+        self.assertEqual(
+            drain.call_args_list,
+            [
+                call(
+                    client,
+                    json_output=False,
+                    emit=False,
+                    initial_frozen=existing_frozen,
+                ),
+                call(client, json_output=False, emit=False),
+            ],
+        )
+        client.create_integration_pull_request.assert_called_once_with(
+            batch=source_batch,
+            entries=[source],
+        )
+        self.assertEqual(
+            [value["number"] for value in result["drain"]["merged"]],
+            [99, 100],
+        )
 
     def test_reactor_establishes_overlap_integration_before_draining(self) -> None:
         config = parse_config(
@@ -1957,6 +2057,8 @@ class QueueCoreTest(unittest.TestCase):
         client.config = config
         client.coordinator_logins = {"coordinator"}
         client.pipeline_control.return_value = {"state": "running"}
+        client.queued_numbers.return_value = []
+        client.integration_pull_request_numbers.return_value = []
         client.create_integration_pull_request.return_value = {
             "number": 99,
             "conflict": {"number": 2, "reason": "merge conflict"},
