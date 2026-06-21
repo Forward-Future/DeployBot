@@ -457,6 +457,7 @@ class QueueCoreTest(unittest.TestCase):
 
     def test_repair_overlap_hold_is_bounded_and_intent_scoped(self) -> None:
         value = entry(7, state="blocked")
+        value.labels = ["deploy-requested", "merge-queue-blocked"]
         intent = {"intent_id": "intent-7"}
         repair = {
             "created_at": "2026-06-21T12:00:00Z",
@@ -552,6 +553,7 @@ class QueueCoreTest(unittest.TestCase):
 
         self.assertEqual(repair["intent_id"], "intent-new")
         self.assertEqual(repair["hold_started_at"], "2026-06-21T13:00:00Z")
+        self.assertIn("merge-queue-blocked", value.labels)
         client.comment.assert_called_once_with(7, repair_body(repair))
 
     def test_reconciles_an_externally_merged_requested_thread(self) -> None:
@@ -2510,6 +2512,52 @@ class QueueCoreTest(unittest.TestCase):
         self.assertEqual(result["promoted"], [])
         self.assertIn("deploybot resume", result["waiting"][0]["reasons"][0])
         client.add_label.assert_not_called()
+
+    def test_promote_does_not_hold_resumed_repair_against_itself(self) -> None:
+        ready = entry(1)
+        ready.labels = ["deploy-requested", "merge-queue"]
+        intent_comment = {
+            "id": 1,
+            "created_at": "2026-06-20T00:00:00Z",
+            "user": {"login": "trusted"},
+            "body": intent_body(
+                intent_id="intent-1",
+                state="requested",
+                requested_at="2026-06-20T00:00:00Z",
+                requested_head=ready.head_sha,
+            ),
+        }
+        repair_comment = {
+            "id": 2,
+            "created_at": "2026-06-20T00:01:00Z",
+            "user": {"login": "coordinator"},
+            "body": repair_body(
+                {
+                    "created_at": "2026-06-20T00:01:00Z",
+                    "head_sha": ready.head_sha,
+                    "hold_started_at": "2026-06-20T00:01:00Z",
+                    "intent_id": "intent-1",
+                    "pull_request": 1,
+                    "reason": "pull request conflicts with main",
+                }
+            ),
+        }
+        client = Mock()
+        client.config = CONFIG
+        client.repository = "example/repo"
+        client.trusted_logins = {"trusted"}
+        client.coordinator_logins = {"coordinator"}
+        client.intent_numbers.return_value = [1]
+        client.active_integration_sources.return_value = set()
+        client.comments.return_value = [intent_comment, repair_comment]
+        client.snapshot.return_value = ready
+
+        captured: list[QueueEntry] = []
+        with redirect_stdout(io.StringIO()):
+            command_promote(client, captured_entries=captured)
+
+        self.assertFalse(captured[0].repair_overlap_hold)
+        self.assertEqual(near_ready_overlap_holds(client, captured), {})
 
     def test_promote_clears_a_transitional_draft_block(self) -> None:
         ready = entry(1)

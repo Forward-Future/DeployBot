@@ -650,6 +650,8 @@ def repair_overlap_hold_active(
     """Keep genuine repairs in overlap scheduling without authorizing a merge."""
     if not repair or repair_marker_is_transitional(repair):
         return False
+    if client.config.blocked_label not in entry.labels:
+        return False
     if str(repair.get("intent_id") or "") != str(intent.get("intent_id") or ""):
         return False
     if str(repair.get("pull_request") or "") != str(entry.number):
@@ -2592,6 +2594,8 @@ def record_repair(
     labels = client.labels(entry.number)
     if client.config.blocked_label not in labels:
         client.add_label(entry.number, client.config.blocked_label)
+    if client.config.blocked_label not in entry.labels:
+        entry.labels.append(client.config.blocked_label)
     if payload.get("provider") and payload.get("thread_id"):
         client.record_thread(
             ThreadRecord(
@@ -4308,7 +4312,10 @@ def should_settle_batch(client: GitHub, entries: list[QueueEntry]) -> bool:
         for entry in entries
     )
     has_near_ready = any(
-        entry.repair_overlap_hold
+        (
+            entry.repair_overlap_hold
+            and client.config.blocked_label in entry.labels
+        )
         or (
             client.config.queue_label not in entry.labels
             and client.config.blocked_label not in entry.labels
@@ -4335,7 +4342,10 @@ def near_ready_overlap_holds(
     waiting = {
         entry.number: entry
         for entry in entries
-        if entry.repair_overlap_hold
+        if (
+            entry.repair_overlap_hold
+            and client.config.blocked_label in entry.labels
+        )
         or (
             entry.state == "waiting"
             and client.config.queue_label not in entry.labels
