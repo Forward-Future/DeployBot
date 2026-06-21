@@ -7,6 +7,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 CANONICAL = ROOT / "skills" / "deploybot" / "SKILL.md"
 RELEASE_COMMIT = "2e884f65f182f6a9ddc4c4785288045bdf98f188"
+CHECKOUT_COMMIT = "9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0"
 
 
 class DeployBotSkillTest(unittest.TestCase):
@@ -55,6 +56,15 @@ class DeployBotSkillTest(unittest.TestCase):
         self.assertIn("workflows: [CI]", workflow)
         self.assertIn("github.event.repository.default_branch", workflow)
         self.assertIn("persist-credentials: false", workflow)
+
+    def test_workflows_pin_current_checkout_runtime(self) -> None:
+        paths = [
+            ROOT / ".github" / "workflows" / "ci.yml",
+            ROOT / "examples" / "github-workflow.yml",
+        ]
+        for path in paths:
+            with self.subTest(path=path):
+                self.assertIn(CHECKOUT_COMMIT, path.read_text(encoding="utf-8"))
 
     def test_clients_pin_the_immutable_status_release(self) -> None:
         paths = [
