@@ -2559,6 +2559,7 @@ def record_repair(
         previous
         and previous.get("head_sha") == entry.head_sha
         and previous.get("reason") == reason
+        and previous.get("intent_id") == (intent or {}).get("intent_id")
     ):
         return previous
     created_at = utc_now()

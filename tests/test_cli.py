@@ -52,6 +52,7 @@ from agent_merge_queue.cli import (
     queue_from_intent,
     queue_timestamp,
     reconcile_externally_merged_threads,
+    record_repair,
     repair_overlap_hold_active,
     reusable_batch,
     settle_integration_checks,
@@ -513,6 +514,45 @@ class QueueCoreTest(unittest.TestCase):
                 now="2026-06-21T12:50:01Z",
             )
         )
+
+    @patch("agent_merge_queue.cli.utc_now", return_value="2026-06-21T13:00:00Z")
+    def test_record_repair_does_not_reuse_marker_from_previous_intent(
+        self,
+        _utc_now: Mock,
+    ) -> None:
+        value = entry(7, state="blocked")
+        previous = {
+            "created_at": "2026-06-21T12:00:00Z",
+            "head_sha": value.head_sha,
+            "hold_started_at": "2026-06-21T12:00:00Z",
+            "intent_id": "intent-old",
+            "pull_request": 7,
+            "reason": "pull request conflicts with main",
+        }
+        client = Mock()
+        client.config = CONFIG
+        client.repository = "example/repo"
+        client.coordinator_logins = {"coordinator"}
+        client.comments.return_value = [
+            {
+                "body": repair_body(previous),
+                "created_at": previous["created_at"],
+                "user": {"login": "coordinator"},
+            }
+        ]
+        client.base_sha.return_value = "b" * 40
+        client.labels.return_value = []
+
+        repair = record_repair(
+            client,
+            value,
+            {"intent_id": "intent-new"},
+            str(previous["reason"]),
+        )
+
+        self.assertEqual(repair["intent_id"], "intent-new")
+        self.assertEqual(repair["hold_started_at"], "2026-06-21T13:00:00Z")
+        client.comment.assert_called_once_with(7, repair_body(repair))
 
     def test_reconciles_an_externally_merged_requested_thread(self) -> None:
         head_sha = "a" * 40
