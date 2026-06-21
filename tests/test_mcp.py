@@ -1,12 +1,19 @@
 from __future__ import annotations
 
+import importlib.util
 import unittest
 from subprocess import CompletedProcess
 from unittest.mock import patch
 
-from agent_merge_queue.mcp_server import _run
+
+MCP_AVAILABLE = importlib.util.find_spec("mcp") is not None
+if MCP_AVAILABLE:
+    from agent_merge_queue.mcp_server import _run
+else:
+    _run = None
 
 
+@unittest.skipUnless(MCP_AVAILABLE, "the optional MCP extra is not installed")
 class McpTest(unittest.TestCase):
     def test_diagnose_can_return_failed_report_payload(self) -> None:
         completed = CompletedProcess(

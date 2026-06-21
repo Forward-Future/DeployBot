@@ -1,4 +1,4 @@
 interface:
   display_name: "Manage Merge Queue"
-  short_description: "Review, queue, and land pull requests safely"
-  default_prompt: "Use $manage-merge-queue to review and enqueue my pull request, then coordinate the merge queue."
+  short_description: "Review and deliver pull requests safely"
+  default_prompt: "Use $manage-merge-queue to review my pull request, record deploy intent, and let DeployBot deliver it."
