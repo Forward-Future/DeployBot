@@ -126,6 +126,12 @@ class DeployBotSkillTest(unittest.TestCase):
             with self.subTest(path=path):
                 self.assertIn(CHECKOUT_COMMIT, path.read_text(encoding="utf-8"))
 
+    def test_ci_runs_when_draft_becomes_ready(self) -> None:
+        workflow = (ROOT / ".github" / "workflows" / "ci.yml").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("ready_for_review", workflow)
+
     def test_action_dispatches_ci_after_builtin_token_merge(self) -> None:
         action = (ROOT / "action.yml").read_text(encoding="utf-8")
         example = (ROOT / "examples" / "github-workflow.yml").read_text(
