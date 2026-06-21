@@ -185,6 +185,7 @@ def follow_release(
 ) -> dict[str, Any]:
     deadline = time.monotonic() + timeout_seconds
     observed_sha = ""
+    last_verifications: list[dict[str, Any]] = []
     while True:
         main_sha = client.base_sha()
         runs = client.workflow_runs()
@@ -196,13 +197,19 @@ def follow_release(
             return {**value, "verifications": []}
         if value["state"] == "verified":
             checks = http_verifications(client.config.pipeline)
+            last_verifications = checks
             if all(item["passed"] for item in checks):
                 return {**value, "verifications": checks}
         if time.monotonic() >= deadline:
+            state = (
+                "verify-failed"
+                if value["state"] == "verified" and last_verifications
+                else "timed-out"
+            )
             return {
                 **value,
-                "state": "timed-out",
+                "state": state,
                 "observed_sha": observed_sha,
-                "verifications": [],
+                "verifications": last_verifications,
             }
         time.sleep(poll_seconds)

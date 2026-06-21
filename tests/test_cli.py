@@ -4,7 +4,7 @@ import io
 import json
 import unittest
 from contextlib import redirect_stdout
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, call, patch
 
 from agent_merge_queue.cli import (
     FreezeResult,
@@ -240,6 +240,46 @@ class QueueCoreTest(unittest.TestCase):
         )
 
         self.assertEqual(client.queued_numbers(), list(range(1, 151)))
+
+    def test_workflow_history_uses_every_paginated_page(self) -> None:
+        client = object.__new__(GitHub)
+        client.config = CONFIG
+        client.repository = "example/repo"
+        client._json = Mock(
+            return_value=[
+                {"workflow_runs": [{"id": number} for number in range(1, 101)]},
+                {"workflow_runs": [{"id": number} for number in range(101, 151)]},
+            ]
+        )
+
+        self.assertEqual(
+            [run["id"] for run in client.workflow_runs()], list(range(1, 151))
+        )
+        client._json.assert_called_once_with(
+            "api",
+            "--paginate",
+            "--slurp",
+            "repos/example/repo/actions/runs?branch=main&per_page=100",
+        )
+
+    def test_integration_status_requires_every_source_authorization(self) -> None:
+        client = object.__new__(GitHub)
+        client.source_deploy_authorized = Mock(return_value=True)
+        integration = {
+            "heads": {"1": "a" * 40, "2": "b" * 40},
+            "pull_requests": [1, 2],
+        }
+
+        self.assertTrue(client.integration_sources_authorized(integration))
+        client.source_deploy_authorized.assert_has_calls(
+            [
+                call(1, "a" * 40),
+                call(2, "b" * 40),
+            ]
+        )
+        client.source_deploy_authorized.reset_mock(side_effect=True)
+        client.source_deploy_authorized.side_effect = [True, False]
+        self.assertFalse(client.integration_sources_authorized(integration))
 
     def test_dependency_must_be_on_configured_base_branch(self) -> None:
         client = object.__new__(GitHub)
@@ -839,6 +879,47 @@ class QueueCoreTest(unittest.TestCase):
         self.assertIsNone(
             effective_queue_marker(
                 [stale_intent, delegated], {"trusted"}, {"coordinator"}
+            )
+        )
+
+        integration = {
+            "id": 3,
+            "created_at": "2026-06-20T00:02:00Z",
+            "user": {"login": "coordinator"},
+            "body": integration_body(
+                {
+                    "batch_id": "batch-1",
+                    "heads": {"1": sha},
+                    "pull_requests": [1],
+                }
+            ),
+        }
+        integration_marker = {
+            "id": 4,
+            "created_at": "2026-06-20T00:03:00Z",
+            "user": {"login": "coordinator"},
+            "body": queue_state_body(
+                "queued",
+                sha,
+                queued_at="2026-06-20T00:03:00Z",
+                integration_batch_id="batch-1",
+            ),
+        }
+        self.assertEqual(
+            effective_queue_marker(
+                [integration, integration_marker],
+                {"trusted"},
+                {"coordinator"},
+                integration_authorized=lambda _: True,
+            ),
+            latest_marker([integration_marker], {"coordinator"}),
+        )
+        self.assertIsNone(
+            effective_queue_marker(
+                [integration, integration_marker],
+                {"trusted"},
+                {"coordinator"},
+                integration_authorized=lambda _: False,
             )
         )
 

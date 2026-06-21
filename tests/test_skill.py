@@ -6,7 +6,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 CANONICAL = ROOT / "skills" / "deploybot" / "SKILL.md"
-RELEASE_COMMIT = "c9e3d6976b372ef5bcbb2986b0afd6bb1afe9470"
+RELEASE_COMMIT = "9986210b077ebb4c53f2c5b1bbd461ba02dfce19"
 CHECKOUT_COMMIT = "9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0"
 
 
@@ -55,6 +55,14 @@ class DeployBotSkillTest(unittest.TestCase):
         self.assertIn("workflow_run:", workflow)
         self.assertIn("workflows: [CI]", workflow)
         self.assertIn("github.event.repository.default_branch", workflow)
+        self.assertIn(
+            "github.event.pull_request.head.repo.full_name == github.repository",
+            workflow,
+        )
+        self.assertIn(
+            "github.event.check_suite.app.slug != 'github-actions'", workflow
+        )
+        self.assertIn("github.event.check_suite.pull_requests[0].base.ref", workflow)
         self.assertIn("persist-credentials: false", workflow)
 
     def test_workflows_pin_current_checkout_runtime(self) -> None:

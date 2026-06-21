@@ -27,15 +27,33 @@ concurrency:
 jobs:
   react:
     if: >-
-      github.event_name != 'pull_request_target' ||
-      github.event.action != 'labeled' ||
-      github.event.label.name == 'deploy-requested' ||
-      github.event.label.name == 'merge-queue'
+      (
+        github.event_name != 'pull_request_target' ||
+        (
+          github.event.action == 'labeled' &&
+          (
+            github.event.label.name == 'deploy-requested' ||
+            github.event.label.name == 'merge-queue'
+          )
+        ) ||
+        (
+          github.event.action != 'labeled' &&
+          github.event.pull_request.head.repo.full_name == github.repository
+        )
+      ) &&
+      (
+        github.event_name != 'check_suite' ||
+        (
+          github.event.check_suite.app.slug != 'github-actions' &&
+          github.event.check_suite.pull_requests[0].base.ref ==
+            github.event.repository.default_branch
+        )
+      )
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
         with:
           ref: ${{ github.event.repository.default_branch }}
           persist-credentials: false
-      # v0.2.3 implementation; keep the full commit for privileged workflows.
-      - uses: Forward-Future/DeployBot@c9e3d6976b372ef5bcbb2986b0afd6bb1afe9470
+      # v0.2.4 implementation; keep the full commit for privileged workflows.
+      - uses: Forward-Future/DeployBot@9986210b077ebb4c53f2c5b1bbd461ba02dfce19
