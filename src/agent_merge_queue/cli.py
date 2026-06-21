@@ -15,7 +15,7 @@ import time
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
 from . import __version__
 from .config import ConfigError, QueueConfig, initialize_config, load_config
@@ -319,6 +319,7 @@ def effective_queue_marker(
     coordinator_logins: Iterable[str],
     *,
     intent_scope: str = "head",
+    integration_authorized: Callable[[dict[str, Any]], bool] | None = None,
 ) -> dict[str, Any] | None:
     """Accept coordinator state only when rooted in a live trusted deploy intent."""
     values = list(comments)
@@ -341,6 +342,10 @@ def effective_queue_marker(
         delegated
         and integration
         and delegated.get("integration_batch_id") == integration.get("batch_id")
+        and (
+            integration_authorized is None
+            or integration_authorized(integration)
+        )
     ):
         return delegated
     return direct
@@ -354,6 +359,19 @@ def coordinator_logins(client: Any) -> set[str]:
     if isinstance(trusted, (set, frozenset, list, tuple)):
         return {str(item) for item in trusted}
     return set()
+
+
+def queue_marker_for_client(
+    client: Any, comments: Iterable[dict[str, Any]]
+) -> dict[str, Any] | None:
+    validator = getattr(client, "integration_sources_authorized", None)
+    return effective_queue_marker(
+        comments,
+        client.trusted_logins,
+        coordinator_logins(client),
+        intent_scope=client.config.pipeline.intent_scope,
+        integration_authorized=validator if callable(validator) else None,
+    )
 
 
 def require_running_pipeline(client: Any) -> None:
@@ -785,14 +803,53 @@ class GitHub:
         return str(value["sha"])
 
     def workflow_runs(self) -> list[dict[str, Any]]:
-        value = self._json(
-            "api",
+        return self._paged_object_items(
             f"repos/{self.repository}/actions/runs?branch={self.config.base_branch}&per_page=100",
+            "workflow_runs",
         )
-        runs = value.get("workflow_runs") if isinstance(value, dict) else None
-        if not isinstance(runs, list):
-            raise QueueError("GitHub returned invalid workflow-run data")
-        return [run for run in runs if isinstance(run, dict)]
+
+    def source_deploy_authorized(self, number: int, expected_head: str) -> bool:
+        source = self._json(
+            "pr",
+            "view",
+            str(number),
+            "--repo",
+            self.repository,
+            "--json",
+            "headRefOid",
+        )
+        if source.get("headRefOid") != expected_head:
+            return False
+        comments = self.comments(number)
+        intent = latest_intent(comments, self.trusted_logins)
+        direct = latest_marker(comments, self.trusted_logins)
+        return bool(
+            (
+                intent
+                and intent.get("state") == "requested"
+                and intent.get("requested_head") == expected_head
+            )
+            or (
+                direct
+                and direct.get("state") == "queued"
+                and direct.get("head_sha") == expected_head
+            )
+        )
+
+    def integration_sources_authorized(self, integration: dict[str, Any]) -> bool:
+        expected_heads = integration.get("heads") or {}
+        sources = integration.get("pull_requests") or []
+        if not sources:
+            return False
+        for value in sources:
+            try:
+                number = int(value)
+            except (TypeError, ValueError):
+                return False
+            expected = str(expected_heads.get(str(number)) or "")
+            if not expected or not self.source_deploy_authorized(number, expected):
+                return False
+        return True
 
     def dispatch_ci_workflows(self) -> list[dict[str, Any]]:
         configured = self.config.pipeline.ci_workflows
@@ -1044,6 +1101,19 @@ class GitHub:
             values.extend(item for item in page if isinstance(item, dict))
         return values
 
+    def _paged_object_items(
+        self, endpoint: str, key: str
+    ) -> list[dict[str, Any]]:
+        data = self._json("api", "--paginate", "--slurp", endpoint)
+        pages = data if isinstance(data, list) else []
+        values: list[dict[str, Any]] = []
+        for page in pages:
+            items = page.get(key) if isinstance(page, dict) else None
+            if not isinstance(items, list):
+                raise QueueError(f"unexpected GitHub response for {endpoint}")
+            values.extend(item for item in items if isinstance(item, dict))
+        return values
+
     def comments(self, number: int) -> list[dict[str, Any]]:
         return self._paged_api(
             f"repos/{self.repository}/issues/{number}/comments?per_page=100"
@@ -1127,12 +1197,7 @@ class GitHub:
             for provider in self.config.review_providers
         )
         threads = self.review_threads(number) if needs_threads else []
-        marker = effective_queue_marker(
-            comments,
-            self.trusted_logins,
-            self.coordinator_logins,
-            intent_scope=self.config.pipeline.intent_scope,
-        )
+        marker = queue_marker_for_client(self, comments)
         head_sha = str(pull["headRefOid"])
         checks = check_states(pull.get("statusCheckRollup") or [])
         changed_files = self.files(number)
@@ -1302,12 +1367,7 @@ class GitHub:
             raise QueueError(f"PR #{number} changed immediately before merge")
         if self.config.queue_label not in labels or self.config.blocked_label in labels:
             raise QueueError(f"PR #{number} queue authorization was revoked")
-        marker = effective_queue_marker(
-            self.comments(number),
-            self.trusted_logins,
-            getattr(self, "coordinator_logins", self.trusted_logins),
-            intent_scope=self.config.pipeline.intent_scope,
-        )
+        marker = queue_marker_for_client(self, self.comments(number))
         if (
             not marker
             or marker.get("state") != "queued"
@@ -1326,34 +1386,10 @@ class GitHub:
             expected_heads = integration.get("heads") or {}
             for source_number in integration.get("pull_requests") or []:
                 source_number = int(source_number)
-                source = self._json(
-                    "pr",
-                    "view",
-                    str(source_number),
-                    "--repo",
-                    self.repository,
-                    "--json",
-                    "headRefOid",
-                )
                 expected = str(expected_heads.get(str(source_number)) or "")
-                if not expected or source.get("headRefOid") != expected:
-                    raise QueueError(
-                        f"source PR #{source_number} changed after integration freeze"
-                    )
-                source_comments = self.comments(source_number)
-                intent = latest_intent(source_comments, self.trusted_logins)
-                direct_marker = latest_marker(source_comments, self.trusted_logins)
-                has_intent = bool(
-                    intent
-                    and intent.get("state") == "requested"
-                    and intent.get("requested_head") == expected
-                )
-                has_direct_authorization = bool(
-                    direct_marker
-                    and direct_marker.get("state") == "queued"
-                    and direct_marker.get("head_sha") == expected
-                )
-                if not has_intent and not has_direct_authorization:
+                if not expected or not self.source_deploy_authorized(
+                    source_number, expected
+                ):
                     raise QueueError(
                         f"source PR #{source_number} deploy authorization was revoked"
                     )
@@ -1999,12 +2035,7 @@ def queue_from_intent(
             "run deploybot refresh-request after fresh review"
         )
     comments = client.comments(entry.number)
-    previous = effective_queue_marker(
-        comments,
-        client.trusted_logins,
-        coordinator_logins(client),
-        intent_scope=client.config.pipeline.intent_scope,
-    )
+    previous = queue_marker_for_client(client, comments)
     queued_at = queue_timestamp(
         previous,
         already_queued=client.config.queue_label in entry.labels,
@@ -2158,12 +2189,7 @@ def command_block(client: GitHub, selector: str | None, reason: str) -> None:
     client.ensure_labels()
     entry = client.snapshot(number, require_marker=False, allow_blocked_label=True)
     comments = client.comments(number)
-    previous = effective_queue_marker(
-        comments,
-        client.trusted_logins,
-        coordinator_logins(client),
-        intent_scope=client.config.pipeline.intent_scope,
-    )
+    previous = queue_marker_for_client(client, comments)
     if (
         not previous
         or previous.get("state") != "queued"
@@ -2195,12 +2221,7 @@ def command_block(client: GitHub, selector: str | None, reason: str) -> None:
 def command_unblock(client: GitHub, selector: str | None) -> None:
     number = client.resolve_pr(selector)
     entry = client.snapshot(number, require_marker=False, allow_blocked_label=True)
-    previous = effective_queue_marker(
-        client.comments(number),
-        client.trusted_logins,
-        coordinator_logins(client),
-        intent_scope=client.config.pipeline.intent_scope,
-    )
+    previous = queue_marker_for_client(client, client.comments(number))
     if (
         not previous
         or previous.get("state") != "blocked"
@@ -2228,12 +2249,7 @@ def command_unblock(client: GitHub, selector: str | None) -> None:
 def command_dequeue(client: GitHub, selector: str | None, reason: str) -> None:
     number = client.resolve_pr(selector)
     entry = client.snapshot(number, require_marker=False, allow_blocked_label=True)
-    previous = effective_queue_marker(
-        client.comments(number),
-        client.trusted_logins,
-        coordinator_logins(client),
-        intent_scope=client.config.pipeline.intent_scope,
-    )
+    previous = queue_marker_for_client(client, client.comments(number))
     labels = client.labels(number)
     if client.config.blocked_label not in labels:
         client.add_label(number, client.config.blocked_label)
@@ -2577,7 +2593,7 @@ def command_follow(
         poll_seconds=poll_seconds,
     )
     if (
-        result["state"] in {"ci-failed", "deploy-failed"}
+        result["state"] in {"ci-failed", "deploy-failed", "verify-failed"}
         and client.config.pipeline.pause_on_failure
     ):
         client.set_pipeline_control(
@@ -2718,12 +2734,7 @@ def delivery_metrics(client: GitHub, *, limit: int) -> dict[str, Any]:
         number = int(pull["number"])
         comments = client.comments(number)
         intent = latest_intent(comments, client.trusted_logins)
-        marker = effective_queue_marker(
-            comments,
-            client.trusted_logins,
-            coordinator_logins(client),
-            intent_scope=client.config.pipeline.intent_scope,
-        )
+        marker = queue_marker_for_client(client, comments)
         merged_at = str(pull.get("merged_at") or "") or None
         merge_sha = str(pull.get("merge_commit_sha") or "")
         live_at: str | None = None

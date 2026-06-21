@@ -83,6 +83,56 @@ class PipelineTest(unittest.TestCase):
         self.assertEqual(result["state"], "verified")
         self.assertEqual(result["main_sha"], new)
 
+    def test_follow_reports_persistent_http_verification_failure(self) -> None:
+        sha = "a" * 40
+        config = parse_config(
+            {
+                "queue": {
+                    "required_checks": ["CI"],
+                    "trusted_actors": ["trusted"],
+                },
+                "pipeline": {
+                    "verifications": [
+                        {
+                            "name": "Health",
+                            "url": "https://example.invalid/health",
+                        }
+                    ]
+                },
+            }
+        )
+        client = Mock()
+        client.config = config
+        client.base_sha.return_value = sha
+        client.workflow_runs.return_value = [
+            {
+                "id": 1,
+                "name": "CI",
+                "head_sha": sha,
+                "status": "completed",
+                "conclusion": "success",
+            },
+            {
+                "id": 2,
+                "name": "Deploy",
+                "head_sha": sha,
+                "status": "completed",
+                "conclusion": "success",
+            },
+        ]
+        failed = [{"name": "Health", "passed": False, "status": 503}]
+        with (
+            patch(
+                "agent_merge_queue.pipeline.http_verifications",
+                return_value=failed,
+            ),
+            patch("agent_merge_queue.pipeline.time.monotonic", side_effect=[0, 11]),
+        ):
+            result = follow_release(client, timeout_seconds=10, poll_seconds=1)
+
+        self.assertEqual(result["state"], "verify-failed")
+        self.assertEqual(result["verifications"], failed)
+
     def test_metrics_report_p50_and_p95(self) -> None:
         self.assertEqual(percentile([1, 2, 3, 100], 0.50), 2)
         self.assertEqual(percentile([1, 2, 3, 100], 0.95), 100)
