@@ -15,7 +15,7 @@ Install the reviewed `v0.2.0` source commit directly from GitHub:
 
 ```bash
 python3 -m pip install \
-  'deploybot-merge-queue[mcp] @ git+https://github.com/Forward-Future/DeployBot.git@DEPLOYBOT_RELEASE_COMMIT'
+  'deploybot-merge-queue[mcp] @ git+https://github.com/Forward-Future/DeployBot.git@2e884f65f182f6a9ddc4c4785288045bdf98f188'
 deploybot init
 ```
 
@@ -86,7 +86,7 @@ aligned with `pipeline.ci_workflows`. The privileged worker never checks out or
 executes pull-request code. Pin the Action to the full reviewed release commit:
 
 ```yaml
-- uses: Forward-Future/DeployBot@DEPLOYBOT_RELEASE_COMMIT
+- uses: Forward-Future/DeployBot@2e884f65f182f6a9ddc4c4785288045bdf98f188
 ```
 
 The workflow bot and each person allowed to request deployment must be

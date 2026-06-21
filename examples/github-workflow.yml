@@ -37,5 +37,5 @@ jobs:
         with:
           ref: ${{ github.event.repository.default_branch }}
           persist-credentials: false
-      # Replace DEPLOYBOT_RELEASE_COMMIT with the reviewed v0.2.0 commit.
-      - uses: Forward-Future/DeployBot@DEPLOYBOT_RELEASE_COMMIT
+      # v0.2.0 implementation; keep the full commit for privileged workflows.
+      - uses: Forward-Future/DeployBot@2e884f65f182f6a9ddc4c4785288045bdf98f188
