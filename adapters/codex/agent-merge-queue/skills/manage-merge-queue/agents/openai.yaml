@@ -2,8 +2,3 @@ interface:
   display_name: "Manage Merge Queue"
   short_description: "Review and deliver pull requests safely"
   default_prompt: "Use $manage-merge-queue to review my pull request, record deploy intent, and let DeployBot deliver it."
-dependencies:
-  tools:
-    - type: "mcp"
-      value: "deploybot"
-      description: "Durable GitHub merge queue operations"

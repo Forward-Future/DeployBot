@@ -20,6 +20,5 @@
       "Deploy this PR through the agent merge queue.",
       "Show me what is blocking the merge queue."
     ]
-  },
-  "mcpServers": "./.mcp.json"
+  }
 }

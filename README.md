@@ -263,12 +263,15 @@ commit SHA so an older score can never authorize a replacement head.
 
 ## Clients
 
-- Codex: install the plugin under `adapters/codex/agent-merge-queue`.
+- Codex: install the CLI and the CLI-only plugin under
+  `adapters/codex/agent-merge-queue`. The Codex adapter intentionally does not
+  start an MCP subprocess.
 - Claude Code: install the plugin under `adapters/claude-code`.
 - Cursor: copy the files under `adapters/cursor` or use its MCP configuration.
 - Other clients: connect `deploybot-mcp` over stdio or call the CLI directly.
 
-The bundled MCP configurations launch the pinned public release with `uvx`.
+The Claude Code and Cursor MCP configurations launch the pinned public release
+with `uvx`.
 The `mergeq` and `mergeq-mcp` command aliases remain for compatibility.
 
 ## Command overview

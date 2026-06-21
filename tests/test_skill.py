@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import ast
+import json
 import unittest
 from pathlib import Path
 
@@ -11,21 +13,61 @@ CHECKOUT_COMMIT = "9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0"
 
 
 class DeployBotSkillTest(unittest.TestCase):
-    def test_skill_is_packaged_for_codex_and_claude(self) -> None:
+    def test_canonical_skill_is_packaged_for_claude(self) -> None:
         expected = CANONICAL.read_text(encoding="utf-8")
         copies = [
-            ROOT
-            / "adapters"
-            / "codex"
-            / "agent-merge-queue"
-            / "skills"
-            / "deploybot"
-            / "SKILL.md",
             ROOT / "adapters" / "claude-code" / "skills" / "deploybot" / "SKILL.md",
         ]
         for path in copies:
             with self.subTest(path=path):
                 self.assertEqual(path.read_text(encoding="utf-8"), expected)
+
+    def test_codex_adapter_is_cli_only(self) -> None:
+        root = ROOT / "adapters" / "codex" / "agent-merge-queue"
+        manifest = json.loads(
+            (root / ".codex-plugin" / "plugin.json").read_text(encoding="utf-8")
+        )
+        deploybot_skill = (root / "skills" / "deploybot" / "SKILL.md").read_text(
+            encoding="utf-8"
+        )
+        queue_skill = (root / "skills" / "manage-merge-queue" / "SKILL.md").read_text(
+            encoding="utf-8"
+        )
+        packaged_text = "\n".join(
+            path.read_text(encoding="utf-8")
+            for path in root.rglob("*")
+            if path.is_file()
+        )
+        mcp_tree = ast.parse(
+            (ROOT / "src" / "agent_merge_queue" / "mcp_server.py").read_text(
+                encoding="utf-8"
+            )
+        )
+        mcp_tool_names = {
+            node.name
+            for node in mcp_tree.body
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and any(
+                isinstance(decorator, ast.Call)
+                and isinstance(decorator.func, ast.Attribute)
+                and isinstance(decorator.func.value, ast.Name)
+                and decorator.func.value.id == "mcp"
+                and decorator.func.attr == "tool"
+                for decorator in node.decorator_list
+            )
+        }
+
+        self.assertNotIn("mcpServers", manifest)
+        self.assertFalse((root / ".mcp.json").exists())
+        self.assertIn("Use the `deploybot` CLI directly", deploybot_skill)
+        self.assertIn("deploybot status --json", deploybot_skill)
+        self.assertIn("deploybot request", queue_skill)
+        self.assertNotIn("MCP", packaged_text)
+        self.assertNotIn('type: "mcp"', packaged_text)
+        self.assertTrue(mcp_tool_names)
+        for tool_name in mcp_tool_names:
+            with self.subTest(tool_name=tool_name):
+                self.assertNotIn(tool_name, packaged_text)
 
     def test_status_guidance_is_read_only(self) -> None:
         skill = CANONICAL.read_text(encoding="utf-8")
@@ -105,7 +147,6 @@ class DeployBotSkillTest(unittest.TestCase):
 
     def test_clients_pin_the_immutable_status_release(self) -> None:
         paths = [
-            ROOT / "adapters" / "codex" / "agent-merge-queue" / ".mcp.json",
             ROOT / "adapters" / "claude-code" / ".mcp.json",
             ROOT / "adapters" / "cursor" / ".cursor" / "mcp.json",
             ROOT / "examples" / "github-workflow.yml",
