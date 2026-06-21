@@ -15,7 +15,7 @@ Install the reviewed `v0.2.5` source commit directly from GitHub:
 
 ```bash
 python3 -m pip install \
-  'deploybot-merge-queue[mcp] @ git+https://github.com/Forward-Future/DeployBot.git@9986210b077ebb4c53f2c5b1bbd461ba02dfce19'
+  'deploybot-merge-queue[mcp] @ git+https://github.com/Forward-Future/DeployBot.git@94fe042a58c731343c8bbd73d0bdfcb38a55866f'
 deploybot init
 ```
 
@@ -86,7 +86,7 @@ aligned with `pipeline.ci_workflows`. The privileged worker never checks out or
 executes pull-request code. Pin the Action to the full reviewed release commit:
 
 ```yaml
-- uses: Forward-Future/DeployBot@9986210b077ebb4c53f2c5b1bbd461ba02dfce19
+- uses: Forward-Future/DeployBot@94fe042a58c731343c8bbd73d0bdfcb38a55866f
 ```
 
 The Action uses GitHub's built-in workflow token. GitHub intentionally does not
