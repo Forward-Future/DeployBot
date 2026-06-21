@@ -1597,6 +1597,22 @@ class GitHub:
         merge_sha = str((value.get("mergeCommit") or {}).get("oid") or "")
         return merge_sha if value.get("state") == "MERGED" and merge_sha else None
 
+    def pull_release_details(self, number: int) -> dict[str, str]:
+        value = self._json(
+            "pr",
+            "view",
+            str(number),
+            "--repo",
+            self.repository,
+            "--json",
+            "body,title,url",
+        )
+        return {
+            "body": str(value.get("body") or ""),
+            "title": str(value.get("title") or ""),
+            "url": str(value.get("url") or ""),
+        }
+
     def externally_integrated_merge(
         self, number: int, expected_head: str
     ) -> str | None:
@@ -3423,17 +3439,157 @@ def command_integrate(client: GitHub, *, all_entries: bool) -> dict[str, Any]:
     return result
 
 
+RELEASE_NOTE_HEADINGS = {
+    "changes",
+    "feature summary",
+    "features",
+    "overview",
+    "release notes",
+    "summary",
+    "what changed",
+    "what s changed",
+    "whats changed",
+}
+RELEASE_NOTE_EXCLUDED_HEADINGS = {
+    "impact",
+    "safety",
+    "screenshots",
+    "test plan",
+    "testing",
+    "validation",
+    "why",
+}
+
+
+def _release_note_heading(line: str) -> str | None:
+    match = re.match(r"^\s{0,3}#{1,6}\s+(.+?)\s*#*\s*$", line)
+    if not match:
+        return None
+    return re.sub(r"[^a-z0-9]+", " ", match.group(1).lower()).strip()
+
+
+def _release_note_heading_matches(heading: str, names: set[str]) -> bool:
+    return any(heading == name or heading.startswith(name + " ") for name in names)
+
+
+def _release_note_text(value: str, *, limit: int = 180) -> str:
+    text = re.sub(r"^\s*\[[ xX]\]\s*", "", value.strip())
+    text = re.sub(r"!\[([^\]]*)\]\([^)]*\)", r"\1", text)
+    text = re.sub(r"\[([^\]]+)\]\([^)]*\)", r"\1", text)
+    text = re.sub(
+        r"(?i)\b(?:(?:https?|ftp)://|www\.)\S+",
+        "[external link omitted]",
+        text,
+    )
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    if len(text) <= limit:
+        return text
+    shortened = text[: limit - 1].rsplit(" ", 1)[0].rstrip(".,;:")
+    return (shortened or text[: limit - 1]).rstrip() + "…"
+
+
+def _markdown_literal(value: str) -> str:
+    """Render untrusted text without activating its Markdown or URLs."""
+
+    longest_fence = max((len(run) for run in re.findall(r"`+", value)), default=0)
+    fence = "`" * (longest_fence + 1)
+    return f"{fence} {value} {fence}"
+
+
+def pull_request_feature_summary(body: str, *, limit: int = 3) -> list[str]:
+    """Extract a short user-facing feature list from a pull-request body."""
+
+    body = re.sub(r"<!--.*?-->", "", body or "", flags=re.DOTALL)
+    preferred_bullets: list[str] = []
+    preferred_text: list[str] = []
+    fallback_bullets: list[str] = []
+    fallback_text: list[str] = []
+    heading = ""
+    bullet_pattern = re.compile(r"^\s*(?:[-*+]\s+|\d+[.)]\s+)(.+)$")
+
+    for raw_line in body.splitlines():
+        parsed_heading = _release_note_heading(raw_line)
+        if parsed_heading is not None:
+            heading = parsed_heading
+            continue
+        line = raw_line.strip()
+        if not line or line in {"---", "***", "___"}:
+            continue
+        bullet = bullet_pattern.match(raw_line)
+        text = _release_note_text(bullet.group(1) if bullet else line)
+        if not text or text.startswith("!["):
+            continue
+        preferred = _release_note_heading_matches(heading, RELEASE_NOTE_HEADINGS)
+        excluded = _release_note_heading_matches(
+            heading, RELEASE_NOTE_EXCLUDED_HEADINGS
+        )
+        if bullet:
+            if preferred:
+                preferred_bullets.append(text)
+            elif not excluded:
+                fallback_bullets.append(text)
+        elif preferred:
+            preferred_text.append(text)
+        elif not heading:
+            fallback_text.append(text)
+
+    candidates = (
+        preferred_bullets or preferred_text or fallback_bullets or fallback_text
+    )
+    unique: list[str] = []
+    seen: set[str] = set()
+    for value in candidates:
+        key = value.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(value)
+        if len(unique) == limit:
+            break
+    return unique
+
+
+def pull_request_notification_details(
+    client: GitHub,
+    pull_request: object,
+    cache: dict[int, dict[str, str]],
+) -> dict[str, str]:
+    try:
+        number = int(pull_request)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return {}
+    if number <= 0:
+        return {}
+    if number not in cache:
+        try:
+            value = client.pull_release_details(number)
+        except QueueError:
+            value = {}
+        cache[number] = value if isinstance(value, dict) else {}
+    return cache[number]
+
+
 def thread_deployment_notification(
     *,
     repository: str,
     record: dict[str, Any],
     release: dict[str, Any],
+    pull_request_details: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     main_sha = str(record.get("deployed_sha") or release["main_sha"])
     provider = str(record["provider"])
     thread_id = str(record["thread_id"])
     pull_request = record.get("pull_request")
+    details = pull_request_details or {}
     subject = f"PR #{pull_request}" if pull_request is not None else "Your change"
+    title = _release_note_text(
+        str(details.get("title") or record.get("title") or subject), limit=160
+    )
+    pull_request_url = str(details.get("url") or "")
+    if pull_request is not None and not pull_request_url:
+        pull_request_url = f"https://github.com/{repository}/pull/{pull_request}"
+    features = pull_request_feature_summary(str(details.get("body") or ""))
     same_release = str(release["main_sha"]) == main_sha
     ci_url = str(record.get("ci_url") or "")
     deployment_url = str(record.get("deployment_url") or "")
@@ -3442,12 +3598,39 @@ def thread_deployment_notification(
         deployment_url = deployment_url or str(
             (release.get("latest_deploy") or {}).get("url") or ""
         )
-    message = (
-        f"Deployed: {subject} is live from exact main `{main_sha}`. "
-        "CI, deployment, and configured health checks passed."
+    pull_request_label = subject
+    if pull_request_url:
+        pull_request_label = f"[{subject}]({pull_request_url})"
+    if pull_request_url and title == subject:
+        deployed_change = f"**[{title}]({pull_request_url})**"
+    elif pull_request_url:
+        deployed_change = f"{_markdown_literal(title)} ({pull_request_label})"
+    else:
+        deployed_change = _markdown_literal(title)
+    message_lines = [
+        "Deployment complete",
+        "",
+        f"{deployed_change} is now live.",
+    ]
+    if features:
+        message_lines.extend(["", "What changed:"])
+        message_lines.extend(f"- {_markdown_literal(feature)}" for feature in features)
+    message_lines.extend(
+        [
+            "",
+            "Release details:",
+            f"- Exact main: `{main_sha}`",
+            "- CI, deployment, and configured health checks passed.",
+        ]
     )
+    links: list[str] = []
+    if ci_url:
+        links.append(f"[CI run]({ci_url})")
     if deployment_url:
-        message += f" [Deployment run]({deployment_url})"
+        links.append(f"[Deployment run]({deployment_url})")
+    if links:
+        message_lines.append("- " + " · ".join(links))
+    message = "\n".join(message_lines)
     notification: dict[str, Any] = {
         "notification_id": thread_notification_id(
             repository=repository,
@@ -3532,6 +3715,7 @@ def command_follow(
         existing_notifications = client.deployment_notifications(include_delivered=True)
         if not isinstance(existing_notifications, list):
             existing_notifications = []
+        pull_request_details_cache: dict[int, dict[str, str]] = {}
         notification_states = {
             str(value["notification_id"]): str(value["state"])
             for value in existing_notifications
@@ -3567,6 +3751,11 @@ def command_follow(
                 repository=client.repository,
                 record=deployed_record,
                 release=result,
+                pull_request_details=pull_request_notification_details(
+                    client,
+                    obligation.get("pull_request"),
+                    pull_request_details_cache,
+                ),
             )
             notification_id = str(notification["notification_id"])
             record_pending_deployment_notification(client, notification)
@@ -3614,13 +3803,25 @@ def command_follow(
                 "ci_url": ci_url or None,
                 "deployment_url": deployment_url or None,
             }
-            notification = thread_deployment_notification(
+            pull_request = record.get("pull_request")
+            notification_id = thread_notification_id(
                 repository=client.repository,
-                record=deployed_record,
-                release=result,
+                provider=str(record["provider"]),
+                thread_id=str(record["thread_id"]),
+                merge_sha=merge_sha,
+                pull_request=(int(pull_request) if pull_request is not None else None),
             )
-            notification_id = str(notification["notification_id"])
             if notification_id not in notification_states:
+                notification = thread_deployment_notification(
+                    repository=client.repository,
+                    record=deployed_record,
+                    release=result,
+                    pull_request_details=pull_request_notification_details(
+                        client,
+                        pull_request,
+                        pull_request_details_cache,
+                    ),
+                )
                 record_pending_deployment_notification(client, notification)
                 pending_notifications[notification_id] = notification
                 notification_states[notification_id] = "pending"

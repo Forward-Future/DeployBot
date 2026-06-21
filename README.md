@@ -178,7 +178,12 @@ moves the matching source thread to `deployed` when that thread has not moved
 on, and returns a stable `thread_notifications` payload for each one.
 The provider adapter posts the supplied message into that native thread; for
 Codex it wakes the thread with `send_message_to_thread`. The source thread then
-acknowledges delivery and becomes `completed`:
+acknowledges delivery and becomes `completed`. The message is a human-readable
+release receipt with the pull-request title and link, up to three feature
+highlights from its release notes, the exact deployed `main`, and CI/deployment
+evidence. Adapters present that receipt verbatim and keep successful
+acknowledgement IDs internal. PR-authored text is rendered inert; only
+DeployBot-generated PR and release-evidence links remain clickable:
 
 ```bash
 deploybot thread acknowledge --provider codex --thread-id "$CODEX_THREAD_ID" \

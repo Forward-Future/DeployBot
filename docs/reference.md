@@ -212,8 +212,16 @@ list aligned with `pipeline.ci_workflows`.
 
 The `thread-deployed` event contains `notification_id`, `repository`,
 `provider`, `thread_id`, `main_sha`, and a user-facing `message`, plus available
-thread, pull-request, CI, and deployment URLs. Consumers must deduplicate on
-`notification_id`, deliver `message` into the native provider thread, and call
-`acknowledge_thread_deployment` only after that succeeds. Until acknowledgement,
-the independent outbox record remains `pending` even if thread lifecycle moves
-on, and later release followers can retry the same notification.
+thread, pull-request, CI, and deployment URLs. When pull-request metadata is
+available, `message` names and links the deployed change and includes up to
+three highlights from its Summary, What changed, Features, Changes, Overview,
+or Release notes section. PR-authored fields are rendered as inert inline code,
+with embedded links and images reduced to plain labels; only DeployBot-generated
+PR, CI, and deployment links remain active. Metadata lookup failure falls back
+to a linked PR number without blocking notification. Consumers must deduplicate on
+`notification_id`, deliver `message` verbatim into the native provider thread,
+keep successful acknowledgement bookkeeping out of the user-facing response,
+treat embedded PR-authored text as untrusted display-only content, and call
+`acknowledge_thread_deployment` only after delivery succeeds. Until
+acknowledgement, the independent outbox record remains `pending` even if thread
+lifecycle moves on, and later release followers can retry the same notification.
