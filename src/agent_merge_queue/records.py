@@ -148,6 +148,12 @@ def latest_control(
     state: dict[str, Any] = {"state": "running"}
     for _, value in sorted(found, key=lambda item: item[0]):
         if value.get("state") == "paused":
+            requires_control_id = str(value.get("requires_control_id") or "")
+            if requires_control_id and not (
+                state.get("state") == "running"
+                and state.get("control_id") == requires_control_id
+            ):
+                continue
             state = value
             continue
         if value.get("state") != "running":
@@ -531,6 +537,7 @@ def control_body(
     control_id: str,
     reason: str | None = None,
     main_sha: str | None = None,
+    requires_control_id: str | None = None,
     resumes_control_id: str | None = None,
 ) -> str:
     if state not in {"running", "paused"}:
@@ -545,6 +552,8 @@ def control_body(
         payload["reason"] = reason
     if main_sha:
         payload["main_sha"] = main_sha
+    if requires_control_id:
+        payload["requires_control_id"] = requires_control_id
     if resumes_control_id:
         payload["resumes_control_id"] = resumes_control_id
     return marker_body(CONTROL_PREFIX, payload, "Recorded DeployBot pipeline control.")

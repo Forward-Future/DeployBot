@@ -4247,10 +4247,12 @@ class QueueCoreTest(unittest.TestCase):
             },
             {
                 "state": "running",
+                "control_id": "resume-1",
                 "resumes_control_id": control_id,
             },
         ]
         client.base_sha.return_value = sha
+        client.set_pipeline_control.return_value = "resume-1"
 
         with redirect_stdout(io.StringIO()):
             command_unpause(
@@ -4318,6 +4320,7 @@ class QueueCoreTest(unittest.TestCase):
             },
         ]
         client.base_sha.return_value = sha
+        client.set_pipeline_control.return_value = "resume-1"
 
         with self.assertRaisesRegex(QueueError, "changed during unpause"):
             command_unpause(client, main_sha=sha, control_id="pause-1")
@@ -4338,14 +4341,17 @@ class QueueCoreTest(unittest.TestCase):
             },
             {
                 "state": "running",
+                "control_id": "resume-1",
                 "resumes_control_id": "pause-1",
             },
             {
                 "state": "running",
+                "control_id": "resume-1",
                 "resumes_control_id": "pause-1",
             },
         ]
         client.base_sha.side_effect = [sha, newer]
+        client.set_pipeline_control.side_effect = ["resume-1", "compensation-1"]
 
         with self.assertRaisesRegex(QueueError, "pipeline remains paused"):
             command_unpause(client, main_sha=sha, control_id="pause-1")
@@ -4358,6 +4364,7 @@ class QueueCoreTest(unittest.TestCase):
                     "paused",
                     f"main advanced during unpause from {sha} to {newer}",
                     main_sha=newer,
+                    requires_control_id="resume-1",
                 ),
             ],
         )
@@ -4374,6 +4381,7 @@ class QueueCoreTest(unittest.TestCase):
             },
             {
                 "state": "running",
+                "control_id": "resume-1",
                 "resumes_control_id": "pause-1",
             },
             {
@@ -4383,6 +4391,7 @@ class QueueCoreTest(unittest.TestCase):
             },
         ]
         client.base_sha.side_effect = [sha, newer]
+        client.set_pipeline_control.return_value = "resume-1"
 
         with self.assertRaisesRegex(QueueError, "pipeline remains paused"):
             command_unpause(client, main_sha=sha, control_id="pause-1")
@@ -4440,6 +4449,53 @@ class QueueCoreTest(unittest.TestCase):
                         "Recorded DeployBot pipeline control."
                     ),
                 },
+            ]
+        )
+
+        control = client.pipeline_control()
+
+        self.assertEqual(control["state"], "paused")
+        self.assertEqual(control["control_id"], "pause-2")
+
+    def test_pipeline_control_ignores_stale_conditional_repause(self) -> None:
+        sha = "a" * 40
+        client = object.__new__(GitHub)
+        client.coordinator_logins = {"coordinator"}
+        records = [
+            control_body(
+                state="paused",
+                control_id="pause-1",
+                reason=f"ci-failed on {sha}",
+                main_sha=sha,
+            ),
+            control_body(
+                state="running",
+                control_id="resume-1",
+                resumes_control_id="pause-1",
+            ),
+            control_body(
+                state="paused",
+                control_id="pause-2",
+                reason=f"deploy-failed on {sha}",
+                main_sha=sha,
+            ),
+            control_body(
+                state="paused",
+                control_id="compensation-1",
+                reason=f"main advanced from {sha}",
+                main_sha=sha,
+                requires_control_id="resume-1",
+            ),
+        ]
+        client.registry_comments = Mock(
+            return_value=[
+                {
+                    "id": index,
+                    "created_at": f"2026-06-21T17:17:{index:02d}Z",
+                    "user": {"login": "coordinator"},
+                    "body": body,
+                }
+                for index, body in enumerate(records, start=1)
             ]
         )
 

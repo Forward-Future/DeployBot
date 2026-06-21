@@ -1412,6 +1412,7 @@ class GitHub:
         reason: str | None = None,
         *,
         main_sha: str | None = None,
+        requires_control_id: str | None = None,
         resumes_control_id: str | None = None,
     ) -> str:
         number = self.registry_issue_number(create=True)
@@ -1425,6 +1426,7 @@ class GitHub:
                 control_id=control_id,
                 reason=reason,
                 main_sha=(main_sha or self.base_sha()) if state == "paused" else None,
+                requires_control_id=requires_control_id,
                 resumes_control_id=resumes_control_id,
             ),
         )
@@ -5123,11 +5125,13 @@ def command_unpause(
         raise QueueError(
             f"DeployBot main advanced from {main_sha} to {current_sha}; refresh status"
         )
-    client.set_pipeline_control("running", None, resumes_control_id=control_id)
+    resume_control_id = client.set_pipeline_control(
+        "running", None, resumes_control_id=control_id
+    )
     refreshed = client.pipeline_control()
     if refreshed.get("state") != "running" or (
         refreshed.get("resumes_control_id") != control_id
-    ):
+    ) or refreshed.get("control_id") != resume_control_id:
         raise QueueError("DeployBot pause changed during unpause; refresh status")
     refreshed_main = client.base_sha()
     if refreshed_main != main_sha:
@@ -5139,6 +5143,7 @@ def command_unpause(
                 "paused",
                 f"main advanced during unpause from {main_sha} to {refreshed_main}",
                 main_sha=refreshed_main,
+                requires_control_id=resume_control_id,
             )
         raise QueueError(
             f"DeployBot main advanced from {main_sha} to {refreshed_main} "
