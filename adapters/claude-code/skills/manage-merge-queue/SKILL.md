@@ -24,6 +24,11 @@ A genuine repair remains merge-ineligible, but DeployBot may temporarily hold
 overlapping ready work for the configured bounded repair window so concurrent
 merges do not repeatedly invalidate the replacement head.
 
+Before creating an exact-main recovery, call `claim_release_repair`; only the
+returned `owned` thread may use the deterministic repair branch. Respect the
+maximum batch size and keep new merges closed while an earlier release is
+unfinished.
+
 When `follow_release` returns `thread_notifications`, send each supplied
 message to its native source thread. The source thread calls
 `acknowledge_thread_deployment` with the matching `notification_id`. Present the

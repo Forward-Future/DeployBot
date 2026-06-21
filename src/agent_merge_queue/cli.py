@@ -24,6 +24,7 @@ from .config import ConfigError, QueueConfig, initialize_config, load_config
 from .doctor import diagnose
 from .pipeline import (
     follow_release,
+    http_verifications,
     notify,
     release_state,
     seconds_between,
@@ -33,6 +34,7 @@ from .records import (
     CONTROL_MARKER,
     INTEGRATION_MARKER,
     REPAIR_MARKER,
+    RELEASE_WATERMARK_MARKER,
     THREAD_PHASES,
     DeploymentNotificationRecord,
     ThreadRecord,
@@ -41,11 +43,14 @@ from .records import (
     integration_body,
     intent_body,
     latest_intent,
+    latest_release_repair,
     latest_deployment_notifications,
     latest_payload,
     latest_thread_records,
     parse_time,
     repair_body,
+    release_repair_body,
+    release_watermark_body,
     thread_record_body,
 )
 from .reviews import ReviewVerdict, evaluate_reviews
@@ -79,6 +84,7 @@ BATCH_COMPLETE_MARKER = re.compile(
     re.DOTALL,
 )
 PULL_REQUEST_NUMBER = re.compile(r"#(\d+)\b")
+RELEASE_REPAIR_LEASE_PREFIX = "DeployBot release repair lease v1 "
 FAILED_CHECK_STATES = {
     "ACTION_REQUIRED",
     "CANCELLED",
@@ -434,17 +440,26 @@ def generated_only_change(
     return bool(removed or added) and removed == added
 
 
-def overlap_groups(entries: Iterable["QueueEntry"]) -> list[dict[str, Any]]:
+def overlap_groups(
+    entries: Iterable["QueueEntry"], *, include_generated: bool = True
+) -> list[dict[str, Any]]:
     values = list(entries)
     adjacency: dict[int, set[int]] = {entry.number: set() for entry in values}
-    shared: dict[tuple[int, int], set[str]] = {}
+    shared_source: dict[tuple[int, int], set[str]] = {}
+    shared_generated: dict[tuple[int, int], set[str]] = {}
     for index, left in enumerate(values):
         for right in values[index + 1 :]:
-            paths = set(left.source_paths) & set(right.source_paths)
-            if not paths:
+            source_paths = set(left.source_paths) & set(right.source_paths)
+            generated_paths = (
+                set(left.generated_paths) & set(right.generated_paths)
+                if include_generated
+                else set()
+            )
+            if not source_paths and not generated_paths:
                 continue
             pair = tuple(sorted((left.number, right.number)))
-            shared[pair] = paths
+            shared_source[pair] = source_paths
+            shared_generated[pair] = generated_paths
             adjacency[left.number].add(right.number)
             adjacency[right.number].add(left.number)
 
@@ -462,12 +477,18 @@ def overlap_groups(entries: Iterable["QueueEntry"]) -> list[dict[str, Any]]:
             component.add(current)
             pending.extend(adjacency[current] - component)
         visited.update(component)
-        paths: set[str] = set()
-        for pair, pair_paths in shared.items():
+        source_paths: set[str] = set()
+        generated_paths: set[str] = set()
+        for pair, pair_paths in shared_source.items():
             if pair[0] in component and pair[1] in component:
-                paths.update(pair_paths)
+                source_paths.update(pair_paths)
+                generated_paths.update(shared_generated[pair])
         groups.append(
-            {"pull_requests": sorted(component), "source_paths": sorted(paths)}
+            {
+                "pull_requests": sorted(component),
+                "source_paths": sorted(source_paths),
+                "generated_paths": sorted(generated_paths),
+            }
         )
     return groups
 
@@ -479,6 +500,7 @@ def batch_fingerprint(entries: Iterable["QueueEntry"]) -> str:
             "number": entry.number,
             "dependencies": entry.dependencies,
             "source_paths": entry.source_paths,
+            "generated_paths": entry.generated_paths,
         }
         for entry in entries
     ]
@@ -498,6 +520,9 @@ def new_batch(entries: list["QueueEntry"], *, frozen_at: str) -> dict[str, Any]:
         "pull_requests": [entry.number for entry in entries],
         "schema": 1,
         "source_paths": {str(entry.number): entry.source_paths for entry in entries},
+        "generated_paths": {
+            str(entry.number): entry.generated_paths for entry in entries
+        },
     }
 
 
@@ -522,13 +547,18 @@ def batch_overlap_peers(
     batch: dict[str, Any], number: int, active_numbers: set[int]
 ) -> list[int]:
     paths_by_pr = batch.get("source_paths") or {}
+    generated_by_pr = batch.get("generated_paths") or {}
     target_paths = set(paths_by_pr.get(str(number)) or [])
+    target_generated = set(generated_by_pr.get(str(number)) or [])
     return sorted(
         int(peer)
         for peer in batch.get("pull_requests") or []
         if int(peer) != number
         and int(peer) in active_numbers
-        and target_paths.intersection(paths_by_pr.get(str(peer)) or [])
+        and (
+            target_paths.intersection(paths_by_pr.get(str(peer)) or [])
+            or target_generated.intersection(generated_by_pr.get(str(peer)) or [])
+        )
     )
 
 
@@ -1376,6 +1406,177 @@ class GitHub:
             raise QueueError("could not create DeployBot registry")
         self.issue_comment(number, control_body(state=state, reason=reason))
 
+    def verified_main_sha(self) -> str | None:
+        value = latest_payload(
+            self.registry_comments(),
+            RELEASE_WATERMARK_MARKER,
+            self.coordinator_logins,
+        )
+        sha = str((value or {}).get("main_sha") or "")
+        return sha if re.fullmatch(r"[0-9a-f]{40}", sha) else None
+
+    def record_verified_main(self, main_sha: str) -> None:
+        if self.verified_main_sha() == main_sha:
+            return
+        number = self.registry_issue_number(create=True)
+        if number is None:  # pragma: no cover
+            raise QueueError("could not create DeployBot registry")
+        self.issue_comment(number, release_watermark_body(main_sha))
+
+    def claim_release_repair(
+        self,
+        *,
+        provider: str,
+        thread_id: str,
+        thread_url: str | None = None,
+        main_sha: str | None = None,
+    ) -> dict[str, Any]:
+        """Atomically elect one native thread to repair the active release."""
+        self.require_actor(
+            self.coordinator_logins | self.trusted_logins,
+            "claim a release repair",
+        )
+        current_sha = self.base_sha()
+        expected_sha = main_sha or current_sha
+        if expected_sha != current_sha:
+            raise QueueError(
+                f"release repair SHA {expected_sha} is stale; current main is {current_sha}"
+            )
+        release = release_state(
+            main_sha=current_sha,
+            runs=self.workflow_runs(),
+            config=self.config.pipeline,
+        )
+        if release.get("state") == "verified" and self.config.pipeline.verifications:
+            health = http_verifications(self.config.pipeline)
+            if not all(item["passed"] for item in health):
+                release = {
+                    **release,
+                    "state": "verify-failed",
+                    "verifications": health,
+                }
+        if release.get("state") not in {
+            "ci-failed",
+            "deploy-failed",
+            "verify-failed",
+        }:
+            raise QueueError(
+                f"main {current_sha} is {release.get('state')}; no release repair is claimable"
+            )
+        branch = f"{self.config.pipeline.repair_branch_prefix}/{current_sha[:12]}"
+        latest_ci = release.get("latest_ci") or {}
+        latest_deploy = release.get("latest_deploy") or {}
+        failed_run = (
+            latest_deploy
+            if release.get("state") == "deploy-failed"
+            else latest_ci
+        )
+        payload = {
+            "branch": branch,
+            "claimed_at": utc_now(),
+            "failure_state": release.get("state"),
+            "main_sha": current_sha,
+            "provider": provider,
+            "run_id": failed_run.get("id"),
+            "thread_id": thread_id,
+            "thread_url": thread_url,
+        }
+        base_commit = self._json(
+            "api", f"repos/{self.repository}/git/commits/{current_sha}"
+        )
+        tree_sha = str((base_commit.get("tree") or {}).get("sha") or "")
+        if not tree_sha:
+            raise QueueError("GitHub did not return the failed main commit tree")
+        lease_commit = self._json(
+            "api",
+            "--method",
+            "POST",
+            f"repos/{self.repository}/git/commits",
+            "-f",
+            f"message={RELEASE_REPAIR_LEASE_PREFIX}{json.dumps(payload, sort_keys=True)}",
+            "-f",
+            f"tree={tree_sha}",
+            "-f",
+            f"parents[]={current_sha}",
+        )
+        lease_sha = str(lease_commit.get("sha") or "")
+        if not lease_sha:
+            raise QueueError("GitHub did not create the release repair lease commit")
+        payload["lease_sha"] = lease_sha
+        if self.base_sha() != current_sha:
+            raise QueueError(
+                f"release repair SHA {current_sha} is stale; main advanced before claim"
+            )
+        created = False
+        try:
+            self._json(
+                "api",
+                "--method",
+                "POST",
+                f"repos/{self.repository}/git/refs",
+                "-f",
+                f"ref=refs/heads/{branch}",
+                "-f",
+                f"sha={lease_sha}",
+            )
+            created = True
+        except QueueError as error:
+            if "Reference already exists" not in str(error):
+                raise
+
+        if self.base_sha() != current_sha:
+            if created:
+                try:
+                    self._run(
+                        "api",
+                        "--method",
+                        "DELETE",
+                        f"repos/{self.repository}/git/refs/heads/{branch}",
+                    )
+                except QueueError:
+                    pass
+            raise QueueError(
+                f"release repair SHA {current_sha} is stale; main advanced during claim"
+            )
+
+        if not created:
+            ref = self._json(
+                "api", f"repos/{self.repository}/git/ref/heads/{branch}"
+            )
+            lease_sha = str((ref.get("object") or {}).get("sha") or "")
+            commit = self._json(
+                "api", f"repos/{self.repository}/git/commits/{lease_sha}"
+            )
+            message = str(commit.get("message") or "")
+            if not message.startswith(RELEASE_REPAIR_LEASE_PREFIX):
+                raise QueueError(f"repair lease branch {branch} has invalid ownership")
+            try:
+                lease_payload = json.loads(message[len(RELEASE_REPAIR_LEASE_PREFIX) :])
+            except json.JSONDecodeError as error:
+                raise QueueError(
+                    f"repair lease branch {branch} has invalid ownership"
+                ) from error
+            if (
+                not isinstance(lease_payload, dict)
+                or lease_payload.get("main_sha") != current_sha
+                or not lease_payload.get("thread_id")
+            ):
+                raise QueueError(f"repair lease branch {branch} has invalid ownership")
+            payload = {**lease_payload, "lease_sha": lease_sha}
+
+        # The ref's owner-encoded commit is authoritative. Publishing the
+        # registry record is retryable and idempotent even if the first process
+        # exits immediately after winning the atomic ref create.
+        number = self.registry_issue_number(create=True)
+        if number is None:  # pragma: no cover
+            raise QueueError("could not create DeployBot registry")
+        self.issue_comment(number, release_repair_body(payload))
+        same_owner = (
+            payload.get("provider") == provider
+            and payload.get("thread_id") == thread_id
+        )
+        return {**payload, "state": "owned" if same_owner else "claimed"}
+
     def create_integration_pull_request(
         self,
         *,
@@ -1471,8 +1672,46 @@ class GitHub:
                 except QueueError:
                     pass
                 raise
+        author = str((pull.get("user") or {}).get("login") or "")
+        identity_error: str | None = None
+        if self.config.integration.require_non_actions_author:
+            if author.lower() == "github-actions[bot]":
+                identity_error = (
+                    "integration PRs require a GitHub App installation token; "
+                    "pass the action's token input and do not use github.token"
+                )
+            elif author.lower() not in {
+                login.lower() for login in self.coordinator_logins
+            }:
+                identity_error = (
+                    f"integration PR author {author or '<unknown>'} is not trusted; "
+                    "add the GitHub App bot login to queue.coordinator_actors"
+                )
+        if identity_error:
+            # Installation-token identity is available on the PR response,
+            # unlike GET /user. Remove the unusable workflow-token PR before it
+            # can own the frozen source batch.
+            try:
+                self._run(
+                    "api",
+                    "--method",
+                    "PATCH",
+                    f"repos/{self.repository}/pulls/{pull['number']}",
+                    "-f",
+                    "state=closed",
+                )
+                self._run(
+                    "api",
+                    "--method",
+                    "DELETE",
+                    f"repos/{self.repository}/git/refs/heads/{branch}",
+                )
+            except QueueError:
+                pass
+            raise QueueError(identity_error)
         number = int(pull["number"])
         marker = {
+            "author": author,
             "base_sha": base_sha,
             "batch_id": batch_id,
             "conflict": conflict,
@@ -1599,7 +1838,6 @@ class GitHub:
                 continue
             if path in self.config.generated_paths:
                 generated_paths.append(path)
-                source_paths.append(path)
                 continue
             target = (
                 generated_paths
@@ -2011,7 +2249,7 @@ def print_plan(entries: list[QueueEntry], *, json_output: bool) -> None:
         print(f"{position}. #{entry.number} {entry.state} ({review}) - {detail}")
     for group in groups:
         numbers = ", ".join(f"#{value}" for value in group["pull_requests"])
-        paths = ", ".join(group["source_paths"])
+        paths = ", ".join(group["source_paths"] + group["generated_paths"])
         print(f"integration required: {numbers} overlap in {paths}")
 
 
@@ -2138,6 +2376,14 @@ def pipeline_status(client: GitHub) -> dict[str, Any]:
         ),
         config=client.config.pipeline,
     )
+    coordinator_logins = getattr(client, "coordinator_logins", None)
+    if not isinstance(coordinator_logins, set):
+        coordinator_logins = client.trusted_logins
+    release_repair = latest_release_repair(
+        client.registry_comments(),
+        coordinator_logins | client.trusted_logins,
+        main_sha=main_sha,
+    )
     now = datetime.now(timezone.utc)
     alerts: list[dict[str, Any]] = []
     queue_target = client.config.pipeline.ready_to_merge_target_minutes * 60
@@ -2205,6 +2451,7 @@ def pipeline_status(client: GitHub) -> dict[str, Any]:
             [entry for entry, _, _ in active_intents]
         ),
         "release": delivery,
+        "release_repair": release_repair,
         "alerts": alerts,
     }
 
@@ -3231,6 +3478,55 @@ class FreezeResult:
         }
 
 
+def bounded_batch_entries(
+    entries: list[QueueEntry], max_batch_size: int
+) -> list[QueueEntry]:
+    """Choose one FIFO window closed over overlap and queued dependencies."""
+    by_number = {entry.number: entry for entry in entries}
+    component_by_number = {
+        entry.number: {entry.number} for entry in entries
+    }
+    for group in overlap_groups(entries, include_generated=False):
+        component = {int(number) for number in group["pull_requests"]}
+        for number in component:
+            component_by_number[number] = component
+
+    def closure(seed: int) -> set[int]:
+        result = set(component_by_number[seed])
+        pending = list(result)
+        while pending:
+            number = pending.pop()
+            entry = by_number[number]
+            for dependency in entry.dependencies:
+                if dependency not in by_number:
+                    continue
+                for related in component_by_number[dependency]:
+                    if related not in result:
+                        result.add(related)
+                        pending.append(related)
+        return result
+
+    selected: set[int] = set()
+    for entry in entries:
+        if entry.number in selected:
+            continue
+        candidate = closure(entry.number)
+        if len(candidate) > max_batch_size:
+            if not selected:
+                # A true source-overlap/dependency closure is indivisible. Let
+                # it ship alone rather than deadlocking forever or splitting an
+                # atomic validation unit. Generated artifacts are excluded from
+                # source overlap, so they cannot inflate this exception.
+                selected.update(candidate)
+            break
+        if len(selected | candidate) > max_batch_size:
+            break
+        selected.update(candidate)
+        if len(selected) == max_batch_size:
+            break
+    return [entry for entry in entries if entry.number in selected]
+
+
 def freeze_queue(
     client: GitHub,
     *,
@@ -3311,7 +3607,21 @@ def freeze_queue(
     }
     batch = active_batch(entries, latest, completed)
     if batch is None:
-        batch = new_batch(entries, frozen_at=utc_now())
+        # A single slow integration must not turn every ready change behind it
+        # into one unbounded release train. Preserve FIFO order, but freeze only
+        # the configured delivery window; the remainder becomes the next batch.
+        bounded = bounded_batch_entries(
+            entries, client.config.integration.max_batch_size
+        )
+        if not bounded:
+            return FreezeResult(
+                None,
+                [],
+                blocked_entries,
+                entries,
+                overlap_groups(entries),
+            )
+        batch = new_batch(bounded, frozen_at=utc_now())
     selected = entries_in_batch(entries, batch)
     selected_numbers = {entry.number for entry in selected}
     next_batch = [entry for entry in entries if entry.number not in selected_numbers]
@@ -3788,6 +4098,10 @@ def command_drain(
             key = tuple(int(value) for value in group["pull_requests"])
             integration_by_members[key] = group
         next_batch = list(batch_result["next_batch"])
+        if batch_result["merged"]:
+            # One reaction owns one bounded release batch. Leave the FIFO
+            # remainder for the event that runs after exact-main verification.
+            break
         if not next_batch:
             break
 
@@ -4129,6 +4443,7 @@ def command_follow(
             f"{result['state']} on {result['main_sha']}",
         )
     if result["state"] == "verified":
+        client.record_verified_main(str(result["main_sha"]))
         existing_notifications = client.deployment_notifications(include_delivered=True)
         if not isinstance(existing_notifications, list):
             existing_notifications = []
@@ -4425,7 +4740,118 @@ def command_react(
         print(json.dumps(result, indent=2, sort_keys=True))
         return result
 
+    # An authorized PR may have landed outside the controller. Materialize its
+    # durable release obligation before deciding whether an empty watermark
+    # can safely establish a first-install baseline.
     reconciled_merges = reconcile_externally_merged_threads(client)
+
+    # Once a batch reaches main, close admission until that exact cumulative
+    # revision is live. Otherwise a busy queue can keep advancing main faster
+    # than CI/deploy can verify it, starving an already-merged small change.
+    release_completed_before_merge = False
+    release_before_batch: dict[str, Any] | None = None
+    if client.config.pipeline.hold_merges_while_releasing:
+        workflow_runs = client.workflow_runs()
+        if not isinstance(workflow_runs, list):
+            workflow_runs = []
+        current_main_sha = client.base_sha()
+        release_before_merge = release_state(
+            main_sha=current_main_sha,
+            runs=workflow_runs,
+            config=client.config.pipeline,
+        )
+        raw_watermark = client.verified_main_sha()
+        release_already_verified = raw_watermark == current_main_sha
+        has_release_owner = (
+            not release_already_verified
+            and release_before_merge.get("latest_ci") is not None
+        )
+        if not release_already_verified and any(
+            value.get("merge_sha")
+            and client.is_ancestor(str(value["merge_sha"]), current_main_sha)
+            for value in reconciled_merges
+        ):
+            has_release_owner = True
+        if (
+            not release_already_verified
+            and isinstance(raw_watermark, str)
+            and raw_watermark != current_main_sha
+        ):
+            has_release_owner = True
+        if not release_already_verified and not has_release_owner:
+            thread_records = client.thread_records(include_terminal=True)
+            if not isinstance(thread_records, list):
+                thread_records = []
+            has_release_owner = any(
+                record.get("phase") == "merged"
+                and bool(record.get("merge_sha"))
+                and client.is_ancestor(
+                    str(record["merge_sha"]),
+                    str(release_before_merge["main_sha"]),
+                )
+                for record in thread_records
+            )
+        if not release_already_verified and not has_release_owner:
+            notifications = client.deployment_notifications(include_delivered=True)
+            if not isinstance(notifications, list):
+                notifications = []
+            has_release_owner = any(
+                record.get("state") == "awaiting-verification"
+                for record in notifications
+            )
+        if raw_watermark is None and not has_release_owner:
+            # First installation (or registry recovery) has no trustworthy
+            # prior boundary. Seed current main only when no exact run or
+            # durable merged obligation owns it; historical runs for older
+            # SHAs cannot make an unobservable release finish.
+            client.record_verified_main(current_main_sha)
+        release_is_verified = release_already_verified or (
+            release_before_merge.get("state") == "verified"
+        )
+        if (
+            not release_already_verified
+            and release_is_verified
+            and client.config.pipeline.verifications
+        ):
+            health = http_verifications(client.config.pipeline)
+            release_before_merge = {
+                **release_before_merge,
+                "state": (
+                    "verified"
+                    if all(item["passed"] for item in health)
+                    else "verify-failed"
+                ),
+                "verifications": health,
+            }
+            release_is_verified = release_before_merge["state"] == "verified"
+        if release_is_verified:
+            client.record_verified_main(current_main_sha)
+        if has_release_owner and not release_is_verified:
+            release = release_before_merge
+            if follow:
+                release = command_follow(
+                    client,
+                    timeout_seconds=timeout_seconds,
+                    poll_seconds=10,
+                    json_output=False,
+                    emit=False,
+                )
+            if release.get("state") != "verified":
+                result = {
+                    "state": "release-held",
+                    "release": release,
+                    "promoted": {},
+                    "promoted_integrations": [],
+                    "drain": {},
+                    "dispatched_ci": [],
+                    "integrations": [],
+                    "integration_checks": [],
+                    "reconciled_merges": reconciled_merges,
+                }
+                print(json.dumps(result, indent=2, sort_keys=True))
+                return result
+            release_completed_before_merge = True
+            release_before_batch = release
 
     def own_integration_checks(
         numbers: Iterable[int] | None = None,
@@ -4593,11 +5019,19 @@ def command_react(
             emit=False,
             initial_frozen=frozen,
         )
-    if newly_promoted_integrations:
+    if newly_promoted_integrations and not drained.get("merged"):
+        integration_frozen: FreezeResult | None = None
+        if client.config.integration.mode == "all":
+            queued_numbers = set(client.queued_numbers())
+            integration_frozen = freeze_queue(
+                client,
+                held_numbers=queued_numbers - set(newly_promoted_integrations),
+            )
         integration_drain = command_drain(
             client,
             json_output=False,
             emit=False,
+            initial_frozen=integration_frozen,
         )
         drained = combine_drain_results(drained, integration_drain)
     dispatched_ci: list[dict[str, Any]] = []
@@ -4610,9 +5044,9 @@ def command_react(
                     "paused", "post-merge CI dispatch failed: " + str(error)
                 )
             raise
-    release: dict[str, Any] | None = None
+    release: dict[str, Any] | None = release_before_batch
     should_follow = bool(drained.get("merged"))
-    if follow and not should_follow:
+    if follow and not should_follow and not release_completed_before_merge:
         # The worker that performed the merge may be replaced while waiting for
         # CI. Let a later event take over only when a release actually remains;
         # an idle all-mode integration batch must not occupy the coordinator for
@@ -4644,6 +5078,24 @@ def command_react(
 def command_control(client: GitHub, *, state: str, reason: str | None) -> None:
     client.set_pipeline_control(state, reason)
     print(f"DeployBot pipeline is {state}")
+
+
+def command_claim_release_repair(
+    client: GitHub,
+    *,
+    provider: str,
+    thread_id: str,
+    thread_url: str | None,
+    main_sha: str | None,
+) -> dict[str, Any]:
+    result = client.claim_release_repair(
+        provider=provider,
+        thread_id=thread_id,
+        thread_url=thread_url,
+        main_sha=main_sha,
+    )
+    print(json.dumps(result, indent=2, sort_keys=True))
+    return result
 
 
 def delivery_metrics(client: GitHub, *, limit: int) -> dict[str, Any]:
@@ -4810,6 +5262,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     pause.add_argument("--reason", required=True)
     subparsers.add_parser("unpause", help="resume a paused delivery pipeline")
+    claim_repair = subparsers.add_parser(
+        "claim-release-repair",
+        help="atomically claim ownership of the current failed release",
+    )
+    claim_repair.add_argument("--provider", required=True)
+    claim_repair.add_argument("--thread-id", required=True)
+    claim_repair.add_argument("--thread-url")
+    claim_repair.add_argument("--sha", dest="main_sha")
     metrics = subparsers.add_parser("metrics", help="show delivery timing percentiles")
     metrics.add_argument("--limit", type=int, default=25)
     metrics.add_argument("--json", action="store_true", dest="json_output")
@@ -4928,6 +5388,14 @@ def main(argv: list[str] | None = None) -> int:
             command_control(client, state="paused", reason=arguments.reason)
         elif arguments.command == "unpause":
             command_control(client, state="running", reason=None)
+        elif arguments.command == "claim-release-repair":
+            command_claim_release_repair(
+                client,
+                provider=arguments.provider,
+                thread_id=arguments.thread_id,
+                thread_url=arguments.thread_url,
+                main_sha=arguments.main_sha,
+            )
         elif arguments.command == "metrics":
             if arguments.limit < 1:
                 raise QueueError("--limit must be positive")

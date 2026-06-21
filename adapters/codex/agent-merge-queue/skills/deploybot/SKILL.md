@@ -76,6 +76,22 @@ Use `deploybot doctor --json` for setup drift and `deploybot metrics --json` for
 p50, p95, and slow-stage evidence. A failed cumulative CI or deployment pauses
 the controller; only a designated coordinator may unpause after recovery.
 
+Before opening or editing an exact-main recovery PR, run
+`deploybot claim-release-repair` with the native provider and thread ID. Work only when it
+returns `owned`, using its deterministic branch. If it returns `claimed`, the
+named thread already owns that failed SHA; wait for that repair and never create
+a competing PR. The owner is encoded in the atomic branch ref, so a registry
+write failure is recovered by calling the same tool again.
+
+New batches are FIFO-bounded by `integration.max_batch_size`, and a merged batch
+closes admission until its cumulative main revision is verified live. Do not
+override either boundary for later work. Never execute merged PR code inside
+the privileged coordinator; generated-artifact conflicts go to the elected
+repair owner for a normal reviewed rebuild. When PR-authored checks are
+required, use a GitHub App installation token, list its bot login in
+`queue.coordinator_actors`, and enable `require_non_actions_author`; never manually re-author a
+workflow-token integration PR.
+
 ## Notify Source Threads
 
 After exact-main verification, `deploybot follow --json` returns one

@@ -187,6 +187,8 @@ class ConfigTest(unittest.TestCase):
                     "ci_failure_grace_seconds": 45,
                     "promotion_workers": 3,
                     "repair_hold_minutes": 90,
+                    "hold_merges_while_releasing": False,
+                    "repair_branch_prefix": "repairs/main",
                     "auto_promote": False,
                     "verifications": [
                         {
@@ -196,7 +198,11 @@ class ConfigTest(unittest.TestCase):
                         }
                     ],
                 },
-                "integration": {"mode": "all"},
+                "integration": {
+                    "mode": "all",
+                    "max_batch_size": 2,
+                    "require_non_actions_author": True,
+                },
             }
         )
         self.assertEqual(config.pipeline.ci_workflows, ("Main CI",))
@@ -204,9 +210,28 @@ class ConfigTest(unittest.TestCase):
         self.assertEqual(config.pipeline.ci_failure_grace_seconds, 45)
         self.assertEqual(config.pipeline.promotion_workers, 3)
         self.assertEqual(config.pipeline.repair_hold_minutes, 90)
+        self.assertFalse(config.pipeline.hold_merges_while_releasing)
+        self.assertEqual(config.pipeline.repair_branch_prefix, "repairs/main")
         self.assertFalse(config.pipeline.auto_promote)
         self.assertEqual(config.pipeline.verifications[0].expected_status, 200)
         self.assertEqual(config.integration.mode, "all")
+        self.assertEqual(config.integration.max_batch_size, 2)
+        self.assertTrue(config.integration.require_non_actions_author)
+
+    def test_rejects_invalid_repair_branch_prefix(self) -> None:
+        for prefix in ("/", "repairs//main", "repairs/../main", "repairs/main.lock"):
+            with self.subTest(prefix=prefix), self.assertRaisesRegex(
+                ConfigError, "valid Git branch prefix"
+            ):
+                parse_config(
+                    {
+                        "queue": {
+                            "required_checks": ["CI"],
+                            "trusted_actors": ["trusted"],
+                        },
+                        "pipeline": {"repair_branch_prefix": prefix},
+                    }
+                )
 
     def test_rejects_invalid_integration_mode_and_boolean(self) -> None:
         with self.assertRaisesRegex(ConfigError, "integration.mode"):

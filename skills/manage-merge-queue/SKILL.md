@@ -49,6 +49,10 @@ merges do not repeatedly invalidate the replacement head.
 
 Finish with `follow_release`, tracking newer cumulative base heads through CI,
 deployment, and configured health checks. A failure pauses further merges until
-the coordinator verifies recovery and unpauses. Record exact heads, review
+the coordinator verifies recovery and unpauses. Before creating that recovery,
+call `claim_release_repair`; only the returned `owned` thread may use the
+deterministic repair branch. Respect the configured maximum batch size and keep
+new merges closed while an earlier exact-main release is unfinished. Record
+exact heads, review
 verdicts, merged commits, waiting items, repair packets, integration groups, and
 delivery timing.

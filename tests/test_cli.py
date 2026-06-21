@@ -12,9 +12,11 @@ from agent_merge_queue.cli import (
     GitHub,
     QueueEntry,
     QueueError,
+    RELEASE_REPAIR_LEASE_PREFIX,
     active_batch,
     batch_fingerprint,
     batch_overlap_peers,
+    bounded_batch_entries,
     check_states,
     command_block,
     command_dequeue,
@@ -62,7 +64,12 @@ from agent_merge_queue.cli import (
     thread_notification_id,
 )
 from agent_merge_queue.config import parse_config
-from agent_merge_queue.records import integration_body, intent_body, repair_body
+from agent_merge_queue.records import (
+    integration_body,
+    intent_body,
+    release_repair_body,
+    repair_body,
+)
 from agent_merge_queue.reviews import ReviewVerdict
 
 
@@ -382,6 +389,7 @@ class QueueCoreTest(unittest.TestCase):
         client.pipeline_control.return_value = {"state": "running"}
         client.thread_records.return_value = []
         client.deployment_notifications.return_value = []
+        client.registry_comments.return_value = []
 
         result = pipeline_status(client)
 
@@ -1392,6 +1400,30 @@ class QueueCoreTest(unittest.TestCase):
             )
         )
 
+    def test_generated_paths_do_not_create_hand_edited_overlap(self) -> None:
+        config = parse_config(
+            {
+                "queue": {
+                    "required_checks": ["CI"],
+                    "trusted_actors": ["trusted"],
+                },
+                "files": {"generated_paths": ["dist/app.js"]},
+            }
+        )
+        client = object.__new__(GitHub)
+        client.config = config
+        client.files = Mock(
+            return_value=[
+                {"filename": "src/app.js", "patch": "+code"},
+                {"filename": "dist/app.js", "patch": None},
+            ]
+        )
+
+        source_paths, generated_paths = client.changed_paths(1)
+
+        self.assertEqual(source_paths, ["src/app.js"])
+        self.assertEqual(generated_paths, ["dist/app.js"])
+
     def test_waiting_promotion_defers_changed_file_fetch(self) -> None:
         client = object.__new__(GitHub)
         client.config = CONFIG
@@ -1589,6 +1621,18 @@ class QueueCoreTest(unittest.TestCase):
 
         self.assertEqual(groups[0]["pull_requests"], [1, 2, 3])
 
+    def test_generated_overlap_still_requires_cumulative_validation(self) -> None:
+        first = entry(1, "src/a.py")
+        second = entry(2, "src/b.py")
+        first.generated_paths = ["dist/app.js"]
+        second.generated_paths = ["dist/app.js"]
+
+        groups = overlap_groups([first, second])
+
+        self.assertEqual(groups[0]["pull_requests"], [1, 2])
+        self.assertEqual(groups[0]["source_paths"], [])
+        self.assertEqual(groups[0]["generated_paths"], ["dist/app.js"])
+
     def test_queue_discovery_uses_every_paginated_pull_request(self) -> None:
         client = object.__new__(GitHub)
         client.config = CONFIG
@@ -1748,6 +1792,657 @@ class QueueCoreTest(unittest.TestCase):
 
         self.assertTrue(client.dependency_is_merged(12))
         self.assertIn("...main", client._json.call_args_list[1].args[1])
+
+    def test_freeze_caps_new_batch_and_preserves_fifo_remainder(self) -> None:
+        values = [entry(number, f"{number}.py") for number in range(1, 6)]
+        client = Mock()
+        client.config = CONFIG
+        client.coordinator_logins = {"coordinator"}
+        client.queue.return_value = values
+        client.comments.return_value = []
+
+        frozen = freeze_queue(client)
+
+        self.assertEqual([value.number for value in frozen.queue], [1, 2, 3])
+        self.assertEqual([value.number for value in frozen.next_batch], [4, 5])
+        self.assertEqual(frozen.batch["pull_requests"], [1, 2, 3])
+
+    def test_bounded_batch_does_not_split_overlap_component(self) -> None:
+        values = [
+            entry(1, "a.py"),
+            entry(2, "b.py"),
+            entry(3, "shared.py"),
+            entry(4, "shared.py"),
+            entry(5, "c.py"),
+        ]
+
+        selected = bounded_batch_entries(values, 3)
+
+        self.assertEqual([value.number for value in selected], [1, 2])
+
+    def test_bounded_batch_includes_queued_dependency_closure(self) -> None:
+        dependent = entry(1, "a.py")
+        dependent.dependencies = [4]
+        values = [dependent, entry(2, "b.py"), entry(3, "c.py"), entry(4, "d.py")]
+
+        selected = bounded_batch_entries(values, 3)
+
+        self.assertEqual([value.number for value in selected], [1, 2, 4])
+
+    def test_oversized_indivisible_overlap_closure_ships_alone(self) -> None:
+        values = [entry(number, "shared.py") for number in range(1, 5)]
+        values.append(entry(5, "independent.py"))
+
+        selected = bounded_batch_entries(values, 3)
+
+        self.assertEqual([value.number for value in selected], [1, 2, 3, 4])
+
+    def test_generated_overlap_does_not_exceed_batch_limit(self) -> None:
+        values = [entry(number, f"src/{number}.py") for number in range(1, 5)]
+        for value in values:
+            value.generated_paths = ["dist/app.js"]
+
+        selected = bounded_batch_entries(values, 3)
+
+        self.assertEqual([value.number for value in selected], [1, 2, 3])
+
+    def test_reactor_holds_admission_until_existing_release_finishes(self) -> None:
+        sha = "a" * 40
+        client = Mock()
+        client.config = CONFIG
+        client.pipeline_control.return_value = {"state": "running"}
+        client.base_sha.return_value = sha
+        client.workflow_runs.return_value = [
+            {
+                "id": 1,
+                "name": "CI",
+                "head_sha": sha,
+                "status": "in_progress",
+                "conclusion": None,
+                "created_at": "2026-06-20T00:00:00Z",
+                "updated_at": "2026-06-20T00:00:00Z",
+            }
+        ]
+        with (
+            patch(
+                "agent_merge_queue.cli.command_follow",
+                return_value={"state": "testing", "main_sha": sha},
+            ),
+            patch("agent_merge_queue.cli.command_promote") as promote,
+            redirect_stdout(io.StringIO()),
+        ):
+            result = command_react(client, follow=True, timeout_seconds=10)
+
+        self.assertEqual(result["state"], "release-held")
+        promote.assert_not_called()
+
+    def test_reactor_holds_admission_even_without_follow(self) -> None:
+        sha = "a" * 40
+        client = Mock()
+        client.config = CONFIG
+        client.pipeline_control.return_value = {"state": "running"}
+        client.base_sha.return_value = sha
+        client.workflow_runs.return_value = [
+            {
+                "id": 1,
+                "name": "CI",
+                "head_sha": sha,
+                "status": "in_progress",
+                "conclusion": None,
+            }
+        ]
+        with (
+            patch("agent_merge_queue.cli.command_follow") as follow_release,
+            patch("agent_merge_queue.cli.command_promote") as promote,
+            redirect_stdout(io.StringIO()),
+        ):
+            result = command_react(client, follow=False, timeout_seconds=10)
+
+        self.assertEqual(result["state"], "release-held")
+        follow_release.assert_not_called()
+        promote.assert_not_called()
+
+    def test_reactor_ignores_rerun_after_same_main_was_verified(self) -> None:
+        sha = "a" * 40
+        client = Mock()
+        client.config = CONFIG
+        client.pipeline_control.return_value = {"state": "running"}
+        client.base_sha.return_value = sha
+        client.verified_main_sha.return_value = sha
+        client.workflow_runs.return_value = [
+            {
+                "id": 2,
+                "name": "CI",
+                "head_sha": sha,
+                "status": "completed",
+                "conclusion": "failure",
+            }
+        ]
+        frozen = FreezeResult(None, [], [], [], [])
+        with (
+            patch("agent_merge_queue.cli.settle_integration_checks", return_value=[]),
+            patch("agent_merge_queue.cli.promote_integrations", return_value=[]),
+            patch(
+                "agent_merge_queue.cli.command_promote",
+                return_value={"promoted": [], "waiting": [], "blocked": []},
+            ) as promote,
+            patch("agent_merge_queue.cli.freeze_queue", return_value=frozen),
+            redirect_stdout(io.StringIO()),
+        ):
+            result = command_react(client, follow=False, timeout_seconds=10)
+
+        self.assertNotEqual(result.get("state"), "release-held")
+        promote.assert_called_once()
+
+    def test_reactor_holds_newly_merged_revision_before_ci_is_visible(self) -> None:
+        sha = "a" * 40
+        client = Mock()
+        client.config = CONFIG
+        client.pipeline_control.return_value = {"state": "running"}
+        client.base_sha.return_value = sha
+        client.workflow_runs.return_value = []
+        client.thread_records.return_value = [
+            {"phase": "merged", "merge_sha": "b" * 40}
+        ]
+        client.is_ancestor.return_value = True
+        with (
+            patch("agent_merge_queue.cli.command_promote") as promote,
+            redirect_stdout(io.StringIO()),
+        ):
+            result = command_react(client, follow=False, timeout_seconds=10)
+
+        self.assertEqual(result["state"], "release-held")
+        promote.assert_not_called()
+
+    def test_reactor_seeds_first_install_despite_historical_runs(self) -> None:
+        sha = "a" * 40
+        client = Mock()
+        client.config = CONFIG
+        client.pipeline_control.return_value = {"state": "running"}
+        client.base_sha.return_value = sha
+        client.workflow_runs.return_value = [
+            {
+                "id": 99,
+                "name": "CI",
+                "head_sha": "b" * 40,
+                "status": "completed",
+                "conclusion": "success",
+            }
+        ]
+        client.verified_main_sha.return_value = None
+        client.thread_records.return_value = []
+        client.deployment_notifications.return_value = []
+        frozen = FreezeResult(None, [], [], [], [])
+        with (
+            patch("agent_merge_queue.cli.settle_integration_checks", return_value=[]),
+            patch("agent_merge_queue.cli.promote_integrations", return_value=[]),
+            patch(
+                "agent_merge_queue.cli.command_promote",
+                return_value={"promoted": [], "waiting": [], "blocked": []},
+            ) as promote,
+            patch("agent_merge_queue.cli.freeze_queue", return_value=frozen),
+            redirect_stdout(io.StringIO()),
+        ):
+            result = command_react(client, follow=False, timeout_seconds=10)
+
+        self.assertNotEqual(result.get("state"), "release-held")
+        client.record_verified_main.assert_called_once_with(sha)
+        promote.assert_called_once()
+
+    def test_reactor_reconciles_external_merge_before_first_watermark(self) -> None:
+        sha = "a" * 40
+        client = Mock()
+        client.config = CONFIG
+        client.pipeline_control.return_value = {"state": "running"}
+        client.base_sha.return_value = sha
+        client.workflow_runs.return_value = []
+        client.verified_main_sha.return_value = None
+        client.thread_records.return_value = []
+        client.deployment_notifications.return_value = []
+        client.is_ancestor.return_value = True
+        with (
+            patch(
+                "agent_merge_queue.cli.reconcile_externally_merged_threads",
+                return_value=[{"merge_sha": "b" * 40, "pull_request": 1}],
+            ) as reconcile,
+            patch("agent_merge_queue.cli.command_promote") as promote,
+            redirect_stdout(io.StringIO()),
+        ):
+            result = command_react(client, follow=False, timeout_seconds=10)
+
+        self.assertEqual(result["state"], "release-held")
+        self.assertEqual(result["reconciled_merges"][0]["pull_request"], 1)
+        client.record_verified_main.assert_not_called()
+        reconcile.assert_called_once_with(client)
+        promote.assert_not_called()
+
+    def test_reactor_requires_configured_health_before_reopening_admission(self) -> None:
+        sha = "a" * 40
+        config = parse_config(
+            {
+                "queue": {
+                    "required_checks": ["CI"],
+                    "trusted_actors": ["trusted"],
+                },
+                "pipeline": {
+                    "verifications": [
+                        {"name": "Login", "url": "https://example.test/login"}
+                    ]
+                },
+            }
+        )
+        client = Mock()
+        client.config = config
+        client.pipeline_control.return_value = {"state": "running"}
+        client.base_sha.return_value = sha
+        client.workflow_runs.return_value = [
+            {
+                "id": 1,
+                "name": "CI",
+                "head_sha": sha,
+                "status": "completed",
+                "conclusion": "success",
+            },
+            {
+                "id": 2,
+                "name": "Deploy",
+                "head_sha": sha,
+                "status": "completed",
+                "conclusion": "success",
+            },
+        ]
+        with (
+            patch(
+                "agent_merge_queue.cli.http_verifications",
+                return_value=[{"name": "Login", "passed": False}],
+            ),
+            patch("agent_merge_queue.cli.command_promote") as promote,
+            redirect_stdout(io.StringIO()),
+        ):
+            result = command_react(client, follow=False, timeout_seconds=10)
+
+        self.assertEqual(result["state"], "release-held")
+        self.assertEqual(result["release"]["state"], "verify-failed")
+        promote.assert_not_called()
+
+    def test_release_repair_claim_creates_one_deterministic_lease(self) -> None:
+        sha = "a" * 40
+        client = object.__new__(GitHub)
+        client.config = CONFIG
+        client.repository = "example/repo"
+        client.trusted_logins = {"trusted"}
+        client.coordinator_logins = {"coordinator"}
+        client.require_actor = Mock(return_value="trusted")
+        client.base_sha = Mock(return_value=sha)
+        client.workflow_runs = Mock(
+            return_value=[
+                {
+                    "id": 7,
+                    "name": "CI",
+                    "head_sha": sha,
+                    "status": "completed",
+                    "conclusion": "success",
+                    "updated_at": "2026-06-20T00:01:00Z",
+                },
+                {
+                    "id": 8,
+                    "name": "Deploy",
+                    "head_sha": sha,
+                    "status": "completed",
+                    "conclusion": "failure",
+                    "created_at": "2026-06-20T00:02:00Z",
+                },
+            ]
+        )
+        client.registry_comments = Mock(return_value=[])
+        client.registry_issue_number = Mock(return_value=42)
+        client.issue_comment = Mock()
+        client._json = Mock(
+            side_effect=[
+                {"tree": {"sha": "t" * 40}},
+                {"sha": "l" * 40},
+                {},
+            ]
+        )
+
+        result = client.claim_release_repair(
+            provider="codex",
+            thread_id="thread-1",
+        )
+
+        self.assertEqual(result["state"], "owned")
+        self.assertEqual(result["branch"], f"deploybot/repair/{sha[:12]}")
+        self.assertEqual(result["run_id"], 8)
+        client.issue_comment.assert_called_once()
+
+    def test_repair_claim_ignores_unbacked_registry_owner(self) -> None:
+        sha = "a" * 40
+        owner = {
+            "branch": f"deploybot/repair/{sha[:12]}",
+            "main_sha": sha,
+            "provider": "codex",
+            "thread_id": "thread-1",
+        }
+        client = object.__new__(GitHub)
+        client.config = CONFIG
+        client.repository = "example/repo"
+        client.trusted_logins = {"trusted"}
+        client.coordinator_logins = {"coordinator"}
+        client.require_actor = Mock(return_value="trusted")
+        client.base_sha = Mock(return_value=sha)
+        client.workflow_runs = Mock(
+            return_value=[
+                {
+                    "id": 7,
+                    "name": "CI",
+                    "head_sha": sha,
+                    "status": "completed",
+                    "conclusion": "failure",
+                }
+            ]
+        )
+        client.registry_comments = Mock(
+            return_value=[
+                {
+                    "body": release_repair_body(owner),
+                    "created_at": "2026-06-20T00:00:00Z",
+                    "id": 1,
+                    "user": {"login": "coordinator"},
+                }
+            ]
+        )
+        client.registry_issue_number = Mock(return_value=42)
+        client.issue_comment = Mock()
+        client._json = Mock(
+            side_effect=[
+                {"tree": {"sha": "t" * 40}},
+                {"sha": "l" * 40},
+                {},
+            ]
+        )
+
+        result = client.claim_release_repair(
+            provider="claude", thread_id="thread-1"
+        )
+
+        self.assertEqual(result["state"], "owned")
+        self.assertEqual(result["provider"], "claude")
+        client.registry_comments.assert_not_called()
+
+    def test_release_repair_claim_accepts_failed_health_verification(self) -> None:
+        sha = "a" * 40
+        config = parse_config(
+            {
+                "queue": {
+                    "required_checks": ["CI"],
+                    "trusted_actors": ["trusted"],
+                },
+                "pipeline": {
+                    "verifications": [
+                        {"name": "Login", "url": "https://example.test/login"}
+                    ]
+                },
+            }
+        )
+        client = object.__new__(GitHub)
+        client.config = config
+        client.repository = "example/repo"
+        client.trusted_logins = {"trusted"}
+        client.coordinator_logins = {"coordinator"}
+        client.require_actor = Mock(return_value="trusted")
+        client.base_sha = Mock(return_value=sha)
+        client.workflow_runs = Mock(
+            return_value=[
+                {
+                    "id": 7,
+                    "name": "CI",
+                    "head_sha": sha,
+                    "status": "completed",
+                    "conclusion": "success",
+                },
+                {
+                    "id": 8,
+                    "name": "Deploy",
+                    "head_sha": sha,
+                    "status": "completed",
+                    "conclusion": "success",
+                },
+            ]
+        )
+        client.registry_comments = Mock(return_value=[])
+        client.registry_issue_number = Mock(return_value=42)
+        client.issue_comment = Mock()
+        client._json = Mock(
+            side_effect=[
+                {"tree": {"sha": "t" * 40}},
+                {"sha": "l" * 40},
+                {},
+            ]
+        )
+        with patch(
+            "agent_merge_queue.cli.http_verifications",
+            return_value=[{"name": "Login", "passed": False}],
+        ):
+            result = client.claim_release_repair(
+                provider="codex", thread_id="thread-1"
+            )
+
+        self.assertEqual(result["failure_state"], "verify-failed")
+
+    def test_existing_repair_ref_recovers_encoded_owner(self) -> None:
+        sha = "a" * 40
+        client = object.__new__(GitHub)
+        client.config = CONFIG
+        client.repository = "example/repo"
+        client.trusted_logins = {"trusted"}
+        client.coordinator_logins = {"coordinator"}
+        client.require_actor = Mock(return_value="trusted")
+        client.base_sha = Mock(return_value=sha)
+        client.workflow_runs = Mock(
+            return_value=[
+                {
+                    "id": 7,
+                    "name": "CI",
+                    "head_sha": sha,
+                    "status": "completed",
+                    "conclusion": "failure",
+                }
+            ]
+        )
+        client.registry_comments = Mock(return_value=[])
+        client.registry_issue_number = Mock(return_value=42)
+        client.issue_comment = Mock()
+        owner = {
+            "branch": f"deploybot/repair/{sha[:12]}",
+            "claimed_at": "2026-06-20T00:00:00Z",
+            "failure_state": "ci-failed",
+            "main_sha": sha,
+            "provider": "codex",
+            "run_id": 7,
+            "thread_id": "thread-1",
+            "thread_url": None,
+        }
+        client._json = Mock(
+            side_effect=[
+                {"tree": {"sha": "t" * 40}},
+                {"sha": "n" * 40},
+                QueueError("Reference already exists"),
+                {"object": {"sha": "l" * 40}},
+                {"message": RELEASE_REPAIR_LEASE_PREFIX + json.dumps(owner)},
+            ]
+        )
+
+        result = client.claim_release_repair(
+            provider="claude",
+            thread_id="thread-1",
+        )
+
+        self.assertEqual(result["state"], "claimed")
+        self.assertEqual(result["thread_id"], "thread-1")
+        client.issue_comment.assert_called_once()
+
+    def test_failed_repair_registry_write_is_recoverable_from_lease_ref(self) -> None:
+        sha = "a" * 40
+        client = object.__new__(GitHub)
+        client.config = CONFIG
+        client.repository = "example/repo"
+        client.trusted_logins = {"trusted"}
+        client.coordinator_logins = {"coordinator"}
+        client.require_actor = Mock(return_value="trusted")
+        client.base_sha = Mock(return_value=sha)
+        client.workflow_runs = Mock(
+            return_value=[
+                {
+                    "id": 7,
+                    "name": "CI",
+                    "head_sha": sha,
+                    "status": "completed",
+                    "conclusion": "failure",
+                }
+            ]
+        )
+        client.registry_comments = Mock(return_value=[])
+        client.registry_issue_number = Mock(return_value=42)
+        owner = {
+            "branch": f"deploybot/repair/{sha[:12]}",
+            "claimed_at": "2026-06-20T00:00:00Z",
+            "failure_state": "ci-failed",
+            "main_sha": sha,
+            "provider": "codex",
+            "run_id": 7,
+            "thread_id": "thread-1",
+            "thread_url": None,
+        }
+        client.issue_comment = Mock(
+            side_effect=[QueueError("temporary failure"), None]
+        )
+        client._json = Mock(
+            side_effect=[
+                {"tree": {"sha": "t" * 40}},
+                {"sha": "l" * 40},
+                {},
+                {"tree": {"sha": "t" * 40}},
+                {"sha": "n" * 40},
+                QueueError("Reference already exists"),
+                {"object": {"sha": "l" * 40}},
+                {"message": RELEASE_REPAIR_LEASE_PREFIX + json.dumps(owner)},
+            ]
+        )
+
+        with self.assertRaisesRegex(QueueError, "temporary failure"):
+            client.claim_release_repair(provider="codex", thread_id="thread-1")
+
+        result = client.claim_release_repair(
+            provider="codex", thread_id="thread-1"
+        )
+        self.assertEqual(result["state"], "owned")
+        self.assertEqual(result["lease_sha"], "l" * 40)
+
+    def test_release_repair_claim_rejects_main_that_advances_during_claim(self) -> None:
+        sha = "a" * 40
+        newer = "b" * 40
+        client = object.__new__(GitHub)
+        client.config = CONFIG
+        client.repository = "example/repo"
+        client.trusted_logins = {"trusted"}
+        client.coordinator_logins = {"coordinator"}
+        client.require_actor = Mock(return_value="trusted")
+        client.base_sha = Mock(side_effect=[sha, sha, newer])
+        client.workflow_runs = Mock(
+            return_value=[
+                {
+                    "id": 7,
+                    "name": "CI",
+                    "head_sha": sha,
+                    "status": "completed",
+                    "conclusion": "failure",
+                }
+            ]
+        )
+        client.registry_comments = Mock(return_value=[])
+        client._json = Mock(
+            side_effect=[
+                {"tree": {"sha": "t" * 40}},
+                {"sha": "l" * 40},
+                {},
+            ]
+        )
+        client._run = Mock(return_value="")
+
+        with self.assertRaisesRegex(QueueError, "advanced during claim"):
+            client.claim_release_repair(
+                provider="codex", thread_id="thread-1", main_sha=sha
+            )
+
+        client._run.assert_called_once()
+
+    def test_integration_can_require_non_actions_author(self) -> None:
+        config = parse_config(
+            {
+                "queue": {
+                    "required_checks": ["CI"],
+                    "trusted_actors": ["trusted"],
+                },
+                "integration": {"require_non_actions_author": True},
+            }
+        )
+        client = object.__new__(GitHub)
+        client.config = config
+        client.repository = "example/repo"
+        client.owner = "example"
+        client.coordinator_logins = {"trusted"}
+        client.base_sha = Mock(return_value="b" * 40)
+        client._json = Mock(
+            side_effect=[
+                {},
+                {},
+                {},
+                [],
+                {"number": 99, "user": {"login": "github-actions[bot]"}},
+            ]
+        )
+        client._run = Mock(return_value="")
+
+        with self.assertRaisesRegex(QueueError, "GitHub App installation token"):
+            client.create_integration_pull_request(
+                batch={"batch_id": "batch"},
+                entries=[entry(1), entry(2)],
+            )
+        self.assertEqual(client._run.call_count, 2)
+
+    def test_integration_requires_app_author_to_be_a_coordinator(self) -> None:
+        config = parse_config(
+            {
+                "queue": {
+                    "required_checks": ["CI"],
+                    "trusted_actors": ["trusted"],
+                },
+                "integration": {"require_non_actions_author": True},
+            }
+        )
+        client = object.__new__(GitHub)
+        client.config = config
+        client.repository = "example/repo"
+        client.owner = "example"
+        client.coordinator_logins = {"trusted"}
+        client.base_sha = Mock(return_value="b" * 40)
+        client._json = Mock(
+            side_effect=[
+                {},
+                {},
+                {},
+                [],
+                {"number": 99, "user": {"login": "deploybot-app[bot]"}},
+            ]
+        )
+        client._run = Mock(return_value="")
+
+        with self.assertRaisesRegex(QueueError, "queue.coordinator_actors"):
+            client.create_integration_pull_request(
+                batch={"batch_id": "batch"},
+                entries=[entry(1), entry(2)],
+            )
+        self.assertEqual(client._run.call_count, 2)
 
     def test_queue_marker_rejects_forgery_and_free_text_injection(self) -> None:
         sha = "a" * 40
@@ -1934,7 +2629,13 @@ class QueueCoreTest(unittest.TestCase):
         self.assertEqual(client.changed_paths.call_count, 2)
         self.assertEqual(
             frozen.overlap_groups,
-            [{"pull_requests": [1, 2], "source_paths": ["shared.py"]}],
+            [
+                {
+                    "pull_requests": [1, 2],
+                    "source_paths": ["shared.py"],
+                    "generated_paths": [],
+                }
+            ],
         )
         self.assertEqual(
             frozen.batch["source_paths"],
@@ -2063,6 +2764,31 @@ class QueueCoreTest(unittest.TestCase):
         self.assertEqual(result["batch_ids"], ["first", "second"])
         self.assertEqual(result["merged"][0]["number"], 2)
         self.assertEqual(result["waiting"][0]["number"], 1)
+
+    def test_drain_stops_after_one_batch_merges(self) -> None:
+        first_entry = entry(1, "a.py")
+        later_entry = entry(2, "b.py")
+        first = FreezeResult(
+            batch={"batch_id": "first"},
+            queue=[first_entry],
+            blocked_queue=[],
+            next_batch=[later_entry],
+            overlap_groups=[],
+        )
+        client = Mock()
+        with (
+            patch("agent_merge_queue.cli.freeze_queue", return_value=first) as freeze,
+            patch(
+                "agent_merge_queue.cli.command_merge", return_value="m" * 40
+            ) as merge,
+            redirect_stdout(io.StringIO()),
+        ):
+            result = command_drain(client, json_output=True)
+
+        freeze.assert_called_once()
+        merge.assert_called_once()
+        self.assertEqual(result["merged"][0]["number"], 1)
+        self.assertEqual(result["next_batch"], [2])
 
     def test_reenqueue_toggles_label_to_wake_event_coordinator(self) -> None:
         value = entry(1)
@@ -2897,7 +3623,7 @@ class QueueCoreTest(unittest.TestCase):
         client.config = config
         client.coordinator_logins = {"coordinator"}
         client.pipeline_control.return_value = {"state": "running"}
-        client.queued_numbers.return_value = []
+        client.queued_numbers.return_value = [1, 2, 99]
         client.integration_pull_request_numbers.return_value = []
         client.create_integration_pull_request.return_value = {
             "number": 99,
@@ -2913,7 +3639,19 @@ class QueueCoreTest(unittest.TestCase):
                 side_effect=[[], [99]],
             ),
             patch("agent_merge_queue.cli.command_promote", return_value={}),
-            patch("agent_merge_queue.cli.freeze_queue", return_value=frozen),
+            patch(
+                "agent_merge_queue.cli.freeze_queue",
+                side_effect=[
+                    frozen,
+                    FreezeResult(
+                        new_batch([entry(99)], frozen_at="2026-06-20T00:01:00Z"),
+                        [entry(99)],
+                        [],
+                        [],
+                        [],
+                    ),
+                ],
+            ) as freeze,
             patch(
                 "agent_merge_queue.cli.command_drain",
                 return_value={
@@ -2928,7 +3666,12 @@ class QueueCoreTest(unittest.TestCase):
             redirect_stdout(io.StringIO()),
         ):
             result = command_react(client, follow=False, timeout_seconds=10)
-        drain.assert_called_once_with(client, json_output=False, emit=False)
+        self.assertEqual(
+            freeze.call_args_list,
+            [call(client, known_entries=[], held_numbers=set()), call(client, held_numbers={1, 2})],
+        )
+        drain.assert_called_once()
+        self.assertEqual(drain.call_args.kwargs["initial_frozen"].queue[0].number, 99)
         self.assertEqual(result["integrations"][0]["number"], 99)
         self.assertEqual(result["drain"]["merged"][0]["number"], 99)
 
@@ -3018,7 +3761,6 @@ class QueueCoreTest(unittest.TestCase):
                     emit=False,
                     initial_frozen=existing_frozen,
                 ),
-                call(client, json_output=False, emit=False),
             ],
         )
         client.create_integration_pull_request.assert_called_once_with(
@@ -3027,7 +3769,7 @@ class QueueCoreTest(unittest.TestCase):
         )
         self.assertEqual(
             [value["number"] for value in result["drain"]["merged"]],
-            [99, 100],
+            [99],
         )
 
     def test_reactor_establishes_overlap_integration_before_draining(self) -> None:
@@ -3088,7 +3830,7 @@ class QueueCoreTest(unittest.TestCase):
         ):
             command_react(client, follow=False, timeout_seconds=10)
 
-        self.assertEqual(events, ["integration", "settle", "drain", "drain"])
+        self.assertEqual(events, ["integration", "settle", "drain"])
 
     def test_reactor_does_not_drain_when_overlap_integration_creation_fails(
         self,

@@ -131,6 +131,8 @@ class DocumentationTest(unittest.TestCase):
                 "ci_failure_grace_seconds",
                 "promotion_workers",
                 "repair_hold_minutes",
+                "hold_merges_while_releasing",
+                "repair_branch_prefix",
                 "ready_to_merge_target_minutes",
                 "merge_to_live_target_minutes",
                 "auto_promote",
@@ -142,7 +144,13 @@ class DocumentationTest(unittest.TestCase):
                 "url",
                 "expected_status",
             },
-            "integration": {"mode", "branch_prefix", "title_prefix"},
+            "integration": {
+                "mode",
+                "branch_prefix",
+                "title_prefix",
+                "max_batch_size",
+                "require_non_actions_author",
+            },
         }
         queue_fields = {field.name for field in fields(QueueConfig)} - {
             "review_providers",

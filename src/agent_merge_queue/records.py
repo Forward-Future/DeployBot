@@ -12,9 +12,11 @@ from typing import Any, Iterable
 THREAD_PREFIX = "deploybot-thread:v1"
 INTENT_PREFIX = "deploybot-intent:v1"
 REPAIR_PREFIX = "deploybot-repair:v1"
+RELEASE_REPAIR_PREFIX = "deploybot-release-repair:v1"
 CONTROL_PREFIX = "deploybot-control:v1"
 INTEGRATION_PREFIX = "deploybot-integration:v1"
 NOTIFICATION_PREFIX = "deploybot-notification:v1"
+RELEASE_WATERMARK_PREFIX = "deploybot-release-watermark:v1"
 
 THREAD_PHASES = {
     "working",
@@ -60,12 +62,18 @@ def _marker(prefix: str, prose: str) -> re.Pattern[str]:
 THREAD_MARKER = _marker(THREAD_PREFIX, "Recorded DeployBot thread metadata.")
 INTENT_MARKER = _marker(INTENT_PREFIX, "Recorded DeployBot deploy intent.")
 REPAIR_MARKER = _marker(REPAIR_PREFIX, "Recorded DeployBot repair handoff.")
+RELEASE_REPAIR_MARKER = _marker(
+    RELEASE_REPAIR_PREFIX, "Recorded DeployBot release repair lease."
+)
 CONTROL_MARKER = _marker(CONTROL_PREFIX, "Recorded DeployBot pipeline control.")
 INTEGRATION_MARKER = _marker(
     INTEGRATION_PREFIX, "Recorded DeployBot integration pull request."
 )
 NOTIFICATION_MARKER = _marker(
     NOTIFICATION_PREFIX, "Recorded DeployBot thread notification."
+)
+RELEASE_WATERMARK_MARKER = _marker(
+    RELEASE_WATERMARK_PREFIX, "Recorded DeployBot verified main watermark."
 )
 
 
@@ -430,6 +438,40 @@ def latest_intent(
 def repair_body(payload: dict[str, Any]) -> str:
     value = {"schema": 1, **payload}
     return marker_body(REPAIR_PREFIX, value, "Recorded DeployBot repair handoff.")
+
+
+def release_repair_body(payload: dict[str, Any]) -> str:
+    value = {"schema": 1, **payload}
+    return marker_body(
+        RELEASE_REPAIR_PREFIX,
+        value,
+        "Recorded DeployBot release repair lease.",
+    )
+
+
+def release_watermark_body(main_sha: str) -> str:
+    return marker_body(
+        RELEASE_WATERMARK_PREFIX,
+        {"main_sha": main_sha, "recorded_at": utc_now(), "schema": 1},
+        "Recorded DeployBot verified main watermark.",
+    )
+
+
+def latest_release_repair(
+    comments: Iterable[dict[str, Any]],
+    trusted_logins: Iterable[str],
+    *,
+    main_sha: str,
+) -> dict[str, Any] | None:
+    trusted = {value.lower() for value in trusted_logins}
+    found: list[tuple[tuple[str, int, int], dict[str, Any]]] = []
+    for index, comment in enumerate(comments):
+        if comment_login(comment) not in trusted:
+            continue
+        value = _payload(str(comment.get("body") or ""), RELEASE_REPAIR_MARKER)
+        if value is not None and value.get("main_sha") == main_sha:
+            found.append((_comment_key(comment, index), value))
+    return max(found, key=lambda item: item[0])[1] if found else None
 
 
 def control_body(*, state: str, reason: str | None = None) -> str:
