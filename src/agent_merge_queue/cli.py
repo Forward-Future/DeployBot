@@ -783,6 +783,9 @@ class GitHub:
         for name, color, description in self.label_specs():
             if name in existing:
                 continue
+            # The pre-read preserves existing label metadata in the normal
+            # path; --force makes the remaining list/create race idempotent if
+            # another first-use worker creates this label concurrently.
             self._run(
                 "label",
                 "create",

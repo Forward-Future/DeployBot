@@ -92,6 +92,30 @@ def entry(number: int, *paths: str, state: str = "ready") -> QueueEntry:
 
 
 class QueueCoreTest(unittest.TestCase):
+    def test_ensure_labels_exist_is_race_safe(self) -> None:
+        client = object.__new__(GitHub)
+        client.repository = "example/repo"
+        client._json = Mock(return_value=[])
+        client._run = Mock()
+        client.label_specs = Mock(
+            return_value=(("merge-queue", "0E8A16", "Queue label"),)
+        )
+
+        client.ensure_labels_exist()
+
+        client._run.assert_called_once_with(
+            "label",
+            "create",
+            "merge-queue",
+            "--repo",
+            "example/repo",
+            "--color",
+            "0E8A16",
+            "--description",
+            "Queue label",
+            "--force",
+        )
+
     def test_status_is_a_read_only_pipeline_view(self) -> None:
         status = {"repository": "example/repo"}
         with (
