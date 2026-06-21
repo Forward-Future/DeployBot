@@ -600,6 +600,7 @@ class QueueEntry:
     state: str = "waiting"
     reasons: list[str] | None = None
     priority_at: str | None = None
+    integration_batch_id: str | None = None
 
     def classify(
         self,
@@ -677,6 +678,7 @@ class GitHub:
         if self.repository.count("/") != 1:
             raise QueueError(f"invalid repository name: {self.repository}")
         self.owner, self.name = self.repository.split("/", 1)
+        self._registry_issue_cache: int | None = None
         self.trusted_logins = {
             self.owner if value == "@repository-owner" else value
             for value in self.config.trusted_actors
@@ -1001,6 +1003,9 @@ class GitHub:
         return comparison.get("status") in {"ahead", "identical"}
 
     def registry_issue_number(self, *, create: bool) -> int | None:
+        cached = getattr(self, "_registry_issue_cache", None)
+        if cached is not None:
+            return cached
         values = self._paged_api(
             f"repos/{self.repository}/issues?state=all&labels={self.config.pipeline.registry_label}&per_page=100"
         )
@@ -1015,7 +1020,9 @@ class GitHub:
             # workers can both create a registry after observing none. The
             # lowest issue number is deterministic and comments remain trusted
             # by authenticated author, so all workers safely converge there.
-            return min(int(value["number"]) for value in matches)
+            canonical = min(int(value["number"]) for value in matches)
+            self._registry_issue_cache = canonical
+            return canonical
         if not create:
             return None
         self.ensure_labels_exist()
@@ -1033,7 +1040,9 @@ class GitHub:
         )
         # Re-read after creation so a concurrent lower-numbered creator wins
         # before this worker writes any metadata to its candidate issue.
-        return self.registry_issue_number(create=False) or int(created["number"])
+        canonical = self.registry_issue_number(create=False) or int(created["number"])
+        self._registry_issue_cache = canonical
+        return canonical
 
     def issue_comment(self, number: int, body: str) -> None:
         self._json(
@@ -1355,6 +1364,11 @@ class GitHub:
                 body, self.config.dependency_directive
             ),
             priority_at=marker_priority_at(marker),
+            integration_batch_id=(
+                str(marker.get("integration_batch_id") or "") or None
+                if marker
+                else None
+            ),
         )
         entry.classify(
             self.config,
@@ -1380,6 +1394,7 @@ class GitHub:
             entries,
             key=lambda entry: (
                 entry.priority_at or entry.queued_at or "9999",
+                entry.number if entry.priority_at else 0,
                 entry.queued_at or "9999",
                 entry.number,
             ),
@@ -1453,35 +1468,54 @@ class GitHub:
         )
         return comparison.get("status") in {"ahead", "identical"}
 
-    def merge(self, number: int, head_sha: str) -> str:
-        authorization = self._json(
-            "pr",
-            "view",
-            str(number),
-            "--repo",
-            self.repository,
-            "--json",
-            "headRefOid,isDraft,labels,state",
-        )
-        labels = {
-            str(label.get("name") or "") for label in authorization.get("labels") or []
-        }
-        if authorization.get("state") != "OPEN":
-            raise QueueError(f"PR #{number} is no longer open")
-        if authorization.get("isDraft"):
-            raise QueueError(f"PR #{number} returned to draft before merge")
-        if authorization.get("headRefOid") != head_sha:
-            raise QueueError(f"PR #{number} changed immediately before merge")
+    def merge(
+        self,
+        number: int,
+        head_sha: str,
+        *,
+        authorization_entry: QueueEntry | None = None,
+    ) -> str:
+        if authorization_entry is None:
+            authorization = self._json(
+                "pr",
+                "view",
+                str(number),
+                "--repo",
+                self.repository,
+                "--json",
+                "headRefOid,isDraft,labels,state",
+            )
+            labels = {
+                str(label.get("name") or "")
+                for label in authorization.get("labels") or []
+            }
+            if authorization.get("state") != "OPEN":
+                raise QueueError(f"PR #{number} is no longer open")
+            if authorization.get("isDraft"):
+                raise QueueError(f"PR #{number} returned to draft before merge")
+            if authorization.get("headRefOid") != head_sha:
+                raise QueueError(f"PR #{number} changed immediately before merge")
+            marker = queue_marker_for_client(self, self.comments(number))
+            integration_batch_id = str(marker.get("integration_batch_id") or "") if marker else ""
+        else:
+            labels = set(authorization_entry.labels)
+            if authorization_entry.is_draft:
+                raise QueueError(f"PR #{number} returned to draft before merge")
+            if authorization_entry.head_sha != head_sha:
+                raise QueueError(f"PR #{number} changed immediately before merge")
+            marker = {
+                "state": authorization_entry.queue_state,
+                "head_sha": authorization_entry.queued_head_sha,
+            }
+            integration_batch_id = authorization_entry.integration_batch_id or ""
         if self.config.queue_label not in labels or self.config.blocked_label in labels:
             raise QueueError(f"PR #{number} queue authorization was revoked")
-        marker = queue_marker_for_client(self, self.comments(number))
         if (
             not marker
             or marker.get("state") != "queued"
             or marker.get("head_sha") != head_sha
         ):
             raise QueueError(f"PR #{number} durable queue authorization was revoked")
-        integration_batch_id = str(marker.get("integration_batch_id") or "")
         if integration_batch_id:
             integration = latest_payload(
                 self.comments(number),
@@ -2284,6 +2318,7 @@ def freeze_queue(
             entries_by_number.values(),
             key=lambda entry: (
                 entry.priority_at or entry.queued_at or "9999",
+                entry.number if entry.priority_at else 0,
                 entry.queued_at or "9999",
                 entry.number,
             ),
@@ -2489,7 +2524,8 @@ def command_merge(
     frozen_batch: dict[str, Any] | None = None,
     active_numbers: set[int] | None = None,
 ) -> str:
-    require_running_pipeline(client)
+    if frozen_entry is None or frozen_batch is None:
+        require_running_pipeline(client)
     number = frozen_entry.number if frozen_entry is not None else client.resolve_pr(selector)
     batch = frozen_batch
     if batch is not None and str(batch.get("batch_id") or "") != batch_id:
@@ -2567,7 +2603,11 @@ def command_merge(
     if fresh.queued_at and str(batch.get("frozen_at") or "") < fresh.queued_at:
         raise QueueError(f"batch {batch_id} predates the current queue authorization")
 
-    merge_sha = client.merge(number, fresh.head_sha)
+    merge_sha = client.merge(
+        number,
+        fresh.head_sha,
+        authorization_entry=fresh,
+    )
     merged_comments = client.comments(number)
     intent = latest_intent(merged_comments, client.trusted_logins)
     integration = latest_payload(
@@ -2889,6 +2929,20 @@ def release_follow_needed(client: GitHub) -> bool:
     return True
 
 
+def should_settle_batch(client: GitHub, entries: list[QueueEntry]) -> bool:
+    has_ready = any(
+        client.config.queue_label in entry.labels and entry.state == "ready"
+        for entry in entries
+    )
+    has_near_ready = any(
+        client.config.queue_label not in entry.labels
+        and client.config.blocked_label not in entry.labels
+        and entry.state == "waiting"
+        for entry in entries
+    )
+    return has_ready and has_near_ready
+
+
 def command_react(
     client: GitHub,
     *,
@@ -2908,6 +2962,23 @@ def command_react(
         emit=False,
         captured_entries=captured_entries,
     )
+    if (
+        client.config.pipeline.batch_settle_seconds
+        and should_settle_batch(client, captured_entries)
+    ):
+        time.sleep(client.config.pipeline.batch_settle_seconds)
+        settled_entries: list[QueueEntry] = []
+        settled = command_promote(
+            client,
+            emit=False,
+            captured_entries=settled_entries,
+        )
+        promoted["promoted"] = list(
+            dict.fromkeys(promoted["promoted"] + settled["promoted"])
+        )
+        promoted["blocked"] = promoted["blocked"] + settled["blocked"]
+        promoted["waiting"] = settled["waiting"]
+        captured_entries = settled_entries
     frozen = freeze_queue(client, known_entries=captured_entries)
     integrations: list[dict[str, Any]] = []
     if (

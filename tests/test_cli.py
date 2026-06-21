@@ -42,6 +42,7 @@ from agent_merge_queue.cli import (
     queue_from_intent,
     queue_timestamp,
     reusable_batch,
+    should_settle_batch,
     structured_dependencies,
 )
 from agent_merge_queue.config import parse_config
@@ -144,6 +145,30 @@ class QueueCoreTest(unittest.TestCase):
             client.comment.call_args.args[1],
         )
 
+    def test_settle_window_only_collects_a_mixed_ready_burst(self) -> None:
+        ready = entry(1)
+        waiting = entry(2, state="waiting")
+        waiting.labels = ["deploy-requested"]
+        client = Mock()
+        client.config = CONFIG
+
+        self.assertTrue(should_settle_batch(client, [ready, waiting]))
+        self.assertFalse(should_settle_batch(client, [ready]))
+        waiting.labels.append("merge-queue-blocked")
+        self.assertFalse(should_settle_batch(client, [ready, waiting]))
+
+    def test_simultaneous_intents_use_pull_request_number_as_fifo_tiebreaker(self) -> None:
+        first = entry(1)
+        second = entry(2)
+        first.priority_at = second.priority_at = "2026-06-20T00:00:00Z"
+        first.queued_at = "2026-06-20T00:00:02Z"
+        second.queued_at = "2026-06-20T00:00:01Z"
+        client = object.__new__(GitHub)
+        client.queued_numbers = Mock(return_value=[2, 1])
+        client.snapshot = Mock(side_effect=lambda number: {1: first, 2: second}[number])
+
+        self.assertEqual([value.number for value in client.queue()], [1, 2])
+
     def test_registry_race_converges_on_the_lowest_issue_number(self) -> None:
         client = object.__new__(GitHub)
         client.config = CONFIG
@@ -189,6 +214,11 @@ class QueueCoreTest(unittest.TestCase):
             1,
             known_source_paths=["a.py"],
             known_generated_paths=[],
+        )
+        client.merge.assert_called_once_with(
+            1,
+            value.head_sha,
+            authorization_entry=value,
         )
 
     def test_generated_paths_are_configurable(self) -> None:
@@ -871,6 +901,25 @@ class QueueCoreTest(unittest.TestCase):
 
         with self.assertRaisesRegex(QueueError, "durable queue authorization"):
             client.merge(1, value.head_sha)
+        self.assertEqual(client._json.call_count, 1)
+
+    def test_prevalidated_merge_avoids_duplicate_authorization_reads(self) -> None:
+        value = entry(1)
+        client = object.__new__(GitHub)
+        client.config = CONFIG
+        client.repository = "example/repo"
+        client.trusted_logins = {"trusted"}
+        client._json = Mock(return_value={"merged": True, "sha": "m" * 40})
+        client.comments = Mock()
+
+        result = client.merge(
+            1,
+            value.head_sha,
+            authorization_entry=value,
+        )
+
+        self.assertEqual(result, "m" * 40)
+        client.comments.assert_not_called()
         self.assertEqual(client._json.call_count, 1)
 
     def test_final_integration_merge_requires_current_exact_head_intent(self) -> None:

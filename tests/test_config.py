@@ -183,6 +183,7 @@ class ConfigTest(unittest.TestCase):
                 "pipeline": {
                     "ci_workflows": ["Main CI"],
                     "deploy_workflows": ["Production"],
+                    "batch_settle_seconds": 30,
                     "auto_promote": False,
                     "verifications": [
                         {
@@ -196,6 +197,7 @@ class ConfigTest(unittest.TestCase):
             }
         )
         self.assertEqual(config.pipeline.ci_workflows, ("Main CI",))
+        self.assertEqual(config.pipeline.batch_settle_seconds, 30)
         self.assertFalse(config.pipeline.auto_promote)
         self.assertEqual(config.pipeline.verifications[0].expected_status, 200)
         self.assertEqual(config.integration.mode, "all")
@@ -229,6 +231,16 @@ class ConfigTest(unittest.TestCase):
                         "trusted_actors": ["trusted"],
                     },
                     "pipeline": {"intent_scope": "pull-request"},
+                }
+            )
+        with self.assertRaisesRegex(ConfigError, "batch_settle_seconds"):
+            parse_config(
+                {
+                    "queue": {
+                        "required_checks": ["CI"],
+                        "trusted_actors": ["trusted"],
+                    },
+                    "pipeline": {"batch_settle_seconds": -1},
                 }
             )
 
