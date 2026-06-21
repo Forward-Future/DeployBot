@@ -14,7 +14,7 @@ import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable
 from urllib.parse import quote
@@ -639,6 +639,38 @@ def repair_marker_is_transitional(marker: dict[str, Any] | None) -> bool:
     return bool(reasons) and not any(reason_requires_repair(value) for value in reasons)
 
 
+def repair_overlap_hold_active(
+    client: "GitHub",
+    entry: "QueueEntry",
+    intent: dict[str, Any],
+    repair: dict[str, Any] | None,
+    *,
+    now: str | None = None,
+) -> bool:
+    """Keep genuine repairs in overlap scheduling without authorizing a merge."""
+    if not repair or repair_marker_is_transitional(repair):
+        return False
+    if str(repair.get("intent_id") or "") != str(intent.get("intent_id") or ""):
+        return False
+    if str(repair.get("pull_request") or "") != str(entry.number):
+        return False
+    created_at = parse_time(
+        str(repair.get("hold_started_at") or repair.get("created_at") or "")
+    )
+    current = parse_time(now or utc_now())
+    if (
+        created_at is None
+        or current is None
+        or created_at.tzinfo is None
+        or current.tzinfo is None
+    ):
+        return False
+    expires_at = created_at + timedelta(
+        minutes=client.config.pipeline.repair_hold_minutes
+    )
+    return current <= expires_at
+
+
 @dataclass
 class QueueEntry:
     number: int
@@ -662,6 +694,7 @@ class QueueEntry:
     reasons: list[str] | None = None
     priority_at: str | None = None
     integration_batch_id: str | None = None
+    repair_overlap_hold: bool = False
 
     def classify(
         self,
@@ -1872,44 +1905,30 @@ class GitHub:
         self,
         number: int,
         head_sha: str,
-        *,
-        authorization_entry: QueueEntry | None = None,
     ) -> str:
-        if authorization_entry is None:
-            authorization = self._json(
-                "pr",
-                "view",
-                str(number),
-                "--repo",
-                self.repository,
-                "--json",
-                "headRefOid,isDraft,labels,state",
-            )
-            labels = {
-                str(label.get("name") or "")
-                for label in authorization.get("labels") or []
-            }
-            if authorization.get("state") != "OPEN":
-                raise QueueError(f"PR #{number} is no longer open")
-            if authorization.get("isDraft"):
-                raise QueueError(f"PR #{number} returned to draft before merge")
-            if authorization.get("headRefOid") != head_sha:
-                raise QueueError(f"PR #{number} changed immediately before merge")
-            marker = queue_marker_for_client(self, self.comments(number))
-            integration_batch_id = (
-                str(marker.get("integration_batch_id") or "") if marker else ""
-            )
-        else:
-            labels = set(authorization_entry.labels)
-            if authorization_entry.is_draft:
-                raise QueueError(f"PR #{number} returned to draft before merge")
-            if authorization_entry.head_sha != head_sha:
-                raise QueueError(f"PR #{number} changed immediately before merge")
-            marker = {
-                "state": authorization_entry.queue_state,
-                "head_sha": authorization_entry.queued_head_sha,
-            }
-            integration_batch_id = authorization_entry.integration_batch_id or ""
+        authorization = self._json(
+            "pr",
+            "view",
+            str(number),
+            "--repo",
+            self.repository,
+            "--json",
+            "headRefOid,isDraft,labels,state",
+        )
+        labels = {
+            str(label.get("name") or "")
+            for label in authorization.get("labels") or []
+        }
+        if authorization.get("state") != "OPEN":
+            raise QueueError(f"PR #{number} is no longer open")
+        if authorization.get("isDraft"):
+            raise QueueError(f"PR #{number} returned to draft before merge")
+        if authorization.get("headRefOid") != head_sha:
+            raise QueueError(f"PR #{number} changed immediately before merge")
+        marker = queue_marker_for_client(self, self.comments(number))
+        integration_batch_id = (
+            str(marker.get("integration_batch_id") or "") if marker else ""
+        )
         if self.config.queue_label not in labels or self.config.blocked_label in labels:
             raise QueueError(f"PR #{number} queue authorization was revoked")
         if (
@@ -2542,10 +2561,23 @@ def record_repair(
         and previous.get("reason") == reason
     ):
         return previous
+    created_at = utc_now()
+    hold_started_at = created_at
+    if (
+        previous
+        and previous.get("intent_id") == (intent or {}).get("intent_id")
+        and not repair_marker_is_transitional(previous)
+    ):
+        hold_started_at = str(
+            previous.get("hold_started_at")
+            or previous.get("created_at")
+            or created_at
+        )
     payload = {
         "base_sha": client.base_sha(),
-        "created_at": utc_now(),
+        "created_at": created_at,
         "head_sha": entry.head_sha,
+        "hold_started_at": hold_started_at,
         "intent_id": (intent or {}).get("intent_id"),
         "provider": (intent or {}).get("provider"),
         "pull_request": entry.number,
@@ -2692,6 +2724,17 @@ def command_promote(
             known_comments=comments,
             defer_paths_until_ready=True,
         )
+        repair = latest_payload(
+            comments,
+            REPAIR_MARKER,
+            coordinator_logins(client),
+        )
+        entry.repair_overlap_hold = repair_overlap_hold_active(
+            client,
+            entry,
+            intent,
+            repair,
+        )
         if (
             client.config.pipeline.intent_scope == "head"
             and intent.get("requested_head") != entry.head_sha
@@ -2700,18 +2743,25 @@ def command_promote(
                 "deploy intent is bound to an older head; the trusted source agent "
                 "must run deploybot refresh-request after fresh gates pass"
             )
-            record_repair(client, entry, intent, reason)
+            repair = record_repair(client, entry, intent, reason)
+            entry.repair_overlap_hold = repair_overlap_hold_active(
+                client,
+                entry,
+                intent,
+                repair,
+            )
             return "blocked", {"number": number, "reason": reason}, entry
         if client.config.blocked_label in entry.labels:
-            repair = latest_payload(
-                comments,
-                REPAIR_MARKER,
-                coordinator_logins(client),
-            )
             if repair_marker_is_transitional(repair):
                 if deployment_repair_required(entry):
                     reason = "; ".join(entry.reasons or ["blocked"])
-                    record_repair(client, entry, intent, reason)
+                    repair = record_repair(client, entry, intent, reason)
+                    entry.repair_overlap_hold = repair_overlap_hold_active(
+                        client,
+                        entry,
+                        intent,
+                        repair,
+                    )
                     return "blocked", {"number": number, "reason": reason}, entry
                 client.remove_label(number, client.config.blocked_label)
                 entry.labels = [
@@ -2744,7 +2794,13 @@ def command_promote(
             return "ready", None, entry
         if deployment_repair_required(entry):
             reason = "; ".join(entry.reasons or ["blocked"])
-            record_repair(client, entry, intent, reason)
+            repair = record_repair(client, entry, intent, reason)
+            entry.repair_overlap_hold = repair_overlap_hold_active(
+                client,
+                entry,
+                intent,
+                repair,
+            )
             return "blocked", {"number": number, "reason": reason}, entry
         return (
             "waiting",
@@ -3528,11 +3584,7 @@ def command_merge(
                 f"batch {batch_id} predates the current queue authorization"
             )
 
-        merge_sha = client.merge(
-            number,
-            fresh.head_sha,
-            authorization_entry=fresh,
-        )
+        merge_sha = client.merge(number, fresh.head_sha)
     merged_comments = client.comments(number)
     intent = latest_intent(merged_comments, client.trusted_logins)
     integration = latest_payload(
@@ -4255,9 +4307,12 @@ def should_settle_batch(client: GitHub, entries: list[QueueEntry]) -> bool:
         for entry in entries
     )
     has_near_ready = any(
-        client.config.queue_label not in entry.labels
-        and client.config.blocked_label not in entry.labels
-        and entry.state == "waiting"
+        entry.repair_overlap_hold
+        or (
+            client.config.queue_label not in entry.labels
+            and client.config.blocked_label not in entry.labels
+            and entry.state == "waiting"
+        )
         for entry in entries
     )
     return has_ready and has_near_ready
@@ -4279,9 +4334,12 @@ def near_ready_overlap_holds(
     waiting = {
         entry.number: entry
         for entry in entries
-        if entry.state == "waiting"
-        and client.config.queue_label not in entry.labels
-        and client.config.blocked_label not in entry.labels
+        if entry.repair_overlap_hold
+        or (
+            entry.state == "waiting"
+            and client.config.queue_label not in entry.labels
+            and client.config.blocked_label not in entry.labels
+        )
     }
     if not ready or not waiting:
         return {}

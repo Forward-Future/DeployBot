@@ -47,6 +47,7 @@ class PipelineConfig:
     batch_settle_seconds: int
     ci_failure_grace_seconds: int
     promotion_workers: int
+    repair_hold_minutes: int
     ready_to_merge_target_minutes: int
     merge_to_live_target_minutes: int
     auto_promote: bool
@@ -122,6 +123,7 @@ deploy_workflows = ["Deploy"]
 batch_settle_seconds = 15
 ci_failure_grace_seconds = 90
 promotion_workers = 4
+repair_hold_minutes = 60
 ready_to_merge_target_minutes = 15
 merge_to_live_target_minutes = 10
 auto_promote = true
@@ -444,6 +446,11 @@ def parse_config(payload: dict[str, Any]) -> QueueConfig:
                 pipeline.get("promotion_workers"),
                 "pipeline.promotion_workers",
                 4,
+            ),
+            repair_hold_minutes=_positive_int(
+                pipeline.get("repair_hold_minutes"),
+                "pipeline.repair_hold_minutes",
+                60,
             ),
             ready_to_merge_target_minutes=_positive_int(
                 pipeline.get("ready_to_merge_target_minutes"),

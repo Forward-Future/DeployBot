@@ -20,6 +20,10 @@ honor dependencies, route overlap or cumulative validation through
 and use `resume_pull_request` after fresh review. Finish with `follow_release`;
 a failed CI or deployment pauses the pipeline until verified recovery.
 
+A genuine repair remains merge-ineligible, but DeployBot may temporarily hold
+overlapping ready work for the configured bounded repair window so concurrent
+merges do not repeatedly invalidate the replacement head.
+
 When `follow_release` returns `thread_notifications`, send each supplied
 message to its native source thread. The source thread calls
 `acknowledge_thread_deployment` with the matching `notification_id`. Present the
