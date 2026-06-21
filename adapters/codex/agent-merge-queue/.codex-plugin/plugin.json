@@ -1,7 +1,7 @@
 {
   "name": "deploybot",
-  "version": "0.2.4",
-  "description": "Review, queue, and land pull requests through a shared GitHub merge queue",
+  "version": "0.2.9",
+  "description": "Coordinate exact-head pull requests through verified deployment and thread notification",
   "author": {
     "name": "DeployBot contributors"
   },
@@ -11,7 +11,7 @@
   "interface": {
     "displayName": "DeployBot",
     "shortDescription": "Review and land pull requests safely.",
-    "longDescription": "Coordinates exact-head review, manual deploy authorization, burst merging, blockers, and overlapping pull requests.",
+    "longDescription": "Coordinates exact-head review, manual deploy authorization, burst merging, overlap handling, exact-main verification, and source-thread deployment receipts.",
     "developerName": "DeployBot contributors",
     "category": "Productivity",
     "capabilities": ["Interactive", "Write"],
