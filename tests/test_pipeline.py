@@ -105,6 +105,33 @@ class PipelineTest(unittest.TestCase):
         self.assertEqual(value["state"], "awaiting-deploy")
         self.assertIsNone(value["latest_deploy"])
 
+    def test_release_fence_compares_normalized_timestamps(self) -> None:
+        sha = "a" * 40
+        runs = [
+            {
+                "id": 1,
+                "name": "CI",
+                "head_sha": sha,
+                "status": "completed",
+                "conclusion": "success",
+                "created_at": "2026-06-20T00:00:00Z",
+                "updated_at": "2026-06-20T01:00:00+01:00",
+            },
+            {
+                "id": 2,
+                "name": "Deploy",
+                "head_sha": sha,
+                "status": "completed",
+                "conclusion": "success",
+                "created_at": "2026-06-20T00:30:00.000Z",
+            },
+        ]
+
+        value = release_state(main_sha=sha, runs=runs, config=CONFIG.pipeline)
+
+        self.assertEqual(value["state"], "verified")
+        self.assertEqual(value["latest_deploy"]["id"], 2)
+
     def test_follow_dispatches_deploy_after_token_dispatched_ci(self) -> None:
         sha = "a" * 40
         ci = {

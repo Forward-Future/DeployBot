@@ -54,7 +54,9 @@ def release_state(
     # the downstream run against the default-branch SHA, so it can otherwise
     # hide a real deployment (or look like a deployment failure) for that same
     # revision. A skipped run did not attempt a release and is not evidence.
-    ci_fence = str((ci or {}).get("updated_at") or (ci or {}).get("created_at") or "")
+    ci_fence = parse_time(
+        str((ci or {}).get("updated_at") or (ci or {}).get("created_at") or "")
+    )
     deploy = latest_run(
         [
             run
@@ -63,7 +65,14 @@ def release_state(
                 str(run.get("status") or "") == "completed"
                 and str(run.get("conclusion") or "") == "skipped"
             )
-            and (not ci_fence or str(run.get("created_at") or "") >= ci_fence)
+            and (
+                ci_fence is None
+                or (
+                    (created_at := parse_time(str(run.get("created_at") or "")))
+                    is not None
+                    and created_at >= ci_fence
+                )
+            )
         ],
         config.deploy_workflows,
         main_sha,
