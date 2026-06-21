@@ -159,6 +159,9 @@ Provider fields are:
 | `thread_active_hours` | Positive integer; default 72. |
 | `ci_workflows` | Workflow names followed as exact-main CI. Default: `["CI"]`. |
 | `deploy_workflows` | Deployment workflow names. Default: `["Deploy"]`. |
+| `batch_settle_seconds` | Non-negative window for coalescing near-ready deploy requests before freezing a batch. Default: 15. |
+| `ci_failure_grace_seconds` | Non-negative window for an exact-main CI retry to replace a failed attempt before the release fails. Default: 90. |
+| `promotion_workers` | Positive maximum number of deploy requests promoted concurrently. Default: 4. |
 | `ready_to_merge_target_minutes` | Positive timing target; default 15. |
 | `merge_to_live_target_minutes` | Positive timing target; default 10. |
 | `auto_promote` | Default `true`. |

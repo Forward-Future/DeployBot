@@ -1389,7 +1389,9 @@ class GitHub:
         if pull.get("state") != "OPEN":
             raise QueueError(f"PR #{number} is not open")
 
-        comments = known_comments if known_comments is not None else self.comments(number)
+        comments = (
+            known_comments if known_comments is not None else self.comments(number)
+        )
         reviews = self.reviews(number) if self.config.review_providers else []
         needs_threads = any(
             provider.kind == "bot" and provider.require_resolved_threads
@@ -1608,7 +1610,9 @@ class GitHub:
             if authorization.get("headRefOid") != head_sha:
                 raise QueueError(f"PR #{number} changed immediately before merge")
             marker = queue_marker_for_client(self, self.comments(number))
-            integration_batch_id = str(marker.get("integration_batch_id") or "") if marker else ""
+            integration_batch_id = (
+                str(marker.get("integration_batch_id") or "") if marker else ""
+            )
         else:
             labels = set(authorization_entry.labels)
             if authorization_entry.is_draft:
@@ -2067,9 +2071,7 @@ def reconcile_externally_merged_threads(client: GitHub) -> list[dict[str, Any]]:
     if not isinstance(records, list):
         return reconciled
     for record in records:
-        if record.get("phase") != "deploy-requested" or not record.get(
-            "pull_request"
-        ):
+        if record.get("phase") != "deploy-requested" or not record.get("pull_request"):
             continue
         number = int(record["pull_request"])
         comments = client.comments(number)
@@ -2527,7 +2529,9 @@ def queue_from_intent(
             f"PR #{entry.number} deploy intent is bound to an older head; "
             "run deploybot refresh-request after fresh review"
         )
-    current_comments = comments if comments is not None else client.comments(entry.number)
+    current_comments = (
+        comments if comments is not None else client.comments(entry.number)
+    )
     previous = queue_marker_for_client(client, current_comments)
     current_labels = labels if labels is not None else client.labels(entry.number)
     if (
@@ -2867,7 +2871,9 @@ def command_merge(
 ) -> str:
     if frozen_entry is None or frozen_batch is None:
         require_running_pipeline(client)
-    number = frozen_entry.number if frozen_entry is not None else client.resolve_pr(selector)
+    number = (
+        frozen_entry.number if frozen_entry is not None else client.resolve_pr(selector)
+    )
     batch = frozen_batch
     if batch is not None and str(batch.get("batch_id") or "") != batch_id:
         raise QueueError(f"frozen context does not match batch {batch_id}")
@@ -2885,7 +2891,9 @@ def command_merge(
     if frozen_entry is None:
         entries = client.queue()
         frozen_entries = [value for value in entries if value.number in frozen]
-        entry = next((value for value in frozen_entries if value.number == number), None)
+        entry = next(
+            (value for value in frozen_entries if value.number == number), None
+        )
         current_numbers = {value.number for value in frozen_entries}
     else:
         entry = frozen_entry
@@ -3374,8 +3382,7 @@ def combine_drain_results(
         "batch_ids": batch_ids,
         "integration_required": list(first.get("integration_required") or [])
         + list(second.get("integration_required") or []),
-        "merged": list(first.get("merged") or [])
-        + list(second.get("merged") or []),
+        "merged": list(first.get("merged") or []) + list(second.get("merged") or []),
         "next_batch": list(second.get("next_batch") or []),
         "waiting": list(waiting.values()),
     }
@@ -3427,9 +3434,8 @@ def command_react(
         emit=False,
         captured_entries=captured_entries,
     )
-    if (
-        client.config.pipeline.batch_settle_seconds
-        and should_settle_batch(client, captured_entries)
+    if client.config.pipeline.batch_settle_seconds and should_settle_batch(
+        client, captured_entries
     ):
         time.sleep(client.config.pipeline.batch_settle_seconds)
         settled_entries: list[QueueEntry] = []

@@ -181,9 +181,7 @@ class QueueCoreTest(unittest.TestCase):
         client.changed_paths.return_value = (["shared.py"], [])
         client.comments.return_value = []
 
-        holds = near_ready_overlap_holds(
-            client, [overlapping, independent, waiting]
-        )
+        holds = near_ready_overlap_holds(client, [overlapping, independent, waiting])
 
         self.assertEqual(holds, {1: [3]})
         client.changed_paths.assert_called_once_with(3)
@@ -267,15 +265,15 @@ class QueueCoreTest(unittest.TestCase):
         client.coordinator_logins = {"coordinator"}
         client.changed_paths.return_value = (["shared.py"], [])
         client.comments.return_value = []
-        with patch(
-            "agent_merge_queue.cli.latest_batch_marker", return_value=batch
-        ):
+        with patch("agent_merge_queue.cli.latest_batch_marker", return_value=batch):
             self.assertEqual(
                 near_ready_overlap_holds(client, [ready, waiting]),
                 {},
             )
 
-    def test_simultaneous_intents_use_pull_request_number_as_fifo_tiebreaker(self) -> None:
+    def test_simultaneous_intents_use_pull_request_number_as_fifo_tiebreaker(
+        self,
+    ) -> None:
         first = entry(1)
         second = entry(2)
         first.priority_at = second.priority_at = "2026-06-20T00:00:00Z"
@@ -1850,9 +1848,7 @@ class QueueCoreTest(unittest.TestCase):
         with (
             patch("agent_merge_queue.cli.promote_integrations", return_value=[]),
             patch("agent_merge_queue.cli.command_promote", side_effect=promote),
-            patch(
-                "agent_merge_queue.cli.freeze_queue", return_value=frozen
-            ) as freeze,
+            patch("agent_merge_queue.cli.freeze_queue", return_value=frozen) as freeze,
             patch(
                 "agent_merge_queue.cli.command_drain",
                 return_value={"merged": [{"number": 3, "merge_sha": "a" * 40}]},
@@ -1939,7 +1935,9 @@ class QueueCoreTest(unittest.TestCase):
         )
         self.assertEqual(result["release"], release)
 
-    def test_reactor_does_not_follow_conflicted_all_mode_integration_batch(self) -> None:
+    def test_reactor_does_not_follow_conflicted_all_mode_integration_batch(
+        self,
+    ) -> None:
         config = parse_config(
             {
                 "queue": {
