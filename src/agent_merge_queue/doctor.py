@@ -58,18 +58,20 @@ def diagnose(
         ]
     rows.append(row("tooling", "ok", "GitHub CLI is installed"))
 
-    code, auth = _gh("auth", "status", cwd=root)
+    code, _ = _gh("auth", "status", cwd=root)
     authenticated = code == 0
+    auth_detail = "GitHub authentication is not active"
+    if authenticated:
+        auth_detail = "GitHub authentication is active"
+        user_code, user, _ = _json("api", "user", cwd=root)
+        login = str((user or {}).get("login") or "") if user_code == 0 else ""
+        if login:
+            auth_detail += f" for {login}"
     rows.append(
         row(
             "authentication",
             "ok" if authenticated else "fail",
-            auth
-            or (
-                "GitHub authentication is active"
-                if authenticated
-                else "Not authenticated"
-            ),
+            auth_detail,
             None if authenticated else "Run `gh auth login`.",
         )
     )

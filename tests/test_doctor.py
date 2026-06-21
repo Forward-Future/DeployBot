@@ -36,6 +36,47 @@ class DoctorTest(unittest.TestCase):
         self.assertEqual(config["status"], "fail")
         self.assertIn("invalid merge queue config", config["detail"])
 
+    def test_auth_output_never_returns_token_or_scope_material(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / ".mergequeue.toml").write_text(
+                '[queue]\nrequired_checks = ["CI"]\ntrusted_actors = ["trusted"]\n',
+                encoding="utf-8",
+            )
+
+            def fake_json(*arguments: str, cwd: Path):
+                joined = " ".join(arguments)
+                if joined == "api user":
+                    return 0, {"login": "safe-user"}, ""
+                if "users/trusted" in joined:
+                    return 0, {"login": "trusted"}, ""
+                if "workflow list" in joined or "label list" in joined:
+                    return 0, [], ""
+                if "pr list" in joined:
+                    return 0, [], ""
+                if "protection" in joined:
+                    return 1, None, "not available"
+                return 0, {"nameWithOwner": "owner/repo"}, ""
+
+            with (
+                patch(
+                    "agent_merge_queue.doctor.shutil.which", return_value="/usr/bin/gh"
+                ),
+                patch(
+                    "agent_merge_queue.doctor._gh",
+                    return_value=(0, "Token: gho_secret; scopes: repo"),
+                ),
+                patch("agent_merge_queue.doctor._json", side_effect=fake_json),
+            ):
+                rows = diagnose(config_path=None, repository="owner/repo", cwd=root)
+
+        auth = next(value for value in rows if value["check"] == "authentication")
+        self.assertEqual(
+            auth["detail"], "GitHub authentication is active for safe-user"
+        )
+        self.assertNotIn("Token", str(rows))
+        self.assertNotIn("scope", str(rows))
+
     def test_missing_labels_and_check_name_are_advisory(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
