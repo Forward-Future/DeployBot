@@ -34,10 +34,12 @@ from agent_merge_queue.cli import (
     latest_batch_marker,
     latest_marker,
     marker_queued_at,
+    marker_priority_at,
     main,
     new_batch,
     overlap_groups,
     queue_state_body,
+    queue_from_intent,
     queue_timestamp,
     reusable_batch,
     structured_dependencies,
@@ -106,6 +108,87 @@ class QueueCoreTest(unittest.TestCase):
         self.assertEqual(
             marker_queued_at({"queued_at": "2026-06-20T00:00:00Z"}),
             "2026-06-20T00:00:00Z",
+        )
+        self.assertEqual(
+            marker_priority_at({"priority_at": "2026-06-19T23:59:00Z"}),
+            "2026-06-19T23:59:00Z",
+        )
+
+    def test_intent_request_time_is_the_stable_queue_priority(self) -> None:
+        value = entry(1)
+        value.labels = ["deploy-requested"]
+        intent = {
+            "intent_id": "intent-1",
+            "requested_at": "2026-06-20T00:00:00Z",
+            "requested_head": value.head_sha,
+            "state": "requested",
+        }
+        client = Mock()
+        client.config = CONFIG
+        client.repository = "example/repo"
+        client.trusted_logins = {"trusted"}
+        client.coordinator_logins = {"trusted"}
+
+        changed = queue_from_intent(
+            client,
+            value,
+            intent,
+            comments=[],
+            labels={"deploy-requested"},
+        )
+
+        self.assertTrue(changed)
+        self.assertEqual(value.priority_at, "2026-06-20T00:00:00Z")
+        self.assertIn(
+            '"priority_at": "2026-06-20T00:00:00Z"',
+            client.comment.call_args.args[1],
+        )
+
+    def test_registry_race_converges_on_the_lowest_issue_number(self) -> None:
+        client = object.__new__(GitHub)
+        client.config = CONFIG
+        client.repository = "example/repo"
+        client._paged_api = Mock(
+            side_effect=[
+                [],
+                [
+                    {"number": 10, "title": "DeployBot delivery registry"},
+                    {"number": 9, "title": "DeployBot delivery registry"},
+                ],
+            ]
+        )
+        client._json = Mock(side_effect=[[], {"number": 10}])
+        client._run = Mock(return_value="")
+
+        self.assertEqual(client.registry_issue_number(create=True), 9)
+
+    def test_frozen_merge_fast_path_never_rescans_the_whole_queue(self) -> None:
+        value = entry(1, "a.py")
+        batch = new_batch([value], frozen_at="2026-06-20T00:01:00Z")
+        client = Mock()
+        client.config = CONFIG
+        client.trusted_logins = {"trusted"}
+        client.coordinator_logins = {"trusted"}
+        client.pipeline_control.return_value = {"state": "running"}
+        client.snapshot.return_value = value
+        client.merge.return_value = "m" * 40
+        client.comments.return_value = []
+
+        merged = command_merge(
+            client,
+            "1",
+            str(batch["batch_id"]),
+            frozen_entry=value,
+            frozen_batch=batch,
+            active_numbers={1},
+        )
+
+        self.assertEqual(merged, "m" * 40)
+        client.queue.assert_not_called()
+        client.snapshot.assert_called_once_with(
+            1,
+            known_source_paths=["a.py"],
+            known_generated_paths=[],
         )
 
     def test_generated_paths_are_configurable(self) -> None:
@@ -504,7 +587,15 @@ class QueueCoreTest(unittest.TestCase):
         ):
             result = command_drain(client, json_output=True)
 
-        merge.assert_called_once_with(client, "1", "batch", emit=False)
+        merge.assert_called_once_with(
+            client,
+            "1",
+            "batch",
+            emit=False,
+            frozen_entry=first,
+            frozen_batch=frozen.batch,
+            active_numbers={1, 2, 3, 4},
+        )
         self.assertEqual(result["merged"][0]["number"], 1)
         self.assertEqual(result["integration_required"][0]["pull_requests"], [2, 3])
         self.assertEqual(result["waiting"][0]["number"], 4)
@@ -565,7 +656,15 @@ class QueueCoreTest(unittest.TestCase):
         ):
             result = command_drain(client, json_output=True)
 
-        merge.assert_called_once_with(client, "2", "second", emit=False)
+        merge.assert_called_once_with(
+            client,
+            "2",
+            "second",
+            emit=False,
+            frozen_entry=ready,
+            frozen_batch=second.batch,
+            active_numbers={1, 2},
+        )
         self.assertEqual(result["batch_ids"], ["first", "second"])
         self.assertEqual(result["merged"][0]["number"], 2)
         self.assertEqual(result["waiting"][0]["number"], 1)
@@ -984,6 +1083,37 @@ class QueueCoreTest(unittest.TestCase):
         self.assertEqual(result["waiting"][0]["number"], 2)
         self.assertIn("intent-1", client.comment.call_args.args[1])
         client.add_label.assert_called_with(1, "merge-queue")
+
+    def test_promote_never_auto_resumes_a_repair_block(self) -> None:
+        blocked = entry(1)
+        blocked.labels = ["deploy-requested", "merge-queue-blocked"]
+        intent_comment = {
+            "id": 1,
+            "created_at": "2026-06-20T00:00:00Z",
+            "user": {"login": "trusted"},
+            "body": intent_body(
+                intent_id="intent-1",
+                state="requested",
+                requested_at="2026-06-20T00:00:00Z",
+                requested_head=blocked.head_sha,
+            ),
+        }
+        client = Mock()
+        client.config = CONFIG
+        client.repository = "example/repo"
+        client.trusted_logins = {"trusted"}
+        client.coordinator_logins = {"coordinator"}
+        client.intent_numbers.return_value = [1]
+        client.active_integration_sources.return_value = set()
+        client.comments.return_value = [intent_comment]
+        client.snapshot.return_value = blocked
+
+        with redirect_stdout(io.StringIO()):
+            result = command_promote(client)
+
+        self.assertEqual(result["promoted"], [])
+        self.assertIn("deploybot resume", result["waiting"][0]["reasons"][0])
+        client.add_label.assert_not_called()
 
     def test_resume_atomically_requeues_repaired_exact_head(self) -> None:
         value = entry(1)

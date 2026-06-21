@@ -118,6 +118,51 @@ trusted_actors = ["trusted"]
         self.assertEqual(labels["status"], "warn")
         self.assertEqual(checks["status"], "warn")
 
+    def test_disabled_issues_is_a_registry_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / ".mergequeue.toml").write_text(
+                '[queue]\nrequired_checks = ["CI"]\ntrusted_actors = ["trusted"]\n',
+                encoding="utf-8",
+            )
+
+            def fake_json(*arguments: str, cwd: Path):
+                joined = " ".join(arguments)
+                if "repo view" in joined:
+                    return (
+                        0,
+                        {"nameWithOwner": "owner/repo", "hasIssuesEnabled": False},
+                        "",
+                    )
+                if "users/trusted" in joined:
+                    return 0, {"login": "trusted"}, ""
+                if "workflow list" in joined or "label list" in joined:
+                    return 0, [], ""
+                if "pr list" in joined:
+                    return 0, [], ""
+                if "protection" in joined:
+                    return 1, None, "not available"
+                return 0, {"login": "owner"}, ""
+
+            with (
+                patch(
+                    "agent_merge_queue.doctor.shutil.which", return_value="/usr/bin/gh"
+                ),
+                patch(
+                    "agent_merge_queue.doctor._gh", return_value=(0, "authenticated")
+                ),
+                patch("agent_merge_queue.doctor._json", side_effect=fake_json),
+            ):
+                rows = diagnose(
+                    config_path=None,
+                    repository="owner/repo",
+                    cwd=root,
+                )
+
+        registry = next(value for value in rows if value["check"] == "issue-registry")
+        self.assertEqual(registry["status"], "fail")
+        self.assertIn("disabled", registry["detail"])
+
 
 if __name__ == "__main__":
     unittest.main()

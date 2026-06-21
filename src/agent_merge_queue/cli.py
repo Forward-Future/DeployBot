@@ -282,11 +282,17 @@ def marker_queued_at(marker: dict[str, Any] | None) -> str | None:
     return str(value) if value else None
 
 
+def marker_priority_at(marker: dict[str, Any] | None) -> str | None:
+    value = marker.get("priority_at") if marker else None
+    return str(value) if value else None
+
+
 def queue_state_body(
     state: str,
     head_sha: str,
     *,
     queued_at: str | None,
+    priority_at: str | None = None,
     reason: str | None = None,
     intent_id: str | None = None,
     integration_batch_id: str | None = None,
@@ -301,6 +307,8 @@ def queue_state_body(
     }
     if queued_at:
         marker["queued_at"] = queued_at
+    if priority_at:
+        marker["priority_at"] = priority_at
     if reason:
         marker["reason"] = reason
     if intent_id:
@@ -591,6 +599,7 @@ class QueueEntry:
     dependencies: list[int]
     state: str = "waiting"
     reasons: list[str] | None = None
+    priority_at: str | None = None
 
     def classify(
         self,
@@ -708,8 +717,8 @@ class GitHub:
         arguments.extend(["--repo", self.repository, "--json", "number"])
         return int(self._json(*arguments)["number"])
 
-    def ensure_labels(self) -> None:
-        labels = (
+    def label_specs(self) -> tuple[tuple[str, str, str], ...]:
+        return (
             (
                 self.config.queue_label,
                 "0E8A16",
@@ -736,7 +745,37 @@ class GitHub:
                 "DeployBot metadata registry (never transcript contents)",
             ),
         )
-        for name, color, description in labels:
+
+    def ensure_labels(self) -> None:
+        for name, color, description in self.label_specs():
+            self._run(
+                "label",
+                "create",
+                name,
+                "--repo",
+                self.repository,
+                "--color",
+                color,
+                "--description",
+                description,
+                "--force",
+            )
+
+    def ensure_labels_exist(self) -> None:
+        values = self._json(
+            "label",
+            "list",
+            "--repo",
+            self.repository,
+            "--limit",
+            "1000",
+            "--json",
+            "name",
+        )
+        existing = {str(value.get("name") or "") for value in values}
+        for name, color, description in self.label_specs():
+            if name in existing:
+                continue
             self._run(
                 "label",
                 "create",
@@ -971,13 +1010,15 @@ class GitHub:
             if "pull_request" not in value
             and str(value.get("title") or "") == self.config.pipeline.registry_title
         ]
-        if len(matches) > 1:
-            raise QueueError("more than one DeployBot registry issue exists")
         if matches:
-            return int(matches[0]["number"])
+            # GitHub Issues has no uniqueness constraint. Concurrent first-use
+            # workers can both create a registry after observing none. The
+            # lowest issue number is deterministic and comments remain trusted
+            # by authenticated author, so all workers safely converge there.
+            return min(int(value["number"]) for value in matches)
         if not create:
             return None
-        self.ensure_labels()
+        self.ensure_labels_exist()
         created = self._json(
             "api",
             "--method",
@@ -990,7 +1031,9 @@ class GitHub:
             "-f",
             f"labels[]={self.config.pipeline.registry_label}",
         )
-        return int(created["number"])
+        # Re-read after creation so a concurrent lower-numbered creator wins
+        # before this worker writes any metadata to its candidate issue.
+        return self.registry_issue_number(create=False) or int(created["number"])
 
     def issue_comment(self, number: int, body: str) -> None:
         self._json(
@@ -1215,6 +1258,9 @@ class GitHub:
         *,
         require_marker: bool = True,
         allow_blocked_label: bool = False,
+        known_comments: list[dict[str, Any]] | None = None,
+        known_source_paths: list[str] | None = None,
+        known_generated_paths: list[str] | None = None,
     ) -> QueueEntry:
         fields = ",".join(
             (
@@ -1244,8 +1290,8 @@ class GitHub:
         if pull.get("state") != "OPEN":
             raise QueueError(f"PR #{number} is not open")
 
-        comments = self.comments(number)
-        reviews = self.reviews(number)
+        comments = known_comments if known_comments is not None else self.comments(number)
+        reviews = self.reviews(number) if self.config.review_providers else []
         needs_threads = any(
             provider.kind == "bot" and provider.require_resolved_threads
             for provider in self.config.review_providers
@@ -1254,29 +1300,31 @@ class GitHub:
         marker = queue_marker_for_client(self, comments)
         head_sha = str(pull["headRefOid"])
         checks = check_states(pull.get("statusCheckRollup") or [])
-        changed_files = self.files(number)
-        source_paths: list[str] = []
-        generated_paths: list[str] = []
-        for value in changed_files:
-            path = str(value.get("filename") or "")
-            if not path:
-                continue
-            if path in self.config.generated_paths:
-                generated_paths.append(path)
-                source_paths.append(path)
-                continue
-            target = (
-                generated_paths
-                if generated_only_change(
-                    path,
-                    value.get("patch"),
-                    generated_paths=self.config.generated_paths,
-                    generated_version_paths=self.config.generated_version_paths,
-                    asset_version_pattern=self.config.asset_version_pattern,
+        source_paths = list(known_source_paths or [])
+        generated_paths = list(known_generated_paths or [])
+        if known_source_paths is None or known_generated_paths is None:
+            source_paths = []
+            generated_paths = []
+            for value in self.files(number):
+                path = str(value.get("filename") or "")
+                if not path:
+                    continue
+                if path in self.config.generated_paths:
+                    generated_paths.append(path)
+                    source_paths.append(path)
+                    continue
+                target = (
+                    generated_paths
+                    if generated_only_change(
+                        path,
+                        value.get("patch"),
+                        generated_paths=self.config.generated_paths,
+                        generated_version_paths=self.config.generated_version_paths,
+                        asset_version_pattern=self.config.asset_version_pattern,
+                    )
+                    else source_paths
                 )
-                else source_paths
-            )
-            target.append(path)
+                target.append(path)
 
         body = str(pull.get("body") or "")
         entry = QueueEntry(
@@ -1306,6 +1354,7 @@ class GitHub:
             dependencies=structured_dependencies(
                 body, self.config.dependency_directive
             ),
+            priority_at=marker_priority_at(marker),
         )
         entry.classify(
             self.config,
@@ -1329,7 +1378,11 @@ class GitHub:
         entries = [self.snapshot(number) for number in self.queued_numbers()]
         return sorted(
             entries,
-            key=lambda entry: (entry.queued_at or "9999", entry.number),
+            key=lambda entry: (
+                entry.priority_at or entry.queued_at or "9999",
+                entry.queued_at or "9999",
+                entry.number,
+            ),
         )
 
     def add_label(self, number: int, label: str) -> None:
@@ -1666,8 +1719,14 @@ def command_request(
 ) -> dict[str, Any]:
     number = client.resolve_pr(selector)
     actor = client.require_actor(client.trusted_logins, "request deployment")
-    client.ensure_labels()
-    entry = client.snapshot(number, require_marker=False, allow_blocked_label=True)
+    client.ensure_labels_exist()
+    entry = client.snapshot(
+        number,
+        require_marker=False,
+        allow_blocked_label=True,
+        known_source_paths=[],
+        known_generated_paths=[],
+    )
     requested_at = utc_now()
     intent_id = hashlib.sha256(
         f"{client.repository}:{number}:{actor}:{requested_at}".encode()
@@ -1856,7 +1915,12 @@ def record_repair(
     return payload
 
 
-def command_promote(client: GitHub, *, emit: bool = True) -> dict[str, Any]:
+def command_promote(
+    client: GitHub,
+    *,
+    emit: bool = True,
+    captured_entries: list[QueueEntry] | None = None,
+) -> dict[str, Any]:
     promoted: list[int] = []
     waiting: list[dict[str, Any]] = []
     blocked: list[dict[str, Any]] = []
@@ -1871,7 +1935,14 @@ def command_promote(client: GitHub, *, emit: bool = True) -> dict[str, Any]:
         intent = latest_intent(comments, client.trusted_logins)
         if not intent or intent.get("state") != "requested":
             continue
-        entry = client.snapshot(number, require_marker=False, allow_blocked_label=True)
+        entry = client.snapshot(
+            number,
+            require_marker=False,
+            allow_blocked_label=True,
+            known_comments=comments,
+        )
+        if captured_entries is not None:
+            captured_entries.append(entry)
         if (
             client.config.pipeline.intent_scope == "head"
             and intent.get("requested_head") != entry.head_sha
@@ -1886,9 +1957,27 @@ def command_promote(client: GitHub, *, emit: bool = True) -> dict[str, Any]:
                 }
             )
             continue
+        if client.config.blocked_label in entry.labels:
+            waiting.append(
+                {
+                    "number": number,
+                    "reasons": [
+                        "repair is blocked; the trusted source agent must run "
+                        "deploybot resume after fresh gates pass"
+                    ],
+                }
+            )
+            continue
         if entry.state == "ready":
-            queue_from_intent(client, entry, intent)
-            promoted.append(number)
+            changed = queue_from_intent(
+                client,
+                entry,
+                intent,
+                comments=comments,
+                labels=set(entry.labels),
+            )
+            if changed:
+                promoted.append(number)
         elif entry.state == "blocked":
             reason = "; ".join(entry.reasons or ["blocked"])
             record_repair(client, entry, intent, reason)
@@ -2029,6 +2118,7 @@ def command_enqueue(client: GitHub, selector: str | None) -> None:
     previous = (
         {
             "head_sha": entry.queued_head_sha,
+            "priority_at": entry.priority_at,
             "queued_at": entry.queued_at,
             "state": entry.queue_state,
         }
@@ -2055,7 +2145,14 @@ def command_enqueue(client: GitHub, selector: str | None) -> None:
         already_queued=client.config.queue_label in entry.labels,
         now=utc_now(),
     )
-    body = queue_state_body("queued", entry.head_sha, queued_at=queued_at)
+    body = queue_state_body(
+        "queued",
+        entry.head_sha,
+        queued_at=queued_at,
+        priority_at=(
+            str(previous.get("priority_at") or "") or None if previous else None
+        ),
+    )
     client.comment(number, body)
     if client.config.queue_label in entry.labels:
         # Re-adding the label emits a fresh `labeled` event for GitHub-hosted
@@ -2071,7 +2168,10 @@ def queue_from_intent(
     client: GitHub,
     entry: QueueEntry,
     intent: dict[str, Any],
-) -> None:
+    *,
+    comments: list[dict[str, Any]] | None = None,
+    labels: set[str] | None = None,
+) -> bool:
     if entry.state != "ready":
         raise QueueError(
             f"PR #{entry.number} is not ready to queue: "
@@ -2088,12 +2188,30 @@ def queue_from_intent(
             f"PR #{entry.number} deploy intent is bound to an older head; "
             "run deploybot refresh-request after fresh review"
         )
-    comments = client.comments(entry.number)
-    previous = queue_marker_for_client(client, comments)
+    current_comments = comments if comments is not None else client.comments(entry.number)
+    previous = queue_marker_for_client(client, current_comments)
+    current_labels = labels if labels is not None else client.labels(entry.number)
+    if (
+        client.config.queue_label in current_labels
+        and previous
+        and previous.get("state") == "queued"
+        and previous.get("head_sha") == entry.head_sha
+        and previous.get("intent_id") == intent_id
+    ):
+        entry.queued_head_sha = entry.head_sha
+        entry.queued_at = marker_queued_at(previous)
+        entry.priority_at = marker_priority_at(previous)
+        entry.queue_state = "queued"
+        return False
     queued_at = queue_timestamp(
         previous,
         already_queued=client.config.queue_label in entry.labels,
         now=utc_now(),
+    )
+    priority_at = (
+        marker_priority_at(previous)
+        or str(intent.get("requested_at") or "")
+        or queued_at
     )
     client.comment(
         entry.number,
@@ -2101,15 +2219,22 @@ def queue_from_intent(
             "queued",
             entry.head_sha,
             queued_at=queued_at,
+            priority_at=priority_at,
             intent_id=intent_id,
         ),
     )
-    labels = client.labels(entry.number)
-    if client.config.queue_label in labels:
+    if client.config.queue_label in current_labels:
         client.remove_label(entry.number, client.config.queue_label)
     client.add_label(entry.number, client.config.queue_label)
-    if client.config.blocked_label in labels:
+    if client.config.blocked_label in current_labels:
         client.remove_label(entry.number, client.config.blocked_label)
+    entry.labels = sorted(
+        (current_labels - {client.config.blocked_label}) | {client.config.queue_label}
+    )
+    entry.queued_head_sha = entry.head_sha
+    entry.queued_at = queued_at
+    entry.priority_at = priority_at
+    entry.queue_state = "queued"
     notify(
         client.config.pipeline,
         "queued",
@@ -2120,6 +2245,7 @@ def queue_from_intent(
             "intent_id": intent_id,
         },
     )
+    return True
 
 
 @dataclass
@@ -2140,8 +2266,28 @@ class FreezeResult:
         }
 
 
-def freeze_queue(client: GitHub) -> FreezeResult:
-    all_entries = client.queue()
+def freeze_queue(
+    client: GitHub, *, known_entries: list[QueueEntry] | None = None
+) -> FreezeResult:
+    if known_entries is None:
+        all_entries = client.queue()
+    else:
+        queued_numbers = set(client.queued_numbers())
+        entries_by_number = {
+            entry.number: entry
+            for entry in known_entries
+            if entry.number in queued_numbers
+        }
+        for number in sorted(queued_numbers - entries_by_number.keys()):
+            entries_by_number[number] = client.snapshot(number)
+        all_entries = sorted(
+            entries_by_number.values(),
+            key=lambda entry: (
+                entry.priority_at or entry.queued_at or "9999",
+                entry.queued_at or "9999",
+                entry.number,
+            ),
+        )
     entries, blocked_entries = split_blocked_entries(
         all_entries, client.config.blocked_label
     )
@@ -2259,6 +2405,7 @@ def command_block(client: GitHub, selector: str | None, reason: str) -> None:
             "blocked",
             entry.head_sha,
             queued_at=str(previous.get("queued_at") or "") or None,
+            priority_at=str(previous.get("priority_at") or "") or None,
             reason=reason,
             intent_id=str(previous.get("intent_id") or "") or None,
         ),
@@ -2288,6 +2435,7 @@ def command_unblock(client: GitHub, selector: str | None) -> None:
             "queued",
             entry.head_sha,
             queued_at=str(previous.get("queued_at") or "") or None,
+            priority_at=str(previous.get("priority_at") or "") or None,
             intent_id=str(previous.get("intent_id") or "") or None,
         ),
     )
@@ -2316,6 +2464,9 @@ def command_dequeue(client: GitHub, selector: str | None, reason: str) -> None:
             queued_at=(
                 str(previous.get("queued_at") or "") or None if previous else None
             ),
+            priority_at=(
+                str(previous.get("priority_at") or "") or None if previous else None
+            ),
             reason=reason,
             intent_id=(
                 str(previous.get("intent_id") or "") or None if previous else None
@@ -2334,22 +2485,34 @@ def command_merge(
     batch_id: str,
     *,
     emit: bool = True,
+    frozen_entry: QueueEntry | None = None,
+    frozen_batch: dict[str, Any] | None = None,
+    active_numbers: set[int] | None = None,
 ) -> str:
     require_running_pipeline(client)
-    number = client.resolve_pr(selector)
-    batch = latest_batch_marker(
-        client.comments(number),
-        coordinator_logins(client),
-        batch_id=batch_id,
-    )
+    number = frozen_entry.number if frozen_entry is not None else client.resolve_pr(selector)
+    batch = frozen_batch
+    if batch is not None and str(batch.get("batch_id") or "") != batch_id:
+        raise QueueError(f"frozen context does not match batch {batch_id}")
+    if batch is None:
+        batch = latest_batch_marker(
+            client.comments(number),
+            coordinator_logins(client),
+            batch_id=batch_id,
+        )
     if batch is None:
         raise QueueError(f"PR #{number} has no trusted marker for batch {batch_id}")
     frozen = {int(value) for value in batch.get("pull_requests") or []}
     if number not in frozen:
         raise QueueError(f"PR #{number} is not a member of batch {batch_id}")
-    entries = client.queue()
-    frozen_entries = [value for value in entries if value.number in frozen]
-    entry = next((value for value in frozen_entries if value.number == number), None)
+    if frozen_entry is None:
+        entries = client.queue()
+        frozen_entries = [value for value in entries if value.number in frozen]
+        entry = next((value for value in frozen_entries if value.number == number), None)
+        current_numbers = {value.number for value in frozen_entries}
+    else:
+        entry = frozen_entry
+        current_numbers = active_numbers or {number}
     if entry is None:
         raise QueueError(f"PR #{number} is not in the merge queue")
     if entry.state != "ready":
@@ -2364,9 +2527,7 @@ def command_merge(
     if entry.queued_at and str(batch.get("frozen_at") or "") < entry.queued_at:
         raise QueueError(f"batch {batch_id} predates the current queue authorization")
 
-    peers = batch_overlap_peers(
-        batch, number, {value.number for value in frozen_entries}
-    )
+    peers = batch_overlap_peers(batch, number, current_numbers)
     if peers:
         peers = ", ".join(f"#{value}" for value in peers)
         raise QueueError(
@@ -2389,7 +2550,11 @@ def command_merge(
             + ", ".join(f"#{value}" for value in missing_dependencies)
         )
 
-    fresh = client.snapshot(number)
+    fresh = client.snapshot(
+        number,
+        known_source_paths=entry.source_paths,
+        known_generated_paths=entry.generated_paths,
+    )
     if fresh.state != "ready":
         raise QueueError(
             f"PR #{number} changed before merge: "
@@ -2490,7 +2655,15 @@ def drain_frozen_batch(
             if any(dependency in pending for dependency in entry.dependencies):
                 continue
             try:
-                merge_sha = command_merge(client, str(number), batch_id, emit=False)
+                merge_sha = command_merge(
+                    client,
+                    str(number),
+                    batch_id,
+                    emit=False,
+                    frozen_entry=entry,
+                    frozen_batch=frozen.batch,
+                    active_numbers=set(pending),
+                )
             except QueueError as error:
                 if "GitHub is still computing mergeability" in str(error):
                     retryable = True
@@ -2538,7 +2711,11 @@ def drain_frozen_batch(
 
 
 def command_drain(
-    client: GitHub, *, json_output: bool, emit: bool = True
+    client: GitHub,
+    *,
+    json_output: bool,
+    emit: bool = True,
+    initial_frozen: FreezeResult | None = None,
 ) -> dict[str, Any]:
     require_running_pipeline(client)
     batch_ids: list[str] = []
@@ -2548,7 +2725,8 @@ def command_drain(
     next_batch: list[int] = []
 
     while True:
-        frozen = freeze_queue(client)
+        frozen = initial_frozen or freeze_queue(client)
+        initial_frozen = None
         if frozen.batch is None:
             break
         batch_id = str(frozen.batch["batch_id"])
@@ -2724,8 +2902,13 @@ def command_react(
         print(json.dumps(result, indent=2, sort_keys=True))
         return result
     promoted_integrations = promote_integrations(client)
-    promoted = command_promote(client, emit=False)
-    frozen = freeze_queue(client)
+    captured_entries: list[QueueEntry] = []
+    promoted = command_promote(
+        client,
+        emit=False,
+        captured_entries=captured_entries,
+    )
+    frozen = freeze_queue(client, known_entries=captured_entries)
     integrations: list[dict[str, Any]] = []
     if (
         frozen.batch is not None
@@ -2746,7 +2929,12 @@ def command_react(
             "next_batch": [],
         }
     else:
-        drained = command_drain(client, json_output=False, emit=False)
+        drained = command_drain(
+            client,
+            json_output=False,
+            emit=False,
+            initial_frozen=frozen,
+        )
         if (
             frozen.batch is not None
             and client.config.integration.mode == "overlap"

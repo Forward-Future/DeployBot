@@ -101,13 +101,45 @@ def diagnose(
             )
             return rows
         repo = str(value.get("nameWithOwner") or "")
-    code, _, detail = _json("repo", "view", repo, "--json", "nameWithOwner", cwd=root)
+    code, repository, detail = _json(
+        "repo",
+        "view",
+        repo,
+        "--json",
+        "nameWithOwner,hasIssuesEnabled",
+        cwd=root,
+    )
     if code:
         rows.append(row("repository", "fail", detail, "Check repository access."))
         return rows
     rows.append(row("repository", "ok", f"Can read {repo}"))
     if config is None:
         return rows
+
+    issues_enabled = (repository or {}).get("hasIssuesEnabled")
+    issues_status = "ok" if issues_enabled is True else "fail"
+    if issues_enabled is None:
+        issues_status = "warn"
+    rows.append(
+        row(
+            "issue-registry",
+            issues_status,
+            (
+                "GitHub Issues is enabled for durable DeployBot metadata"
+                if issues_enabled is True
+                else (
+                    "GitHub Issues is disabled"
+                    if issues_enabled is False
+                    else "Could not confirm whether GitHub Issues is enabled"
+                )
+            ),
+            (
+                None
+                if issues_enabled is True
+                else "Enable Issues before recording deploy intent or pipeline state."
+            ),
+        )
+    )
 
     code, workflows, detail = _json(
         "workflow", "list", "--repo", repo, "--json", "name,path,state", cwd=root

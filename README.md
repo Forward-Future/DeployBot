@@ -88,7 +88,10 @@ Install `examples/github-workflow.yml` on the default branch. It reacts to
 deploy labels, ready/synchronize events, reviews, named CI `workflow_run`
 completions, and completed external check suites. Keep its `workflows` list
 aligned with `pipeline.ci_workflows`. The privileged worker never checks out or
-executes pull-request code. Pin the Action to the full reviewed release commit:
+executes pull-request code. The Action follows releases by default so the same
+serialized worker can dispatch deployment when GitHub suppresses the
+`workflow_run` event for token-dispatched CI. Pin the Action to the full
+reviewed release commit:
 
 ```yaml
 - uses: Forward-Future/DeployBot@13d7293b181581d2e4d59d8a605df76f7feb88a6

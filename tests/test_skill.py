@@ -87,6 +87,14 @@ class DeployBotSkillTest(unittest.TestCase):
         self.assertIn("actions: write", example)
         self.assertIn("workflow_dispatch:", workflow)
 
+    def test_action_follows_release_when_workflow_run_is_suppressed(self) -> None:
+        action = (ROOT / "action.yml").read_text(encoding="utf-8")
+        follow_input = action.split("  follow:\n", 1)[1].split(
+            "  dispatch_ci:\n", 1
+        )[0]
+        self.assertIn('default: "true"', follow_input)
+        self.assertIn('args+=(--follow)', action)
+
     def test_clients_pin_the_immutable_status_release(self) -> None:
         paths = [
             ROOT / "adapters" / "codex" / "agent-merge-queue" / ".mcp.json",
