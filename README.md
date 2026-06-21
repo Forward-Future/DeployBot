@@ -19,6 +19,11 @@ python3 -m pip install \
 deploybot init
 ```
 
+`deploybot init` writes the safe starter policy. The annotated
+[example policy](.mergequeue.example.toml) shows every supported section, and
+the [CLI, MCP, policy, and Action reference](docs/reference.md) lists every
+current command, tool, option, and configuration field.
+
 Invoke the bundled `$deploybot` skill to inspect or operate the queue. Typical
 requests include “show the delivery pipeline,” “why is PR 42 blocked?”, and
 “deploy this PR.” Status and diagnostics are read-only:
@@ -218,36 +223,48 @@ commit SHA so an older score can never authorize a replacement head.
 The bundled MCP configurations launch the pinned public release with `uvx`.
 The `mergeq` and `mergeq-mcp` command aliases remain for compatibility.
 
-## Commands
+## Command overview
+
+All commands accept the global `--config PATH` and `--repository OWNER/REPO`
+options before the subcommand. A missing pull-request selector resolves the PR
+for the current branch.
 
 ```text
+deploybot init [--force]
+deploybot ensure-labels
 deploybot status --json
 deploybot plan --json
 deploybot doctor --json
-deploybot request <pr> --provider codex --thread-id THREAD
-deploybot refresh-request <pr>
+deploybot inspect [PR] --json
+deploybot thread update --provider CLIENT --thread-id ID --phase PHASE [metadata]
+deploybot request [PR] [--provider CLIENT] [--thread-id ID] [--thread-url URL]
+deploybot cancel-request [PR]
+deploybot refresh-request [PR]
+deploybot enqueue [PR]
 deploybot promote
-deploybot react --follow
-deploybot resume <pr>
-deploybot integrate --all
-deploybot follow --json
+deploybot freeze --json
+deploybot drain --json
+deploybot react [--follow] [--dispatch-ci] [--timeout SECONDS]
+deploybot integrate [--all]
+deploybot follow [--timeout SECONDS] [--poll SECONDS] [--json]
 deploybot metrics --json
 deploybot pause --reason "main CI failed"
 deploybot unpause
-deploybot thread update --provider codex --thread-id THREAD --phase ready --pr 42
-deploybot inspect <pr> --json
-deploybot enqueue <pr>
-deploybot freeze --json
-deploybot drain --json
-deploybot block <pr> --reason "..."
-deploybot unblock <pr>
-deploybot dequeue <pr> --reason "..."
-deploybot merge <pr> --batch <batch-id>
+deploybot block [PR] --reason "..."
+deploybot unblock [PR]
+deploybot resume [PR]
+deploybot dequeue [PR] --reason "..."
+deploybot merge [PR] --batch BATCH_ID
 ```
 
 `status` is the read-only full delivery view. `plan` is the narrower queue-only
 view. `doctor` verifies CLI auth, policy, labels, actors, check names, and branch
 protection without changing the repository.
+
+The MCP server exposes named equivalents for the operational commands, plus
+explicit `repository` and `config` arguments on every tool. See the
+[complete reference](docs/reference.md#mcp-tools) for the exact mapping and
+arguments.
 
 `drain` merges only independent, green, exact-head-reviewed PRs. Integration
 mode `overlap` creates one cumulative PR for shared source; mode `all` routes the
