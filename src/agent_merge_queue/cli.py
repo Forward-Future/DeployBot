@@ -2347,12 +2347,18 @@ class FreezeResult:
 
 
 def freeze_queue(
-    client: GitHub, *, known_entries: list[QueueEntry] | None = None
+    client: GitHub,
+    *,
+    known_entries: list[QueueEntry] | None = None,
+    held_numbers: set[int] | None = None,
 ) -> FreezeResult:
+    held_numbers = held_numbers or set()
     if known_entries is None:
-        all_entries = client.queue()
+        all_entries = [
+            entry for entry in client.queue() if entry.number not in held_numbers
+        ]
     else:
-        queued_numbers = set(client.queued_numbers())
+        queued_numbers = set(client.queued_numbers()) - held_numbers
         entries_by_number = {
             entry.number: entry
             for entry in known_entries
@@ -2989,6 +2995,59 @@ def should_settle_batch(client: GitHub, entries: list[QueueEntry]) -> bool:
     return has_ready and has_near_ready
 
 
+def near_ready_overlap_holds(
+    client: GitHub, entries: list[QueueEntry]
+) -> dict[int, list[int]]:
+    """Keep ready overlap peers together while another active intent settles."""
+    if client.config.integration.mode != "overlap":
+        return {}
+    ready = {
+        entry.number: entry
+        for entry in entries
+        if entry.state == "ready"
+        and client.config.queue_label in entry.labels
+        and client.config.blocked_label not in entry.labels
+    }
+    waiting = {
+        entry.number: entry
+        for entry in entries
+        if entry.state == "waiting"
+        and client.config.queue_label not in entry.labels
+        and client.config.blocked_label not in entry.labels
+    }
+    if not ready or not waiting:
+        return {}
+
+    def load_paths(entry: QueueEntry) -> tuple[int, list[str], list[str]]:
+        source_paths, generated_paths = client.changed_paths(entry.number)
+        return entry.number, source_paths, generated_paths
+
+    values = list(waiting.values())
+    with ThreadPoolExecutor(
+        max_workers=min(client.config.pipeline.promotion_workers, len(values))
+    ) as executor:
+        for number, source_paths, generated_paths in executor.map(load_paths, values):
+            waiting[number].source_paths = sorted(set(source_paths))
+            waiting[number].generated_paths = sorted(set(generated_paths))
+
+    waiting_numbers = set(waiting)
+    holds: dict[int, list[int]] = {}
+    for group in overlap_groups([*ready.values(), *waiting.values()]):
+        members = {int(value) for value in group["pull_requests"]}
+        waiting_peers = sorted(members & waiting_numbers)
+        if not waiting_peers:
+            continue
+        for number in sorted(members & ready.keys()):
+            entry = ready[number]
+            comments = client.comments(number)
+            marker = latest_batch_marker(comments, coordinator_logins(client))
+            completed = completed_batch_ids(comments, coordinator_logins(client))
+            if active_batch([entry], {number: marker}, completed) is not None:
+                continue
+            holds[number] = waiting_peers
+    return holds
+
+
 def command_react(
     client: GitHub,
     *,
@@ -3025,7 +3084,20 @@ def command_react(
         promoted["blocked"] = promoted["blocked"] + settled["blocked"]
         promoted["waiting"] = settled["waiting"]
         captured_entries = settled_entries
-    frozen = freeze_queue(client, known_entries=captured_entries)
+    overlap_holds = near_ready_overlap_holds(client, captured_entries)
+    promoted["held"] = [
+        {
+            "number": number,
+            "overlapping_waiting": waiting,
+            "reason": "waiting for overlapping deploy intents to finish gates",
+        }
+        for number, waiting in overlap_holds.items()
+    ]
+    frozen = freeze_queue(
+        client,
+        known_entries=captured_entries,
+        held_numbers=set(overlap_holds),
+    )
     integrations: list[dict[str, Any]] = []
     if (
         frozen.batch is not None

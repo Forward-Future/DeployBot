@@ -158,6 +158,10 @@ work, and creates integration PRs when configured. A conflict produces a repair
 handoff containing the source thread, base/head SHAs, source paths, and one
 return command:
 
+In `overlap` mode, a ready source waits when another active, near-ready intent
+belongs to the same source-overlap component. Unrelated ready work still drains,
+and the held component freezes together once its remaining gates pass.
+
 ```bash
 deploybot resume <pr-number>
 ```

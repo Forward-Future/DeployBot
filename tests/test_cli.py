@@ -36,6 +36,7 @@ from agent_merge_queue.cli import (
     marker_queued_at,
     marker_priority_at,
     main,
+    near_ready_overlap_holds,
     new_batch,
     overlap_groups,
     queue_state_body,
@@ -156,6 +157,78 @@ class QueueCoreTest(unittest.TestCase):
         self.assertFalse(should_settle_batch(client, [ready]))
         waiting.labels.append("merge-queue-blocked")
         self.assertFalse(should_settle_batch(client, [ready, waiting]))
+
+    def test_overlap_mode_holds_only_ready_members_of_near_ready_components(
+        self,
+    ) -> None:
+        config = parse_config(
+            {
+                "queue": {"required_checks": ["CI"], "trusted_actors": ["trusted"]},
+                "integration": {"mode": "overlap"},
+            }
+        )
+        overlapping = entry(1, "shared.py")
+        independent = entry(2, "other.py")
+        waiting = entry(3, state="waiting")
+        waiting.labels = ["deploy-requested"]
+        client = Mock()
+        client.config = config
+        client.coordinator_logins = {"coordinator"}
+        client.changed_paths.return_value = (["shared.py"], [])
+        client.comments.return_value = []
+
+        holds = near_ready_overlap_holds(
+            client, [overlapping, independent, waiting]
+        )
+
+        self.assertEqual(holds, {1: [3]})
+        client.changed_paths.assert_called_once_with(3)
+
+    def test_overlap_hold_includes_transitive_ready_members(self) -> None:
+        config = parse_config(
+            {
+                "queue": {"required_checks": ["CI"], "trusted_actors": ["trusted"]},
+                "integration": {"mode": "overlap"},
+            }
+        )
+        first = entry(1, "shared.py", "bridge.py")
+        second = entry(2, "bridge.py")
+        waiting = entry(3, state="waiting")
+        waiting.labels = ["deploy-requested"]
+        client = Mock()
+        client.config = config
+        client.coordinator_logins = {"coordinator"}
+        client.changed_paths.return_value = (["shared.py"], [])
+        client.comments.return_value = []
+
+        self.assertEqual(
+            near_ready_overlap_holds(client, [first, second, waiting]),
+            {1: [3], 2: [3]},
+        )
+
+    def test_overlap_hold_does_not_rewrite_an_existing_frozen_batch(self) -> None:
+        config = parse_config(
+            {
+                "queue": {"required_checks": ["CI"], "trusted_actors": ["trusted"]},
+                "integration": {"mode": "overlap"},
+            }
+        )
+        ready = entry(1, "shared.py")
+        waiting = entry(2, state="waiting")
+        waiting.labels = ["deploy-requested"]
+        batch = new_batch([ready], frozen_at="2026-06-20T00:01:00Z")
+        client = Mock()
+        client.config = config
+        client.coordinator_logins = {"coordinator"}
+        client.changed_paths.return_value = (["shared.py"], [])
+        client.comments.return_value = []
+        with patch(
+            "agent_merge_queue.cli.latest_batch_marker", return_value=batch
+        ):
+            self.assertEqual(
+                near_ready_overlap_holds(client, [ready, waiting]),
+                {},
+            )
 
     def test_simultaneous_intents_use_pull_request_number_as_fifo_tiebreaker(self) -> None:
         first = entry(1)
@@ -1379,6 +1452,61 @@ class QueueCoreTest(unittest.TestCase):
             result = command_react(client, follow=False, timeout_seconds=10)
         drain.assert_not_called()
         self.assertEqual(result["integrations"], [{"number": 99}])
+
+    def test_reactor_holds_overlap_peer_but_drains_independent_work(self) -> None:
+        config = parse_config(
+            {
+                "queue": {
+                    "required_checks": ["CI"],
+                    "trusted_actors": ["trusted"],
+                    "coordinator_actors": ["coordinator"],
+                },
+                "integration": {"mode": "overlap"},
+            }
+        )
+        overlapping = entry(1, "shared.py")
+        waiting = entry(2, state="waiting")
+        waiting.labels = ["deploy-requested"]
+        independent = entry(3, "other.py")
+        entries = [overlapping, waiting, independent]
+        batch = new_batch([independent], frozen_at="2026-06-20T00:01:00Z")
+        frozen = FreezeResult(batch, [independent], [], [], [])
+        client = Mock()
+        client.config = config
+        client.coordinator_logins = {"coordinator"}
+        client.pipeline_control.return_value = {"state": "running"}
+        client.changed_paths.return_value = (["shared.py"], [])
+        client.comments.return_value = []
+
+        def promote(*_args, **kwargs):
+            kwargs["captured_entries"].extend(entries)
+            return {
+                "promoted": [1, 3],
+                "waiting": [{"number": 2, "reasons": ["CI is not complete"]}],
+                "blocked": [],
+            }
+
+        with (
+            patch("agent_merge_queue.cli.promote_integrations", return_value=[]),
+            patch("agent_merge_queue.cli.command_promote", side_effect=promote),
+            patch(
+                "agent_merge_queue.cli.freeze_queue", return_value=frozen
+            ) as freeze,
+            patch(
+                "agent_merge_queue.cli.command_drain",
+                return_value={"merged": [{"number": 3, "merge_sha": "a" * 40}]},
+            ),
+            redirect_stdout(io.StringIO()),
+        ):
+            result = command_react(client, follow=False, timeout_seconds=10)
+
+        freeze.assert_called_once_with(
+            client,
+            known_entries=entries,
+            held_numbers={1},
+        )
+        self.assertEqual(result["promoted"]["held"][0]["number"], 1)
+        self.assertEqual(result["drain"]["merged"][0]["number"], 3)
 
     def test_reactor_dispatches_ci_once_after_a_merged_batch(self) -> None:
         client = Mock()
