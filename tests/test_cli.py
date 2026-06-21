@@ -40,6 +40,7 @@ from agent_merge_queue.cli import (
     near_ready_overlap_holds,
     new_batch,
     overlap_groups,
+    promote_integrations,
     queue_state_body,
     queue_from_intent,
     queue_timestamp,
@@ -363,6 +364,65 @@ class QueueCoreTest(unittest.TestCase):
 
         self.assertEqual(value.state, "waiting")
         client.changed_paths.assert_not_called()
+
+    def test_integration_snapshot_uses_exact_commit_check_fallback(self) -> None:
+        head_sha = "a" * 40
+        marker = {
+            "batch_id": "batch",
+            "conflict": None,
+            "heads": {"1": "1" * 40, "2": "2" * 40},
+            "pull_requests": [1, 2],
+        }
+        client = object.__new__(GitHub)
+        client.config = CONFIG
+        client.repository = "example/repo"
+        client.trusted_logins = {"trusted"}
+        client.coordinator_logins = {"coordinator"}
+        client.comments = Mock(
+            return_value=[
+                {
+                    "created_at": "2026-06-20T00:00:00Z",
+                    "user": {"login": "coordinator"},
+                    "body": integration_body(marker),
+                }
+            ]
+        )
+        client.changed_paths = Mock(return_value=(["combined.py"], []))
+        client.commit_check_runs = Mock(
+            return_value=[
+                {
+                    "name": "CI",
+                    "conclusion": "success",
+                    "started_at": "2026-06-20T00:01:00Z",
+                }
+            ]
+        )
+        client._json = Mock(
+            return_value={
+                "baseRefName": "main",
+                "body": "",
+                "headRefOid": head_sha,
+                "isDraft": False,
+                "labels": [],
+                "mergeStateStatus": "UNSTABLE",
+                "mergeable": "MERGEABLE",
+                "number": 38,
+                "state": "OPEN",
+                "statusCheckRollup": [],
+                "title": "Integration",
+                "url": "https://example.test/38",
+            }
+        )
+
+        value = client.snapshot(
+            38,
+            require_marker=False,
+            allow_blocked_label=True,
+        )
+
+        self.assertEqual(value.state, "ready")
+        self.assertEqual(value.checks["CI"], "passed")
+        client.commit_check_runs.assert_called_once_with(head_sha)
 
     def test_required_checks_do_not_accept_skipped(self) -> None:
         states = check_states(
@@ -1924,6 +1984,45 @@ class QueueCoreTest(unittest.TestCase):
             known_checks={"CI": "passed"},
         )
         self.assertEqual(result[0]["state"], "ready")
+
+    def test_integration_promotion_reuses_owned_exact_checks(self) -> None:
+        number = 38
+        head_sha = "a" * 40
+        marker = {
+            "batch_id": "batch",
+            "conflict": None,
+            "heads": {"1": "1" * 40, "2": "2" * 40},
+            "pull_requests": [1, 2],
+        }
+        client = Mock()
+        client.config = CONFIG
+        client.coordinator_logins = {"coordinator"}
+        client.integration_pull_request_numbers.return_value = [number]
+        client.comments.return_value = [
+            {
+                "created_at": "2026-06-20T00:00:00Z",
+                "user": {"login": "coordinator"},
+                "body": integration_body(marker),
+            }
+        ]
+        client.labels.return_value = set()
+        ready = entry(8, "combined.py")
+        ready.number = number
+        ready.head_sha = head_sha
+        client.snapshot.return_value = ready
+
+        promoted = promote_integrations(
+            client,
+            known_checks_by_number={number: {"CI": "passed"}},
+        )
+
+        self.assertEqual(promoted, [number])
+        client.snapshot.assert_called_once_with(
+            number,
+            require_marker=False,
+            allow_blocked_label=True,
+            known_checks={"CI": "passed"},
+        )
 
     def test_reactor_pauses_when_post_merge_ci_dispatch_fails(self) -> None:
         client = Mock()

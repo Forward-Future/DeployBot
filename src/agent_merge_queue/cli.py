@@ -1398,8 +1398,19 @@ class GitHub:
         threads = self.review_threads(number) if needs_threads else []
         marker = queue_marker_for_client(self, comments)
         head_sha = str(pull["headRefOid"])
-        checks = check_states(pull.get("statusCheckRollup") or [])
+        check_rollup = list(pull.get("statusCheckRollup") or [])
+        checks = check_states(check_rollup)
         checks.update(known_checks or {})
+        integration = latest_payload(
+            comments,
+            INTEGRATION_MARKER,
+            coordinator_logins(self),
+        )
+        if integration and any(
+            checks.get(name) != "passed" for name in self.config.required_checks
+        ):
+            checks = check_states(check_rollup + self.commit_check_runs(head_sha))
+            checks.update(known_checks or {})
         source_paths = list(known_source_paths or [])
         generated_paths = list(known_generated_paths or [])
         paths_are_known = (
@@ -2124,7 +2135,11 @@ def command_promote(
     return result
 
 
-def promote_integrations(client: GitHub) -> list[int]:
+def promote_integrations(
+    client: GitHub,
+    *,
+    known_checks_by_number: dict[int, dict[str, str]] | None = None,
+) -> list[int]:
     promoted: list[int] = []
     for number in client.integration_pull_request_numbers():
         comments = client.comments(number)
@@ -2138,7 +2153,12 @@ def promote_integrations(client: GitHub) -> list[int]:
         labels = client.labels(number)
         if client.config.queue_label in labels:
             continue
-        entry = client.snapshot(number, require_marker=False, allow_blocked_label=True)
+        entry = client.snapshot(
+            number,
+            require_marker=False,
+            allow_blocked_label=True,
+            known_checks=(known_checks_by_number or {}).get(number),
+        )
         if entry.state != "ready":
             continue
         batch_id = str(integration.get("batch_id") or "")
@@ -2262,6 +2282,7 @@ def settle_integration_checks(
                             {
                                 "branch": branch,
                                 "dispatched_ci": dispatched,
+                                "checks": exact_checks,
                                 "head_sha": head_sha,
                                 "pull_request": number,
                                 "state": "ready",
@@ -3300,7 +3321,13 @@ def command_react(
             raise
 
     integration_checks = own_integration_checks()
-    promoted_integrations = promote_integrations(client)
+    promoted_integrations = promote_integrations(
+        client,
+        known_checks_by_number={
+            int(value["pull_request"]): dict(value.get("checks") or {})
+            for value in integration_checks
+        },
+    )
     captured_entries: list[QueueEntry] = []
     promoted = command_promote(
         client,
@@ -3391,7 +3418,14 @@ def command_react(
         # pull_request/workflow_run chain. Dispatch and own their exact-head CI
         # under this coordinator before any source batch is allowed to drain.
         integration_checks.extend(own_integration_checks(created_clean))
-        newly_promoted_integrations = promote_integrations(client)
+        newly_promoted_integrations = promote_integrations(
+            client,
+            known_checks_by_number={
+                int(value["pull_request"]): dict(value.get("checks") or {})
+                for value in integration_checks
+                if int(value["pull_request"]) in created_clean
+            },
+        )
         promoted_integrations = list(
             dict.fromkeys(promoted_integrations + newly_promoted_integrations)
         )
