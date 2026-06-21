@@ -144,6 +144,7 @@ def drain_queue(repository: str | None = None, config: str | None = None) -> str
 @mcp.tool()
 def react_to_delivery_event(
     follow: bool = False,
+    dispatch_ci: bool = False,
     timeout_seconds: int = 1800,
     repository: str | None = None,
     config: str | None = None,
@@ -152,6 +153,8 @@ def react_to_delivery_event(
     arguments = ["--timeout", str(timeout_seconds)]
     if follow:
         arguments.append("--follow")
+    if dispatch_ci:
+        arguments.append("--dispatch-ci")
     return _run("react", *arguments, repository=repository, config=config)
 
 

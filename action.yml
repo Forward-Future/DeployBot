@@ -9,6 +9,10 @@ inputs:
     description: Follow cumulative main through CI and deployment
     required: false
     default: "false"
+  dispatch_ci:
+    description: Dispatch configured CI after a merge made with github.token
+    required: false
+    default: "true"
   timeout:
     description: Maximum release-follow time in seconds
     required: false
@@ -26,9 +30,13 @@ runs:
         DEPLOYBOT_CONFIG: ${{ inputs.config }}
         GH_TOKEN: ${{ github.token }}
         DEPLOYBOT_FOLLOW: ${{ inputs.follow }}
+        DEPLOYBOT_DISPATCH_CI: ${{ inputs.dispatch_ci }}
         DEPLOYBOT_TIMEOUT: ${{ inputs.timeout }}
       run: |
         args=(react --timeout "$DEPLOYBOT_TIMEOUT")
+        if [[ "$DEPLOYBOT_DISPATCH_CI" == "true" ]]; then
+          args+=(--dispatch-ci)
+        fi
         if [[ "$DEPLOYBOT_FOLLOW" == "true" ]]; then
           args+=(--follow)
         fi

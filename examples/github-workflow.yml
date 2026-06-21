@@ -18,7 +18,7 @@ permissions:
   pull-requests: write
   checks: read
   issues: write
-  actions: read
+  actions: write # required for post-merge workflow_dispatch with github.token
 
 concurrency:
   group: deploybot-${{ github.repository }}

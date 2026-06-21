@@ -66,6 +66,19 @@ class DeployBotSkillTest(unittest.TestCase):
             with self.subTest(path=path):
                 self.assertIn(CHECKOUT_COMMIT, path.read_text(encoding="utf-8"))
 
+    def test_action_dispatches_ci_after_builtin_token_merge(self) -> None:
+        action = (ROOT / "action.yml").read_text(encoding="utf-8")
+        example = (ROOT / "examples" / "github-workflow.yml").read_text(
+            encoding="utf-8"
+        )
+        workflow = (ROOT / ".github" / "workflows" / "ci.yml").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn('default: "true"', action)
+        self.assertIn("args+=(--dispatch-ci)", action)
+        self.assertIn("actions: write", example)
+        self.assertIn("workflow_dispatch:", workflow)
+
     def test_clients_pin_the_immutable_status_release(self) -> None:
         paths = [
             ROOT / "adapters" / "codex" / "agent-merge-queue" / ".mcp.json",
