@@ -11,11 +11,11 @@ integration PRs, follows `main` through production, and pauses after failures.
 
 ## Install
 
-Install the reviewed `v0.2.6` source commit directly from GitHub:
+Install the reviewed `v0.2.7` source commit directly from GitHub:
 
 ```bash
 python3 -m pip install \
-  'deploybot-merge-queue[mcp] @ git+https://github.com/Forward-Future/DeployBot.git@a0e2c833282e63bf5db4339f99773aa9ba2f0c82'
+  'deploybot-merge-queue[mcp] @ git+https://github.com/Forward-Future/DeployBot.git@90f231d7d566901a5f1c0172ac170ec7fab61da0'
 deploybot init
 ```
 
@@ -86,7 +86,7 @@ aligned with `pipeline.ci_workflows`. The privileged worker never checks out or
 executes pull-request code. Pin the Action to the full reviewed release commit:
 
 ```yaml
-- uses: Forward-Future/DeployBot@a0e2c833282e63bf5db4339f99773aa9ba2f0c82
+- uses: Forward-Future/DeployBot@90f231d7d566901a5f1c0172ac170ec7fab61da0
 ```
 
 The Action uses GitHub's built-in workflow token. GitHub intentionally does not
