@@ -2757,7 +2757,28 @@ def command_react(
                 )
             raise
     release: dict[str, Any] | None = None
-    if follow and drained.get("merged"):
+    should_follow = bool(drained.get("merged"))
+    if follow and not should_follow:
+        current = release_state(
+            main_sha=client.base_sha(),
+            runs=client.workflow_runs(),
+            config=client.config.pipeline,
+        )
+        # The worker that merged a batch can be replaced while it waits for CI
+        # (for example, when an older workflow still cancels in-progress runs).
+        # A later event must take over that release even though it did not merge
+        # anything itself. Avoid holding every idle event open when no main CI
+        # exists, and revisit a verified release only when merged thread records
+        # still need their final completion marker.
+        if current["state"] == "testing":
+            should_follow = current.get("latest_ci") is not None
+        elif current["state"] == "verified":
+            should_follow = any(
+                record.get("phase") == "merged" for record in client.thread_records()
+            )
+        else:
+            should_follow = True
+    if follow and should_follow:
         release = command_follow(
             client,
             timeout_seconds=timeout_seconds,

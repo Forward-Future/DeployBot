@@ -1191,6 +1191,52 @@ class QueueCoreTest(unittest.TestCase):
         client.dispatch_ci_workflows.assert_called_once_with()
         self.assertEqual(result["dispatched_ci"], [{"id": 7, "name": "CI"}])
 
+    def test_reactor_resumes_release_when_original_merge_worker_was_replaced(
+        self,
+    ) -> None:
+        sha = "a" * 40
+        client = Mock()
+        client.config = CONFIG
+        client.pipeline_control.return_value = {"state": "running"}
+        client.base_sha.return_value = sha
+        client.workflow_runs.return_value = [
+            {
+                "id": 42,
+                "name": "CI",
+                "head_sha": sha,
+                "status": "completed",
+                "conclusion": "success",
+                "event": "workflow_dispatch",
+                "created_at": "2026-06-20T00:00:00Z",
+                "updated_at": "2026-06-20T00:01:00Z",
+            }
+        ]
+        empty = FreezeResult(None, [], [], [], [])
+        with (
+            patch("agent_merge_queue.cli.promote_integrations", return_value=[]),
+            patch("agent_merge_queue.cli.command_promote", return_value={}),
+            patch("agent_merge_queue.cli.freeze_queue", return_value=empty),
+            patch(
+                "agent_merge_queue.cli.command_drain",
+                return_value={"merged": []},
+            ),
+            patch(
+                "agent_merge_queue.cli.command_follow",
+                return_value={"state": "verified", "main_sha": sha},
+            ) as follow_release,
+            redirect_stdout(io.StringIO()),
+        ):
+            result = command_react(client, follow=True, timeout_seconds=10)
+
+        follow_release.assert_called_once_with(
+            client,
+            timeout_seconds=10,
+            poll_seconds=10,
+            json_output=False,
+            emit=False,
+        )
+        self.assertEqual(result["release"]["state"], "verified")
+
     def test_reactor_pauses_when_post_merge_ci_dispatch_fails(self) -> None:
         client = Mock()
         client.config = CONFIG
