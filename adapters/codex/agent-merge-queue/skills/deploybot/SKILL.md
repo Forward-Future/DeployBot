@@ -138,4 +138,7 @@ thread heartbeat or follow-up monitor before returning. In Codex, use a thread
 heartbeat automation. On wake, run `deploybot status --json`; once this thread
 is listed under pending `notifications`, first show its supplied message to the
 user, then acknowledge it and remove the heartbeat. Do not use a tight polling
-loop.
+loop. Treat `notification_handoff.required_action` in the request result as
+mandatory. Do not finish the source-thread response until that action succeeds;
+if the provider has no native monitor, report the receipt-delivery blocker and
+leave the notification pending.

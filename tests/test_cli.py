@@ -3197,6 +3197,15 @@ class QueueCoreTest(unittest.TestCase):
                 thread_url=None,
             )
         self.assertEqual(result["state"], "deploy-requested")
+        self.assertEqual(
+            result["notification_handoff"],
+            {
+                "owner": "source-thread",
+                "required_action": (
+                    "attach-native-follow-up-monitor-before-returning"
+                ),
+            },
+        )
         self.assertIn("deploybot-intent:v1", client.comment.call_args.args[1])
         client.add_label.assert_called_with(1, "deploy-requested")
         client.record_thread.assert_called_once()

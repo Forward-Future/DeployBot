@@ -2758,6 +2758,22 @@ def command_request(
         "state": "queued" if promoted else "deploy-requested",
         "waiting": [] if promoted else entry.reasons or [],
     }
+    if provider and thread_id:
+        webhook_env = client.config.pipeline.webhook_url_env
+        webhook_ready = bool(webhook_env and os.environ.get(webhook_env))
+        result["notification_handoff"] = {
+            "owner": "webhook" if webhook_ready else "source-thread",
+            "required_action": (
+                "none"
+                if webhook_ready
+                else "attach-native-follow-up-monitor-before-returning"
+            ),
+        }
+    else:
+        result["notification_handoff"] = {
+            "owner": "untracked",
+            "required_action": "record-provider-and-stable-thread-id",
+        }
     print(json.dumps(result, sort_keys=True))
     return result
 

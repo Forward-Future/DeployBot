@@ -38,14 +38,16 @@ batch marker.
 | --- | --- |
 | `deploybot thread update --provider CLIENT --thread-id ID --phase PHASE [--title TEXT] [--branch NAME] [--pr NUMBER] [--url URL]` | Publish metadata-only thread state. Valid client-published phases are `working`, `pr-draft`, `pr-review`, `ready`, `deploy-requested`, `queued`, `merged`, `blocked`, `completed`, and `abandoned`; `deployed` is controller-owned. |
 | `deploybot thread acknowledge --provider CLIENT --thread-id ID --notification-id ID` | Mark the matching `deployed` notification `completed` only after its native-thread message is delivered. Repeated acknowledgement is safe; stale IDs are rejected. |
-| `deploybot request [PR] [--provider CLIENT] [--thread-id ID] [--thread-url URL]` | Record the user's durable deploy intent for the current exact head, even while gates are pending. |
+| `deploybot request [PR] [--provider CLIENT] [--thread-id ID] [--thread-url URL]` | Record the user's durable deploy intent for the current exact head, even while gates are pending, and return the mandatory native receipt handoff action. |
 | `deploybot cancel-request [PR]` | Cancel an unmerged durable deploy request. |
 | `deploybot refresh-request [PR]` | Bind existing user intent to a freshly reviewed replacement head. |
 | `deploybot enqueue [PR]` | Directly queue one exact reviewed head. Prefer `request` for the normal durable-intent flow. |
 
 Only the user's exact `deploy` instruction authorizes `request` or `enqueue` for
 that thread. A source agent may use `refresh-request` after the replacement head
-has fresh evidence; the user does not need to repeat the instruction.
+has fresh evidence; the user does not need to repeat the instruction. The caller
+must complete `notification_handoff.required_action` from the `request` result
+before ending the source-thread response.
 
 ### Coordinator operations
 

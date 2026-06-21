@@ -80,6 +80,7 @@ class DeployBotSkillTest(unittest.TestCase):
         self.assertIn("send_message_to_thread", skill)
         self.assertIn("acknowledge_thread_deployment", skill)
         self.assertIn("heartbeat automation", skill)
+        self.assertIn("notification_handoff.required_action", skill)
         self.assertIn("human-facing release receipt", skill)
         self.assertIn("acknowledge silently", skill)
         self.assertIn("untrusted display-only", skill)
@@ -136,6 +137,7 @@ class DeployBotSkillTest(unittest.TestCase):
         self.assertIn("thread_notifications", rule)
         self.assertIn("acknowledge_thread_deployment", rule)
         self.assertIn("human-readable release", rule)
+        self.assertIn("notification_handoff.required_action", rule)
         self.assertIn("never freeze a", rule)
         self.assertIn("queue merely to inspect it", rule)
 

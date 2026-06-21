@@ -230,6 +230,9 @@ the provider-neutral webhook also receives the `thread-deployed` payload and
 scheduled followers retry it. Without a configured webhook, pending receipts do
 not keep the release worker running; the source adapter's native thread heartbeat
 retrieves, acknowledges, and displays the final notification instead.
+The request result makes this ownership explicit in
+`notification_handoff.required_action`; clients must complete that action before
+ending the source-thread response.
 
 ```toml
 [pipeline]
