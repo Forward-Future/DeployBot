@@ -149,9 +149,7 @@ class ReviewProviderTest(unittest.TestCase):
                 {
                     "isResolved": False,
                     "isOutdated": False,
-                    "comments": {
-                        "nodes": [{"author": {"login": "review-bot[bot]"}}]
-                    },
+                    "comments": {"nodes": [{"author": {"login": "review-bot[bot]"}}]},
                 }
             ],
         )[0]

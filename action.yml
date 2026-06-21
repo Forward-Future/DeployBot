@@ -1,10 +1,18 @@
 name: DeployBot
-description: Drain reviewed pull requests after the merge-queue label is added
+description: Promote, batch, merge, and follow agent-authored pull requests
 inputs:
   config:
     description: Repository-relative merge queue policy path
     required: false
     default: .mergequeue.toml
+  follow:
+    description: Follow cumulative main through CI and deployment
+    required: false
+    default: "false"
+  timeout:
+    description: Maximum release-follow time in seconds
+    required: false
+    default: "1800"
 runs:
   using: composite
   steps:
@@ -17,4 +25,11 @@ runs:
       env:
         DEPLOYBOT_CONFIG: ${{ inputs.config }}
         GH_TOKEN: ${{ github.token }}
-      run: deploybot --config "$DEPLOYBOT_CONFIG" drain --json
+        DEPLOYBOT_FOLLOW: ${{ inputs.follow }}
+        DEPLOYBOT_TIMEOUT: ${{ inputs.timeout }}
+      run: |
+        args=(react --timeout "$DEPLOYBOT_TIMEOUT")
+        if [[ "$DEPLOYBOT_FOLLOW" == "true" ]]; then
+          args+=(--follow)
+        fi
+        deploybot --config "$DEPLOYBOT_CONFIG" "${args[@]}"

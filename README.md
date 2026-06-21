@@ -4,27 +4,30 @@ DeployBot is a provider-neutral GitHub merge queue for coding agents.
 Codex, Claude Code, Cursor, or any MCP client can prepare and review a pull
 request; the user keeps the final merge decision by saying `deploy`.
 
-The queue stores authority in GitHub labels and authenticated comments. It pins
-the exact reviewed head, freezes bursts, merges independent work back-to-back,
-skips blockers, and reports overlapping source that needs one integration PR.
+DeployBot stores authority in GitHub labels and authenticated comments. It
+records deploy intent immediately, promotes the final exact reviewed head,
+freezes bursts, merges independent work back-to-back, scaffolds cumulative
+integration PRs, follows `main` through production, and pauses after failures.
 
 ## Install
 
-Install the reviewed `v0.1.4` source commit directly from GitHub:
+Install the reviewed `v0.2.0` source commit directly from GitHub:
 
 ```bash
 python3 -m pip install \
-  'deploybot-merge-queue[mcp] @ git+https://github.com/Forward-Future/DeployBot.git@f18dce436bae2d6b7009d9aa76b4bfc8d0aac5a8'
+  'deploybot-merge-queue[mcp] @ git+https://github.com/Forward-Future/DeployBot.git@2e884f65f182f6a9ddc4c4785288045bdf98f188'
 deploybot init
 ```
 
 Invoke the bundled `$deploybot` skill to inspect or operate the queue. Typical
-requests include “show the DeployBot queue,” “why is PR 42 blocked?”, and
-“deploy this PR.” Queue-only status is read-only:
+requests include “show the delivery pipeline,” “why is PR 42 blocked?”, and
+“deploy this PR.” Status and diagnostics are read-only:
 
 ```bash
 deploybot status
 deploybot status --json
+deploybot doctor
+deploybot metrics --json
 deploybot inspect 42 --json
 ```
 
@@ -40,6 +43,7 @@ comes from the GitHub CLI:
 ```bash
 gh auth login
 deploybot ensure-labels
+deploybot doctor
 ```
 
 The base installation has no review-service dependency. Repositories can use
@@ -59,47 +63,34 @@ and never execute pull-request-head code in the privileged coordinator. The MCP
 server uses the local process's existing GitHub credentials and accepts explicit
 repository selectors, so run it only from a trusted coding client and workspace.
 
-## Manual deploy gate
+## Durable manual deploy gate
 
 The installed agent adapter treats the user's exact `deploy` instruction as
-authority for that thread's PR only. It calls:
+authority for that thread's PR only. It records the intent immediately—even if
+CI or review is still running:
 
 ```bash
-deploybot enqueue <pr-number>
+deploybot request <pr-number> \
+  --provider codex --thread-id "$CODEX_THREAD_ID"
 ```
 
-No timer is involved. Adding the `merge-queue` label can wake a GitHub Actions
-coordinator immediately:
+The event worker promotes only the intent-bound exact head after all checks and
+review providers pass. If review fixes create a replacement head, the trusted
+source agent runs `deploybot refresh-request <pr>` after its fresh evidence;
+the user does not repeat `deploy`. No polling timer is involved.
+
+Install `examples/github-workflow.yml` on the default branch. It reacts to
+deploy labels, ready/synchronize events, reviews, named CI `workflow_run`
+completions, and completed external check suites. Keep its `workflows` list
+aligned with `pipeline.ci_workflows`. The privileged worker never checks out or
+executes pull-request code. Pin the Action to the full reviewed release commit:
 
 ```yaml
-name: DeployBot
-on:
-  pull_request_target:
-    types: [labeled]
-
-permissions:
-  contents: write
-  pull-requests: write
-  checks: read
-
-concurrency:
-  group: deploybot-${{ github.repository }}
-  cancel-in-progress: false
-
-jobs:
-  drain:
-    if: github.event.label.name == 'merge-queue'
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
-      # v0.1.4; keep the full commit so privileged workflows are immutable.
-      - uses: Forward-Future/DeployBot@f18dce436bae2d6b7009d9aa76b4bfc8d0aac5a8
+- uses: Forward-Future/DeployBot@2e884f65f182f6a9ddc4c4785288045bdf98f188
 ```
 
-Keep this workflow on the default branch. Never check out or execute code from
-the pull-request head in a privileged `pull_request_target` workflow.
-
-The workflow bot and each person allowed to enqueue must be explicitly listed:
+The workflow bot and each person allowed to request deployment must be
+explicitly listed:
 
 ```toml
 [queue]
@@ -109,8 +100,48 @@ coordinator_actors = ["@repository-owner", "github-actions[bot]"]
 
 `@repository-owner` resolves to the owner in `owner/repository`. Organization
 repositories should replace it with the exact human or bot logins they trust.
-Coordinator accounts may freeze and complete a batch, but they cannot create
-the per-pull-request deploy authorization.
+Coordinator accounts may promote, freeze, integrate, and complete batches, but
+they cannot create the original per-pull-request deploy intent.
+
+## Delivery controller
+
+`deploybot status` reports active metadata-only agent threads, every PR stage,
+deploy requests, queue order, overlaps, exact-`main` CI, deployment, and pipeline
+pause state. It never stores prompts, transcripts, source, or credentials.
+
+`deploybot react` promotes ready intent, skips blockers, drains independent
+work, and creates integration PRs when configured. A conflict produces a repair
+handoff containing the source thread, base/head SHAs, source paths, and one
+return command:
+
+```bash
+deploybot resume <pr-number>
+```
+
+`resume` atomically verifies the replacement head, clears the block, requeues,
+and emits a new wake-up event. `follow` tracks newer cumulative `main` revisions
+until exact CI, deployment, and optional HTTP checks pass. A CI or deploy failure
+can pause further merges until `deploybot unpause`.
+
+```toml
+[pipeline]
+ci_workflows = ["CI"]
+deploy_workflows = ["Deploy"]
+ready_to_merge_target_minutes = 15
+merge_to_live_target_minutes = 10
+auto_promote = true
+intent_scope = "head"
+pause_on_failure = true
+
+[[pipeline.verifications]]
+name = "Login"
+url = "https://example.com/login"
+expected_status = 200
+
+[integration]
+# manual, overlap, or all (one cumulative pre-merge validation PR)
+mode = "overlap"
+```
 
 ## Review providers
 
@@ -156,6 +187,18 @@ The `mergeq` and `mergeq-mcp` command aliases remain for compatibility.
 ```text
 deploybot status --json
 deploybot plan --json
+deploybot doctor --json
+deploybot request <pr> --provider codex --thread-id THREAD
+deploybot refresh-request <pr>
+deploybot promote
+deploybot react --follow
+deploybot resume <pr>
+deploybot integrate --all
+deploybot follow --json
+deploybot metrics --json
+deploybot pause --reason "main CI failed"
+deploybot unpause
+deploybot thread update --provider codex --thread-id THREAD --phase ready --pr 42
 deploybot inspect <pr> --json
 deploybot enqueue <pr>
 deploybot freeze --json
@@ -166,11 +209,12 @@ deploybot dequeue <pr> --reason "..."
 deploybot merge <pr> --batch <batch-id>
 ```
 
-`status` is a read-only alias for `plan`. It reports queue order, readiness,
-blockers, dependencies, and overlap groups without freezing a batch.
+`status` is the read-only full delivery view. `plan` is the narrower queue-only
+view. `doctor` verifies CLI auth, policy, labels, actors, check names, and branch
+protection without changing the repository.
 
-`drain` merges only independent, green, exact-head-reviewed PRs. Overlapping
-source is returned as `integration_required` for an agent to resolve once. It
-waits briefly while GitHub recomputes mergeability after a merge, then records
-the pass complete so a later independent batch cannot be stranded behind a
-waiting item.
+`drain` merges only independent, green, exact-head-reviewed PRs. Integration
+mode `overlap` creates one cumulative PR for shared source; mode `all` routes the
+whole frozen batch through one cumulative PR before `main`. DeployBot never
+invents a conflict resolution: it prepares the branch and hands the exact repair
+back to an agent.

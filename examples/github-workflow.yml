@@ -2,22 +2,40 @@ name: DeployBot
 
 on:
   pull_request_target:
-    types: [labeled]
+    types: [labeled, ready_for_review, reopened, synchronize]
+  pull_request_review:
+    types: [submitted, dismissed]
+  # Keep this list aligned with pipeline.ci_workflows in .mergequeue.toml.
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+  check_suite:
+    types: [completed]
+  workflow_dispatch:
 
 permissions:
   contents: write
   pull-requests: write
   checks: read
+  issues: write
+  actions: read
 
 concurrency:
   group: deploybot-${{ github.repository }}
   cancel-in-progress: false
 
 jobs:
-  drain:
-    if: github.event.label.name == 'merge-queue'
+  react:
+    if: >-
+      github.event_name != 'pull_request_target' ||
+      github.event.action != 'labeled' ||
+      github.event.label.name == 'deploy-requested' ||
+      github.event.label.name == 'merge-queue'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
-      # v0.1.4; keep the full commit so privileged workflows are immutable.
-      - uses: Forward-Future/DeployBot@f18dce436bae2d6b7009d9aa76b4bfc8d0aac5a8
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+      # v0.2.0 implementation; keep the full commit for privileged workflows.
+      - uses: Forward-Future/DeployBot@2e884f65f182f6a9ddc4c4785288045bdf98f188

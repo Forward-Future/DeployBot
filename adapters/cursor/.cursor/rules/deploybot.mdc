@@ -1,13 +1,16 @@
 ---
-description: Inspect DeployBot queue status, blockers, dependencies, and overlap groups
+description: Inspect and operate the full DeployBot delivery pipeline
 alwaysApply: false
 ---
 
-Read `.mergequeue.toml` and use the `deploybot` MCP tools. For queue status,
-call `queue_plan`; for one pull request, call `inspect_pull_request`. Status
-requests must stay read-only: never freeze a queue merely to inspect it.
+Read `.mergequeue.toml` and use the `deploybot` MCP tools. For full status call
+`pipeline_status`; for queue-only status call `queue_plan`; for one pull request
+call `inspect_pull_request`. Status requests stay read-only: never freeze a
+queue merely to inspect it.
 
-Report queue order, readiness, exact heads, pending checks or reviews, blockers,
-dependencies, and source overlaps. Only the user's exact `deploy` instruction
-authorizes enqueueing that conversation's pull request. Only the designated
-coordinator may freeze or drain the queue.
+Report metadata-only active threads, deploy intent, PR stages, queue order,
+exact heads, blockers, overlap, CI, and deployment. Only the user's exact
+`deploy` instruction authorizes `request_deployment` for that thread. Publish
+the stable Cursor thread ID, never prompts or transcripts. Refresh intent only
+after replacement-head review. Only the coordinator may react, integrate,
+drain, follow, pause, or resume repaired work.
