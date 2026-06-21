@@ -86,6 +86,45 @@ class DeployBotSkillTest(unittest.TestCase):
         self.assertIn("Never publish prompts, transcripts", skill)
         self.assertIn("Never call `freeze_queue` merely to view status", skill)
         self.assertIn("exact `deploy` instruction", skill)
+        self.assertIn("Immediately before telling the user", skill)
+        self.assertIn("do not repeat a stale action request", skill)
+        self.assertIn("original `deploy` instruction already authorizes", skill)
+
+    def test_every_adapter_revalidates_before_unpause_handoff(self) -> None:
+        paths = [
+            ROOT / "skills" / "manage-merge-queue" / "SKILL.md",
+            ROOT / "adapters" / "claude-code" / "skills" / "deploybot" / "SKILL.md",
+            ROOT
+            / "adapters"
+            / "claude-code"
+            / "skills"
+            / "manage-merge-queue"
+            / "SKILL.md",
+            ROOT
+            / "adapters"
+            / "codex"
+            / "agent-merge-queue"
+            / "skills"
+            / "deploybot"
+            / "SKILL.md",
+            ROOT
+            / "adapters"
+            / "codex"
+            / "agent-merge-queue"
+            / "skills"
+            / "manage-merge-queue"
+            / "SKILL.md",
+            ROOT / "adapters" / "cursor" / ".cursor" / "rules" / "deploybot.mdc",
+        ]
+        for path in paths:
+            text = path.read_text(encoding="utf-8")
+            with self.subTest(path=path):
+                if "adapters/codex" in path.as_posix():
+                    self.assertIn("deploybot status --json", text)
+                else:
+                    self.assertIn("pipeline_status", text)
+                self.assertIn("original", text.lower())
+                self.assertIn("unpause", text)
 
     def test_cursor_adapter_exposes_status_workflow(self) -> None:
         rule = (

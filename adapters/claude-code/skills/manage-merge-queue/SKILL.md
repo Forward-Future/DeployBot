@@ -29,6 +29,15 @@ returned `owned` thread may use the deterministic repair branch. Respect the
 maximum batch size and keep new merges closed while an earlier release is
 unfinished.
 
+Immediately before asking the user to `unpause` or take another repair action,
+call `pipeline_status` again. Never show a stale pause prompt when durable state
+is already `running` or the release has advanced. The original `deploy`
+instruction authorizes the coordinator to unpause the matching failed release
+after the elected repair head passes fresh checks and review, provided the pause
+reason still matches and no rollback or gate waiver is needed. In that case,
+run `deploybot unpause --sha <failed-main-sha> --control-id <control-id>` and
+continue without asking the user to repeat authorization.
+
 When `follow_release` returns `thread_notifications`, send each supplied
 message to its native source thread. The source thread calls
 `acknowledge_thread_deployment` with the matching `notification_id`. Present the

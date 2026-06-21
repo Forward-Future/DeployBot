@@ -32,6 +32,7 @@ from agent_merge_queue.cli import (
     command_resume,
     command_thread_acknowledge,
     command_unblock,
+    command_unpause,
     completed_batch_ids,
     delivery_metrics,
     deployment_repair_required,
@@ -65,6 +66,7 @@ from agent_merge_queue.cli import (
 )
 from agent_merge_queue.config import parse_config
 from agent_merge_queue.records import (
+    control_body,
     integration_body,
     intent_body,
     release_repair_body,
@@ -4205,6 +4207,182 @@ class QueueCoreTest(unittest.TestCase):
         client.set_pipeline_control.assert_called_once_with(
             "paused", "post-merge CI dispatch failed: CI has no dispatch"
         )
+
+    def test_unpause_compare_and_sets_matching_failed_release(self) -> None:
+        sha = "a" * 40
+        control_id = "pause-1"
+        client = Mock()
+        client.pipeline_control.side_effect = [
+            {
+                "state": "paused",
+                "reason": f"ci-failed on {sha}",
+                "control_id": control_id,
+                "main_sha": sha,
+            },
+            {
+                "state": "running",
+                "resumes_control_id": control_id,
+            },
+        ]
+        client.base_sha.return_value = sha
+
+        with redirect_stdout(io.StringIO()):
+            command_unpause(
+                client,
+                main_sha=sha,
+                control_id=control_id,
+            )
+
+        client.set_pipeline_control.assert_called_once_with(
+            "running", None, resumes_control_id=control_id
+        )
+
+    def test_unpause_rejects_changed_pause_record(self) -> None:
+        sha = "a" * 40
+        client = Mock()
+        client.pipeline_control.return_value = {
+            "state": "paused",
+            "reason": f"ci-failed on {sha}",
+            "control_id": "newer",
+            "main_sha": sha,
+        }
+
+        with self.assertRaisesRegex(QueueError, "pause record changed"):
+            command_unpause(
+                client,
+                main_sha=sha,
+                control_id="older",
+            )
+
+        client.set_pipeline_control.assert_not_called()
+
+    def test_unpause_rejects_advanced_main(self) -> None:
+        sha = "a" * 40
+        client = Mock()
+        client.pipeline_control.return_value = {
+            "state": "paused",
+            "reason": f"ci-failed on {sha}",
+            "control_id": "same",
+            "main_sha": sha,
+        }
+        client.base_sha.return_value = "b" * 40
+
+        with self.assertRaisesRegex(QueueError, "main advanced"):
+            command_unpause(
+                client,
+                main_sha=sha,
+                control_id="same",
+            )
+
+        client.set_pipeline_control.assert_not_called()
+
+    def test_unpause_rejects_new_pause_won_during_transition(self) -> None:
+        sha = "a" * 40
+        client = Mock()
+        client.pipeline_control.side_effect = [
+            {
+                "state": "paused",
+                "control_id": "pause-1",
+                "main_sha": sha,
+            },
+            {
+                "state": "paused",
+                "control_id": "pause-2",
+                "main_sha": sha,
+            },
+        ]
+        client.base_sha.return_value = sha
+
+        with self.assertRaisesRegex(QueueError, "changed during unpause"):
+            command_unpause(client, main_sha=sha, control_id="pause-1")
+
+        client.set_pipeline_control.assert_called_once_with(
+            "running", None, resumes_control_id="pause-1"
+        )
+
+    def test_pipeline_control_ignores_stale_resume_after_new_pause(self) -> None:
+        sha = "a" * 40
+        client = object.__new__(GitHub)
+        client.coordinator_logins = {"coordinator"}
+        client.registry_comments = Mock(
+            return_value=[
+                {
+                    "id": 1,
+                    "created_at": "2026-06-21T17:17:13Z",
+                    "user": {"login": "coordinator"},
+                    "body": control_body(
+                        state="paused",
+                        control_id="pause-1",
+                        reason=f"ci-failed on {sha}",
+                        main_sha=sha,
+                    ),
+                },
+                {
+                    "id": 2,
+                    "created_at": "2026-06-21T17:17:14Z",
+                    "user": {"login": "coordinator"},
+                    "body": control_body(
+                        state="paused",
+                        control_id="pause-2",
+                        reason=f"deploy-failed on {sha}",
+                        main_sha=sha,
+                    ),
+                },
+                {
+                    "id": 3,
+                    "created_at": "2026-06-21T17:17:15Z",
+                    "user": {"login": "coordinator"},
+                    "body": control_body(
+                        state="running",
+                        control_id="resume-1",
+                        resumes_control_id="pause-1",
+                    ),
+                },
+                {
+                    "id": 4,
+                    "created_at": "2026-06-21T17:17:16Z",
+                    "user": {"login": "coordinator"},
+                    "body": (
+                        '<!-- deploybot-control:v1 {"recorded_at": '
+                        '"2026-06-21T17:17:16Z", "schema": 1, '
+                        '"state": "running"} -->\n'
+                        "Recorded DeployBot pipeline control."
+                    ),
+                },
+            ]
+        )
+
+        control = client.pipeline_control()
+
+        self.assertEqual(control["state"], "paused")
+        self.assertEqual(control["control_id"], "pause-2")
+
+    def test_pipeline_control_migrates_legacy_pause_with_comment_identity(self) -> None:
+        sha = "a" * 40
+        client = object.__new__(GitHub)
+        client.coordinator_logins = {"coordinator"}
+        client.base_sha = Mock(return_value=sha)
+        client.registry_comments = Mock(
+            return_value=[
+                {
+                    "id": 42,
+                    "created_at": "2026-06-21T17:17:13Z",
+                    "user": {"login": "coordinator"},
+                    "body": (
+                        '<!-- deploybot-control:v1 {"reason": "ci-failed", '
+                        '"recorded_at": "2026-06-21T17:17:13Z", '
+                        '"schema": 1, "state": "paused"} -->\n'
+                        "Recorded DeployBot pipeline control."
+                    ),
+                }
+            ]
+        )
+
+        control = client.pipeline_control()
+
+        self.assertEqual(control["control_id"], "legacy-comment:42")
+        self.assertEqual(control["main_sha"], sha)
+        self.assertTrue(control["legacy_control"])
 
     def test_github_dispatches_each_configured_active_ci_workflow(self) -> None:
         client = object.__new__(GitHub)

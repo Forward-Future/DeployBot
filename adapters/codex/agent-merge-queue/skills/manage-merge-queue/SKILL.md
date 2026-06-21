@@ -30,6 +30,16 @@ only the returned `owned` thread may use the deterministic repair branch. Respec
 maximum batch size and keep new merges closed while an earlier release is
 unfinished.
 
+Immediately before asking the user to `unpause` or take another repair action,
+run `deploybot status --json` again. Never show a stale pause prompt when
+durable state is already `running` or the release has advanced. The original
+`deploy` instruction authorizes the coordinator to run `deploybot unpause
+--sha <failed-main-sha> --control-id <control-id>` for
+the matching failed release after the elected repair head passes fresh checks
+and review, provided the pause reason still matches and no rollback or gate
+waiver is needed. In that case, unpause and continue without asking the user to
+repeat authorization.
+
 When `deploybot follow --json` returns `thread_notifications`, send each supplied
 message to its native source thread. In Codex use `send_message_to_thread`;
 the source thread runs `deploybot thread acknowledge` with the matching

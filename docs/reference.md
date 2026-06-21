@@ -1,7 +1,7 @@
 # DeployBot reference
 
 This reference describes the CLI, MCP server, policy file, and GitHub Action in
-DeployBot v0.2.12. GitHub labels and authenticated comments are the durable state;
+DeployBot v0.2.13. GitHub labels and authenticated comments are the durable state;
 the CLI and MCP tools are two interfaces to the same operations.
 
 ## CLI
@@ -58,7 +58,7 @@ has fresh evidence; the user does not need to repeat the instruction.
 | `deploybot integrate [--all]` | Scaffold a cumulative integration PR for overlap groups, or the whole frozen batch with `--all`. |
 | `deploybot follow [--timeout SECONDS] [--poll SECONDS] [--json]` | Follow the newest exact base-branch head through CI, deployment, and HTTP verification. Defaults: 1800-second timeout and 10-second poll. |
 | `deploybot pause --reason TEXT` | Pause merging after a delivery failure. |
-| `deploybot unpause` | Resume a pipeline after verified recovery. |
+| `deploybot unpause --sha SHA --control-id ID` | Conditionally resume the matching failed release after fresh status revalidation and verified repair; a running record can clear only that unique pause, so changed control or advanced main fails closed. The original deploy instruction remains sufficient unless rollback, bypass, or mismatched recovery expands authority. |
 | `deploybot claim-release-repair --provider CLIENT --thread-id ID [--thread-url URL] [--sha SHA]` | Atomically claim the owner-encoded deterministic repair branch for the current failed exact-main release. Other threads recover the same owner from the ref instead of creating duplicate repair PRs. |
 
 Only a configured coordinator should run these operations. `react
