@@ -1655,6 +1655,59 @@ class QueueCoreTest(unittest.TestCase):
 
         self.assertEqual(states["CI"], "pending")
 
+    def test_same_name_check_run_and_failed_status_blocks_required_check(self) -> None:
+        states = check_states(
+            [
+                {"__typename": "CheckRun", "name": "CI", "conclusion": "SUCCESS"},
+                {"__typename": "StatusContext", "context": "CI", "state": "FAILURE"},
+            ]
+        )
+        self.assertEqual(states["CI"], "failed")
+
+        value = entry(1)
+        value.checks = states
+        value.classify(CONFIG)
+
+        self.assertEqual(value.state, "blocked")
+        self.assertIn("CI failed", value.reasons)
+
+    def test_same_name_check_run_and_pending_status_waits_required_check(self) -> None:
+        states = check_states(
+            [
+                {"__typename": "CheckRun", "name": "CI", "conclusion": "SUCCESS"},
+                {"__typename": "StatusContext", "context": "CI", "state": "PENDING"},
+            ]
+        )
+        self.assertEqual(states["CI"], "pending")
+
+        value = entry(1)
+        value.checks = states
+        value.classify(CONFIG)
+
+        self.assertEqual(value.state, "waiting")
+        self.assertIn("CI is not complete", value.reasons)
+
+    def test_exact_check_run_replaces_stale_rollup_check_run_identity(self) -> None:
+        states = check_states(
+            [
+                {
+                    "__typename": "CheckRun",
+                    "name": "CI",
+                    "status": "QUEUED",
+                    "workflowName": "Build",
+                    "startedAt": "2026-06-20T00:00:00Z",
+                },
+                {
+                    "name": "CI",
+                    "conclusion": "SUCCESS",
+                    "app": {"slug": "github-actions"},
+                    "started_at": "2026-06-20T00:01:00Z",
+                },
+            ]
+        )
+
+        self.assertEqual(states["CI"], "passed")
+
     def test_review_verdicts_are_classified_generically(self) -> None:
         value = entry(1)
         value.review_verdicts = (ReviewVerdict("Any bot", "blocked", ("one finding",)),)
