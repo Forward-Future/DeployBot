@@ -17,6 +17,7 @@ from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable
+from urllib.parse import quote
 
 from . import __version__
 from .config import ConfigError, QueueConfig, initialize_config, load_config
@@ -857,6 +858,28 @@ class GitHub:
             "workflow_runs",
         )
 
+    def workflow_runs_for_branch(self, branch: str) -> list[dict[str, Any]]:
+        return self._paged_object_items(
+            f"repos/{self.repository}/actions/runs?branch={quote(branch, safe='')}&per_page=100",
+            "workflow_runs",
+        )
+
+    def pull_head(self, number: int) -> dict[str, str]:
+        value = self._json(
+            "pr",
+            "view",
+            str(number),
+            "--repo",
+            self.repository,
+            "--json",
+            "headRefName,headRefOid,state",
+        )
+        return {
+            "branch": str(value.get("headRefName") or ""),
+            "head_sha": str(value.get("headRefOid") or ""),
+            "state": str(value.get("state") or ""),
+        }
+
     def source_deploy_authorized(self, number: int, expected_head: str) -> bool:
         source = self._json(
             "pr",
@@ -900,8 +923,13 @@ class GitHub:
                 return False
         return True
 
-    def dispatch_ci_workflows(self) -> list[dict[str, Any]]:
-        configured = self.config.pipeline.ci_workflows
+    def dispatch_ci_workflows(
+        self,
+        *,
+        ref: str | None = None,
+        names: Iterable[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        configured = tuple(names or self.config.pipeline.ci_workflows)
         if not configured:
             raise QueueError("no CI workflow is configured for post-merge dispatch")
         values = self._json(
@@ -936,7 +964,7 @@ class GitHub:
                 "--repo",
                 self.repository,
                 "--ref",
-                self.config.base_branch,
+                ref or self.config.base_branch,
             )
             dispatched.append({"id": workflow_id, "name": name})
         return dispatched
@@ -2131,6 +2159,113 @@ def promote_integrations(client: GitHub) -> list[int]:
     return promoted
 
 
+def settle_integration_checks(
+    client: GitHub,
+    *,
+    timeout_seconds: int,
+    poll_seconds: int,
+    numbers: Iterable[int] | None = None,
+) -> list[dict[str, Any]]:
+    """Own token-created integration CI until each clean PR is merge-ready."""
+    if numbers is None:
+        values = client.integration_pull_request_numbers()
+        if not isinstance(values, list):
+            return []
+        selected = [int(value) for value in values]
+    else:
+        selected = [int(value) for value in numbers]
+    results: list[dict[str, Any]] = []
+    configured = tuple(client.config.pipeline.ci_workflows)
+    for number in selected:
+        comments = client.comments(number)
+        integration = latest_payload(
+            comments,
+            INTEGRATION_MARKER,
+            coordinator_logins(client),
+        )
+        if not integration or integration.get("conflict"):
+            continue
+        pull = client.pull_head(number)
+        branch = str(pull.get("branch") or "")
+        head_sha = str(pull.get("head_sha") or "")
+        if pull.get("state") != "OPEN" or not branch or not head_sha:
+            raise QueueError(f"integration PR #{number} is no longer open")
+        deadline = time.monotonic() + timeout_seconds
+        dispatched: list[dict[str, Any]] = []
+        while True:
+            current = client.pull_head(number)
+            if current.get("state") != "OPEN":
+                raise QueueError(f"integration PR #{number} is no longer open")
+            if current.get("head_sha") != head_sha:
+                raise QueueError(
+                    f"integration PR #{number} changed while CI ownership was active"
+                )
+            runs = client.workflow_runs_for_branch(branch)
+            latest: dict[str, dict[str, Any]] = {}
+            for run in runs:
+                name = str(run.get("name") or "")
+                if (
+                    name not in configured
+                    or str(run.get("head_sha") or "") != head_sha
+                    or str(run.get("event") or "") != "workflow_dispatch"
+                ):
+                    continue
+                previous = latest.get(name)
+                key = (str(run.get("created_at") or ""), int(run.get("id") or 0))
+                previous_key = (
+                    str((previous or {}).get("created_at") or ""),
+                    int((previous or {}).get("id") or 0),
+                )
+                if previous is None or key > previous_key:
+                    latest[name] = run
+            missing = [name for name in configured if name not in latest]
+            if missing:
+                dispatched.extend(
+                    client.dispatch_ci_workflows(ref=branch, names=missing)
+                )
+            else:
+                failed = [
+                    name
+                    for name, run in latest.items()
+                    if str(run.get("status") or "") == "completed"
+                    and str(run.get("conclusion") or "") != "success"
+                ]
+                if failed:
+                    raise QueueError(
+                        f"integration PR #{number} CI failed: " + ", ".join(failed)
+                    )
+                if all(
+                    str(run.get("status") or "") == "completed"
+                    and str(run.get("conclusion") or "") == "success"
+                    for run in latest.values()
+                ):
+                    entry = client.snapshot(
+                        number,
+                        require_marker=False,
+                        allow_blocked_label=True,
+                    )
+                    if entry.state == "ready":
+                        results.append(
+                            {
+                                "branch": branch,
+                                "dispatched_ci": dispatched,
+                                "head_sha": head_sha,
+                                "pull_request": number,
+                                "state": "ready",
+                            }
+                        )
+                        break
+                    if entry.state == "blocked":
+                        raise QueueError(
+                            f"integration PR #{number} is blocked: "
+                            + "; ".join(entry.reasons or ["unknown gate"])
+                        )
+            if time.monotonic() >= deadline:
+                raise QueueError(f"integration PR #{number} CI timed out")
+            time.sleep(poll_seconds)
+    return results
+
+
 def command_resume(client: GitHub, selector: str | None) -> None:
     number = client.resolve_pr(selector)
     comments = client.comments(number)
@@ -3093,6 +3228,34 @@ def near_ready_overlap_holds(
     return holds
 
 
+def combine_drain_results(
+    first: dict[str, Any], second: dict[str, Any]
+) -> dict[str, Any]:
+    batch_ids: list[str] = []
+    for value in (first, second):
+        candidates = list(value.get("batch_ids") or [])
+        if not candidates and value.get("batch_id"):
+            candidates = [str(value["batch_id"])]
+        batch_ids.extend(
+            candidate for candidate in candidates if candidate not in batch_ids
+        )
+    waiting = {
+        int(value["number"]): value
+        for result in (first, second)
+        for value in result.get("waiting") or []
+    }
+    return {
+        "batch_id": batch_ids[-1] if batch_ids else None,
+        "batch_ids": batch_ids,
+        "integration_required": list(first.get("integration_required") or [])
+        + list(second.get("integration_required") or []),
+        "merged": list(first.get("merged") or [])
+        + list(second.get("merged") or []),
+        "next_batch": list(second.get("next_batch") or []),
+        "waiting": list(waiting.values()),
+    }
+
+
 def command_react(
     client: GitHub,
     *,
@@ -3105,6 +3268,25 @@ def command_react(
         result = {"state": "paused", "reason": control.get("reason")}
         print(json.dumps(result, indent=2, sort_keys=True))
         return result
+
+    def own_integration_checks(
+        numbers: Iterable[int] | None = None,
+    ) -> list[dict[str, Any]]:
+        try:
+            return settle_integration_checks(
+                client,
+                timeout_seconds=timeout_seconds,
+                poll_seconds=10,
+                numbers=numbers,
+            )
+        except QueueError as error:
+            if client.config.pipeline.pause_on_failure:
+                client.set_pipeline_control(
+                    "paused", "integration CI ownership failed: " + str(error)
+                )
+            raise
+
+    integration_checks = own_integration_checks()
     promoted_integrations = promote_integrations(client)
     captured_entries: list[QueueEntry] = []
     promoted = command_promote(
@@ -3157,6 +3339,7 @@ def command_react(
         )
         drained: dict[str, Any] = {
             "batch_id": frozen.batch["batch_id"],
+            "batch_ids": [frozen.batch["batch_id"]],
             "merged": [],
             "waiting": [],
             "integration_required": frozen.overlap_groups,
@@ -3182,16 +3365,42 @@ def command_react(
                     entries=overlap_entries,
                 )
             )
+        drained = {}
+
+    created_clean = [
+        int(value["number"])
+        for value in integrations
+        if value.get("number") and not value.get("conflict")
+    ]
+    newly_promoted_integrations: list[int] = []
+    if created_clean:
+        # GITHUB_TOKEN-created pull requests do not emit a dependable recursive
+        # pull_request/workflow_run chain. Dispatch and own their exact-head CI
+        # under this coordinator before any source batch is allowed to drain.
+        integration_checks.extend(own_integration_checks(created_clean))
+        newly_promoted_integrations = promote_integrations(client)
+        promoted_integrations = list(
+            dict.fromkeys(promoted_integrations + newly_promoted_integrations)
+        )
+
+    if not drained:
         # Establish durable ownership for every overlapping source before any
         # independent member of the frozen batch is allowed to merge. A setup
-        # failure while creating the integration PR must leave the batch intact
-        # and must never strand an already-merged partial batch before CI.
+        # or integration-CI failure leaves the batch intact and cannot strand
+        # an already-merged partial batch before exact-main CI.
         drained = command_drain(
             client,
             json_output=False,
             emit=False,
             initial_frozen=frozen,
         )
+    if newly_promoted_integrations:
+        integration_drain = command_drain(
+            client,
+            json_output=False,
+            emit=False,
+        )
+        drained = combine_drain_results(drained, integration_drain)
     dispatched_ci: list[dict[str, Any]] = []
     if dispatch_ci and drained.get("merged"):
         try:
@@ -3225,6 +3434,7 @@ def command_react(
         "drain": drained,
         "dispatched_ci": dispatched_ci,
         "integrations": integrations,
+        "integration_checks": integration_checks,
         "release": release,
     }
     print(json.dumps(result, indent=2, sort_keys=True))

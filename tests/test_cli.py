@@ -44,6 +44,7 @@ from agent_merge_queue.cli import (
     queue_from_intent,
     queue_timestamp,
     reusable_batch,
+    settle_integration_checks,
     should_settle_batch,
     structured_dependencies,
 )
@@ -1509,17 +1510,38 @@ class QueueCoreTest(unittest.TestCase):
         client.config = config
         client.coordinator_logins = {"coordinator"}
         client.pipeline_control.return_value = {"state": "running"}
-        client.create_integration_pull_request.return_value = {"number": 99}
+        client.create_integration_pull_request.return_value = {
+            "number": 99,
+            "conflict": None,
+        }
         with (
-            patch("agent_merge_queue.cli.promote_integrations", return_value=[]),
+            patch(
+                "agent_merge_queue.cli.settle_integration_checks",
+                side_effect=[[], [{"pull_request": 99, "state": "ready"}]],
+            ),
+            patch(
+                "agent_merge_queue.cli.promote_integrations",
+                side_effect=[[], [99]],
+            ),
             patch("agent_merge_queue.cli.command_promote", return_value={}),
             patch("agent_merge_queue.cli.freeze_queue", return_value=frozen),
-            patch("agent_merge_queue.cli.command_drain") as drain,
+            patch(
+                "agent_merge_queue.cli.command_drain",
+                return_value={
+                    "batch_id": "integration",
+                    "batch_ids": ["integration"],
+                    "integration_required": [],
+                    "merged": [{"number": 99, "merge_sha": "a" * 40}],
+                    "next_batch": [],
+                    "waiting": [],
+                },
+            ) as drain,
             redirect_stdout(io.StringIO()),
         ):
             result = command_react(client, follow=False, timeout_seconds=10)
-        drain.assert_not_called()
-        self.assertEqual(result["integrations"], [{"number": 99}])
+        drain.assert_called_once_with(client, json_output=False, emit=False)
+        self.assertEqual(result["integrations"][0]["number"], 99)
+        self.assertEqual(result["drain"]["merged"][0]["number"], 99)
 
     def test_reactor_establishes_overlap_integration_before_draining(self) -> None:
         config = parse_config(
@@ -1551,7 +1573,7 @@ class QueueCoreTest(unittest.TestCase):
         client.pipeline_control.return_value = {"state": "running"}
         events: list[str] = []
         client.create_integration_pull_request.side_effect = lambda **_kwargs: (
-            events.append("integration") or {"number": 99}
+            events.append("integration") or {"number": 99, "conflict": None}
         )
 
         def drain(*_args, **_kwargs):
@@ -1559,7 +1581,19 @@ class QueueCoreTest(unittest.TestCase):
             return {"merged": [{"number": 3, "merge_sha": "a" * 40}]}
 
         with (
-            patch("agent_merge_queue.cli.promote_integrations", return_value=[]),
+            patch(
+                "agent_merge_queue.cli.settle_integration_checks",
+                side_effect=lambda *_args, **kwargs: (
+                    []
+                    if kwargs.get("numbers") is None
+                    else events.append("settle")
+                    or [{"pull_request": 99, "state": "ready"}]
+                ),
+            ),
+            patch(
+                "agent_merge_queue.cli.promote_integrations",
+                side_effect=[[], [99]],
+            ),
             patch("agent_merge_queue.cli.command_promote", return_value={}),
             patch("agent_merge_queue.cli.freeze_queue", return_value=frozen),
             patch("agent_merge_queue.cli.command_drain", side_effect=drain),
@@ -1567,7 +1601,7 @@ class QueueCoreTest(unittest.TestCase):
         ):
             command_react(client, follow=False, timeout_seconds=10)
 
-        self.assertEqual(events, ["integration", "drain"])
+        self.assertEqual(events, ["integration", "settle", "drain", "drain"])
 
     def test_reactor_does_not_drain_when_overlap_integration_creation_fails(
         self,
@@ -1736,7 +1770,7 @@ class QueueCoreTest(unittest.TestCase):
         )
         self.assertEqual(result["release"], release)
 
-    def test_reactor_does_not_follow_idle_all_mode_integration_batch(self) -> None:
+    def test_reactor_does_not_follow_conflicted_all_mode_integration_batch(self) -> None:
         config = parse_config(
             {
                 "queue": {
@@ -1756,7 +1790,10 @@ class QueueCoreTest(unittest.TestCase):
         client.config = config
         client.coordinator_logins = {"coordinator"}
         client.pipeline_control.return_value = {"state": "running"}
-        client.create_integration_pull_request.return_value = {"number": 99}
+        client.create_integration_pull_request.return_value = {
+            "number": 99,
+            "conflict": {"number": 2, "reason": "merge conflict"},
+        }
         client.base_sha.return_value = sha
         client.workflow_runs.return_value = [
             {
@@ -1794,7 +1831,70 @@ class QueueCoreTest(unittest.TestCase):
         drain.assert_not_called()
         follow_release.assert_not_called()
         self.assertIsNone(result["release"])
-        self.assertEqual(result["integrations"], [{"number": 99}])
+        self.assertEqual(result["integrations"][0]["number"], 99)
+
+    def test_integration_ci_dispatch_is_owned_until_the_pr_is_ready(self) -> None:
+        number = 38
+        head_sha = "a" * 40
+        branch = "deploybot/integration/batch"
+        marker = {
+            "batch_id": "batch",
+            "conflict": None,
+            "heads": {"1": "1" * 40, "2": "2" * 40},
+            "pull_requests": [1, 2],
+        }
+        client = Mock()
+        client.config = CONFIG
+        client.coordinator_logins = {"coordinator"}
+        client.comments.return_value = [
+            {
+                "created_at": "2026-06-20T00:00:00Z",
+                "user": {"login": "coordinator"},
+                "body": integration_body(marker),
+            }
+        ]
+        client.pull_head.return_value = {
+            "branch": branch,
+            "head_sha": head_sha,
+            "state": "OPEN",
+        }
+        active = {
+            "id": 7,
+            "name": "CI",
+            "head_sha": head_sha,
+            "event": "workflow_dispatch",
+            "status": "in_progress",
+            "conclusion": None,
+            "created_at": "2026-06-20T00:01:00Z",
+        }
+        successful = {
+            **active,
+            "status": "completed",
+            "conclusion": "success",
+        }
+        client.workflow_runs_for_branch.side_effect = [[], [active], [successful]]
+        client.dispatch_ci_workflows.return_value = [{"id": 7, "name": "CI"}]
+        ready = entry(8, "combined.py")
+        ready.number = number
+        ready.head_sha = head_sha
+        client.snapshot.return_value = ready
+
+        with (
+            patch("agent_merge_queue.cli.time.monotonic", return_value=0),
+            patch("agent_merge_queue.cli.time.sleep"),
+        ):
+            result = settle_integration_checks(
+                client,
+                timeout_seconds=10,
+                poll_seconds=0,
+                numbers=[number],
+            )
+
+        client.dispatch_ci_workflows.assert_called_once_with(
+            ref=branch,
+            names=["CI"],
+        )
+        self.assertEqual(result[0]["state"], "ready")
 
     def test_reactor_pauses_when_post_merge_ci_dispatch_fails(self) -> None:
         client = Mock()
