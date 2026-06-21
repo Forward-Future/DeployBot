@@ -1237,6 +1237,36 @@ class QueueCoreTest(unittest.TestCase):
             "workflow", "run", "7", "--repo", "example/repo", "--ref", "main"
         )
 
+    def test_github_dispatches_deploy_with_exact_successful_ci(self) -> None:
+        client = object.__new__(GitHub)
+        client.config = CONFIG
+        client.repository = "example/repo"
+        client._json = Mock(
+            return_value=[{"id": 8, "name": "Deploy", "state": "active"}]
+        )
+        client._run = Mock(return_value="")
+        sha = "a" * 40
+
+        result = client.dispatch_deploy_workflows(ci_run={"id": 42, "head_sha": sha})
+
+        self.assertEqual(
+            result,
+            [{"id": 8, "name": "Deploy", "ci_sha": sha, "ci_run_id": 42}],
+        )
+        client._run.assert_called_once_with(
+            "workflow",
+            "run",
+            "8",
+            "--repo",
+            "example/repo",
+            "--ref",
+            "main",
+            "-f",
+            f"ci_sha={sha}",
+            "-f",
+            "ci_run_id=42",
+        )
+
     def test_pipeline_pause_blocks_every_merge_path(self) -> None:
         client = Mock()
         client.pipeline_control.return_value = {

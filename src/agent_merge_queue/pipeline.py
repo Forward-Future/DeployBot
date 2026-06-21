@@ -49,7 +49,25 @@ def release_state(
     *, main_sha: str, runs: list[dict[str, Any]], config: PipelineConfig
 ) -> dict[str, Any]:
     ci = latest_run(runs, config.ci_workflows, main_sha)
-    deploy = latest_run(runs, config.deploy_workflows, main_sha)
+    # A workflow_run deployment commonly starts for pull-request CI and then
+    # skips itself because the upstream run was not exact main. GitHub reports
+    # the downstream run against the default-branch SHA, so it can otherwise
+    # hide a real deployment (or look like a deployment failure) for that same
+    # revision. A skipped run did not attempt a release and is not evidence.
+    ci_fence = str((ci or {}).get("updated_at") or (ci or {}).get("created_at") or "")
+    deploy = latest_run(
+        [
+            run
+            for run in runs
+            if not (
+                str(run.get("status") or "") == "completed"
+                and str(run.get("conclusion") or "") == "skipped"
+            )
+            and (not ci_fence or str(run.get("created_at") or "") >= ci_fence)
+        ],
+        config.deploy_workflows,
+        main_sha,
+    )
     active_ci = [
         workflow_run(run)
         for run in runs
@@ -186,6 +204,8 @@ def follow_release(
     deadline = time.monotonic() + timeout_seconds
     observed_sha = ""
     last_verifications: list[dict[str, Any]] = []
+    dispatched_deployments: list[dict[str, Any]] = []
+    dispatched_for: set[tuple[str, int]] = set()
     while True:
         main_sha = client.base_sha()
         runs = client.workflow_runs()
@@ -194,12 +214,33 @@ def follow_release(
         )
         observed_sha = main_sha
         if value["state"] in {"ci-failed", "deploy-failed"}:
-            return {**value, "verifications": []}
+            return {
+                **value,
+                "dispatched_deployments": dispatched_deployments,
+                "verifications": [],
+            }
+        if value["state"] == "awaiting-deploy":
+            ci = value.get("latest_ci") or {}
+            ci_id = int(ci.get("id") or 0)
+            key = (main_sha, ci_id)
+            # Workflows launched with github.token do not reliably emit the
+            # workflow_run handoff that repositories usually use for deploys.
+            # Dispatch the configured deployment explicitly, carrying the
+            # exact successful CI identity into the protected workflow.
+            if ci.get("event") == "workflow_dispatch" and key not in dispatched_for:
+                dispatched_deployments.extend(
+                    client.dispatch_deploy_workflows(ci_run=ci)
+                )
+                dispatched_for.add(key)
         if value["state"] == "verified":
             checks = http_verifications(client.config.pipeline)
             last_verifications = checks
             if all(item["passed"] for item in checks):
-                return {**value, "verifications": checks}
+                return {
+                    **value,
+                    "dispatched_deployments": dispatched_deployments,
+                    "verifications": checks,
+                }
         if time.monotonic() >= deadline:
             state = (
                 "verify-failed"
@@ -209,6 +250,7 @@ def follow_release(
             return {
                 **value,
                 "state": state,
+                "dispatched_deployments": dispatched_deployments,
                 "observed_sha": observed_sha,
                 "verifications": last_verifications,
             }

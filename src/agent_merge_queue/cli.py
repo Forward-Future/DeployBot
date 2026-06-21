@@ -342,10 +342,7 @@ def effective_queue_marker(
         delegated
         and integration
         and delegated.get("integration_batch_id") == integration.get("batch_id")
-        and (
-            integration_authorized is None
-            or integration_authorized(integration)
-        )
+        and (integration_authorized is None or integration_authorized(integration))
     ):
         return delegated
     return direct
@@ -892,6 +889,65 @@ class GitHub:
             dispatched.append({"id": workflow_id, "name": name})
         return dispatched
 
+    def dispatch_deploy_workflows(
+        self, *, ci_run: dict[str, Any]
+    ) -> list[dict[str, Any]]:
+        configured = self.config.pipeline.deploy_workflows
+        if not configured:
+            raise QueueError("no deployment workflow is configured")
+        ci_sha = str(ci_run.get("head_sha") or "")
+        ci_run_id = int(ci_run.get("id") or 0)
+        if not ci_sha or not ci_run_id:
+            raise QueueError("successful CI identity is incomplete")
+        values = self._json(
+            "workflow",
+            "list",
+            "--repo",
+            self.repository,
+            "--all",
+            "--limit",
+            "1000",
+            "--json",
+            "id,name,state",
+        )
+        workflows = values if isinstance(values, list) else []
+        dispatched: list[dict[str, Any]] = []
+        for name in configured:
+            matches = [
+                value
+                for value in workflows
+                if str(value.get("name") or "") == name
+                and str(value.get("state") or "") == "active"
+            ]
+            if len(matches) != 1:
+                raise QueueError(
+                    f"configured deployment workflow {name!r} did not resolve "
+                    "to one active workflow"
+                )
+            workflow_id = int(matches[0]["id"])
+            self._run(
+                "workflow",
+                "run",
+                str(workflow_id),
+                "--repo",
+                self.repository,
+                "--ref",
+                self.config.base_branch,
+                "-f",
+                f"ci_sha={ci_sha}",
+                "-f",
+                f"ci_run_id={ci_run_id}",
+            )
+            dispatched.append(
+                {
+                    "id": workflow_id,
+                    "name": name,
+                    "ci_sha": ci_sha,
+                    "ci_run_id": ci_run_id,
+                }
+            )
+        return dispatched
+
     def recent_merged_pull_requests(self, limit: int) -> list[dict[str, Any]]:
         values = self._paged_api(
             "repos/"
@@ -1101,9 +1157,7 @@ class GitHub:
             values.extend(item for item in page if isinstance(item, dict))
         return values
 
-    def _paged_object_items(
-        self, endpoint: str, key: str
-    ) -> list[dict[str, Any]]:
+    def _paged_object_items(self, endpoint: str, key: str) -> list[dict[str, Any]]:
         data = self._json("api", "--paginate", "--slurp", endpoint)
         pages = data if isinstance(data, list) else []
         values: list[dict[str, Any]] = []
@@ -2587,11 +2641,18 @@ def command_follow(
     json_output: bool,
     emit: bool = True,
 ) -> dict[str, Any]:
-    result = follow_release(
-        client,
-        timeout_seconds=timeout_seconds,
-        poll_seconds=poll_seconds,
-    )
+    try:
+        result = follow_release(
+            client,
+            timeout_seconds=timeout_seconds,
+            poll_seconds=poll_seconds,
+        )
+    except QueueError as error:
+        if client.config.pipeline.pause_on_failure:
+            client.set_pipeline_control(
+                "paused", "release workflow dispatch failed: " + str(error)
+            )
+        raise
     if (
         result["state"] in {"ci-failed", "deploy-failed", "verify-failed"}
         and client.config.pipeline.pause_on_failure

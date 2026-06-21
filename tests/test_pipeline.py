@@ -50,6 +50,101 @@ class PipelineTest(unittest.TestCase):
             "testing",
         )
 
+    def test_release_state_ignores_skipped_deployment_wakeups(self) -> None:
+        sha = "a" * 40
+        runs = [
+            {
+                "id": 1,
+                "name": "CI",
+                "head_sha": sha,
+                "status": "completed",
+                "conclusion": "success",
+                "event": "workflow_dispatch",
+                "created_at": "2026-06-20T00:00:00Z",
+            },
+            {
+                "id": 2,
+                "name": "Deploy",
+                "head_sha": sha,
+                "status": "completed",
+                "conclusion": "skipped",
+                "created_at": "2026-06-20T00:01:00Z",
+            },
+        ]
+
+        value = release_state(main_sha=sha, runs=runs, config=CONFIG.pipeline)
+
+        self.assertEqual(value["state"], "awaiting-deploy")
+        self.assertIsNone(value["latest_deploy"])
+
+    def test_new_successful_ci_supersedes_an_older_failed_deploy(self) -> None:
+        sha = "a" * 40
+        runs = [
+            {
+                "id": 1,
+                "name": "Deploy",
+                "head_sha": sha,
+                "status": "completed",
+                "conclusion": "failure",
+                "created_at": "2026-06-20T00:01:00Z",
+            },
+            {
+                "id": 2,
+                "name": "CI",
+                "head_sha": sha,
+                "status": "completed",
+                "conclusion": "success",
+                "event": "workflow_dispatch",
+                "created_at": "2026-06-20T00:02:00Z",
+                "updated_at": "2026-06-20T00:03:00Z",
+            },
+        ]
+
+        value = release_state(main_sha=sha, runs=runs, config=CONFIG.pipeline)
+
+        self.assertEqual(value["state"], "awaiting-deploy")
+        self.assertIsNone(value["latest_deploy"])
+
+    def test_follow_dispatches_deploy_after_token_dispatched_ci(self) -> None:
+        sha = "a" * 40
+        ci = {
+            "id": 1,
+            "name": "CI",
+            "head_sha": sha,
+            "status": "completed",
+            "conclusion": "success",
+            "event": "workflow_dispatch",
+            "created_at": "2026-06-20T00:00:00Z",
+        }
+        deploy = {
+            "id": 2,
+            "name": "Deploy",
+            "head_sha": sha,
+            "status": "completed",
+            "conclusion": "success",
+            "event": "workflow_dispatch",
+            "created_at": "2026-06-20T00:01:00Z",
+        }
+        client = Mock()
+        client.config = CONFIG
+        client.base_sha.return_value = sha
+        client.workflow_runs.side_effect = [[ci], [ci, deploy]]
+        client.dispatch_deploy_workflows.return_value = [
+            {"id": 9, "name": "Deploy", "ci_sha": sha, "ci_run_id": 1}
+        ]
+        with (
+            patch("agent_merge_queue.pipeline.time.sleep"),
+            patch("agent_merge_queue.pipeline.time.monotonic", side_effect=[0, 1]),
+        ):
+            result = follow_release(client, timeout_seconds=10, poll_seconds=1)
+
+        client.dispatch_deploy_workflows.assert_called_once()
+        dispatched_ci = client.dispatch_deploy_workflows.call_args.kwargs["ci_run"]
+        self.assertEqual(dispatched_ci["id"], 1)
+        self.assertEqual(dispatched_ci["head_sha"], sha)
+        self.assertEqual(result["state"], "verified")
+        self.assertEqual(result["dispatched_deployments"][0]["id"], 9)
+
     def test_follow_switches_to_newer_cumulative_main(self) -> None:
         old = "a" * 40
         new = "b" * 40
