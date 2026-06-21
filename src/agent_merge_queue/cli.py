@@ -1554,6 +1554,32 @@ class GitHub:
         )
         return comparison.get("status") in {"ahead", "identical"}
 
+    def externally_integrated_merge(
+        self, number: int, expected_head: str
+    ) -> str | None:
+        value = self._json(
+            "pr",
+            "view",
+            str(number),
+            "--repo",
+            self.repository,
+            "--json",
+            "headRefOid,mergeCommit,state",
+        )
+        merge_sha = str((value.get("mergeCommit") or {}).get("oid") or "")
+        if (
+            value.get("state") != "MERGED"
+            or value.get("headRefOid") != expected_head
+            or not merge_sha
+        ):
+            return None
+        base_sha = self.base_sha()
+        if not self.is_ancestor(expected_head, base_sha):
+            return None
+        if not self.is_ancestor(merge_sha, base_sha):
+            return None
+        return merge_sha
+
     def merge(
         self,
         number: int,
@@ -2033,6 +2059,55 @@ def record_repair(
         {"repository": client.repository, **payload},
     )
     return payload
+
+
+def reconcile_externally_merged_threads(client: GitHub) -> list[dict[str, Any]]:
+    reconciled: list[dict[str, Any]] = []
+    records = client.thread_records()
+    if not isinstance(records, list):
+        return reconciled
+    for record in records:
+        if record.get("phase") != "deploy-requested" or not record.get(
+            "pull_request"
+        ):
+            continue
+        number = int(record["pull_request"])
+        comments = client.comments(number)
+        intent = latest_intent(comments, client.trusted_logins)
+        expected_head = str((intent or {}).get("requested_head") or "")
+        if not expected_head:
+            continue
+        try:
+            merge_sha = client.externally_integrated_merge(number, expected_head)
+        except QueueError:
+            continue
+        if not merge_sha:
+            continue
+        updated_at = utc_now()
+        client.record_thread(
+            ThreadRecord(
+                provider=str(record["provider"]),
+                thread_id=str(record["thread_id"]),
+                phase="merged",
+                updated_at=updated_at,
+                title=str(record.get("title") or "") or None,
+                branch=str(record.get("branch") or "") or None,
+                pull_request=number,
+                url=str(record.get("url") or "") or None,
+            )
+        )
+        value = {
+            "head_sha": expected_head,
+            "merge_sha": merge_sha,
+            "pull_request": number,
+        }
+        reconciled.append(value)
+        notify(
+            client.config.pipeline,
+            "externally-merged",
+            {"repository": client.repository, **value},
+        )
+    return reconciled
 
 
 def command_promote(
@@ -2852,28 +2927,43 @@ def command_merge(
             + ", ".join(f"#{value}" for value in missing_dependencies)
         )
 
-    fresh = client.snapshot(
-        number,
-        known_source_paths=entry.source_paths,
-        known_generated_paths=entry.generated_paths,
-    )
-    if fresh.state != "ready":
-        raise QueueError(
-            f"PR #{number} changed before merge: "
-            + "; ".join(fresh.reasons or ["unknown gate"])
+    externally_integrated = False
+    try:
+        fresh = client.snapshot(
+            number,
+            known_source_paths=entry.source_paths,
+            known_generated_paths=entry.generated_paths,
         )
-    if str((batch.get("heads") or {}).get(str(number)) or "") != fresh.head_sha:
-        raise QueueError(f"PR #{number} changed after batch {batch_id} was frozen")
-    if fresh.dependencies != expected_dependencies:
-        raise QueueError(f"PR #{number} dependencies changed before merge")
-    if fresh.queued_at and str(batch.get("frozen_at") or "") < fresh.queued_at:
-        raise QueueError(f"batch {batch_id} predates the current queue authorization")
+    except QueueError as error:
+        merge_sha = (
+            client.externally_integrated_merge(number, expected_head)
+            if "is not open" in str(error)
+            else None
+        )
+        if not merge_sha:
+            raise
+        fresh = entry
+        externally_integrated = True
+    if not externally_integrated:
+        if fresh.state != "ready":
+            raise QueueError(
+                f"PR #{number} changed before merge: "
+                + "; ".join(fresh.reasons or ["unknown gate"])
+            )
+        if str((batch.get("heads") or {}).get(str(number)) or "") != fresh.head_sha:
+            raise QueueError(f"PR #{number} changed after batch {batch_id} was frozen")
+        if fresh.dependencies != expected_dependencies:
+            raise QueueError(f"PR #{number} dependencies changed before merge")
+        if fresh.queued_at and str(batch.get("frozen_at") or "") < fresh.queued_at:
+            raise QueueError(
+                f"batch {batch_id} predates the current queue authorization"
+            )
 
-    merge_sha = client.merge(
-        number,
-        fresh.head_sha,
-        authorization_entry=fresh,
-    )
+        merge_sha = client.merge(
+            number,
+            fresh.head_sha,
+            authorization_entry=fresh,
+        )
     merged_comments = client.comments(number)
     intent = latest_intent(merged_comments, client.trusted_logins)
     integration = latest_payload(
@@ -2901,6 +2991,7 @@ def command_merge(
             "head_sha": fresh.head_sha,
             "merge_sha": merge_sha,
             "intent_id": (intent or {}).get("intent_id"),
+            "ownership": "external" if externally_integrated else "deploybot",
         },
     )
     if integration:
@@ -3303,6 +3394,8 @@ def command_react(
         print(json.dumps(result, indent=2, sort_keys=True))
         return result
 
+    reconciled_merges = reconcile_externally_merged_threads(client)
+
     def own_integration_checks(
         numbers: Iterable[int] | None = None,
     ) -> list[dict[str, Any]]:
@@ -3482,6 +3575,7 @@ def command_react(
         "dispatched_ci": dispatched_ci,
         "integrations": integrations,
         "integration_checks": integration_checks,
+        "reconciled_merges": reconciled_merges,
         "release": release,
     }
     print(json.dumps(result, indent=2, sort_keys=True))

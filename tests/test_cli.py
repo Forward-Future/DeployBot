@@ -44,6 +44,7 @@ from agent_merge_queue.cli import (
     queue_state_body,
     queue_from_intent,
     queue_timestamp,
+    reconcile_externally_merged_threads,
     reusable_batch,
     settle_integration_checks,
     should_settle_batch,
@@ -187,6 +188,47 @@ class QueueCoreTest(unittest.TestCase):
         self.assertEqual(holds, {1: [3]})
         client.changed_paths.assert_called_once_with(3)
 
+    def test_reconciles_an_externally_merged_requested_thread(self) -> None:
+        head_sha = "a" * 40
+        merge_sha = "m" * 40
+        client = Mock()
+        client.config = CONFIG
+        client.repository = "example/repo"
+        client.trusted_logins = {"trusted"}
+        client.thread_records.return_value = [
+            {
+                "phase": "deploy-requested",
+                "provider": "codex",
+                "pull_request": 42,
+                "thread_id": "thread-42",
+            }
+        ]
+        client.comments.return_value = [
+            {
+                "created_at": "2026-06-20T00:00:00Z",
+                "user": {"login": "trusted"},
+                "body": intent_body(
+                    intent_id="intent-42",
+                    state="requested",
+                    requested_at="2026-06-20T00:00:00Z",
+                    requested_head=head_sha,
+                    provider="codex",
+                    thread_id="thread-42",
+                ),
+            }
+        ]
+        client.externally_integrated_merge.return_value = merge_sha
+
+        result = reconcile_externally_merged_threads(client)
+
+        self.assertEqual(
+            result,
+            [{"head_sha": head_sha, "merge_sha": merge_sha, "pull_request": 42}],
+        )
+        record = client.record_thread.call_args.args[0]
+        self.assertEqual(record.phase, "merged")
+        self.assertEqual(record.pull_request, 42)
+
     def test_overlap_hold_includes_transitive_ready_members(self) -> None:
         config = parse_config(
             {
@@ -295,6 +337,57 @@ class QueueCoreTest(unittest.TestCase):
             1,
             value.head_sha,
             authorization_entry=value,
+        )
+
+    def test_frozen_merge_accepts_the_same_head_already_integrated_externally(
+        self,
+    ) -> None:
+        value = entry(1, "a.py")
+        batch = new_batch([value], frozen_at="2026-06-20T00:01:00Z")
+        client = Mock()
+        client.config = CONFIG
+        client.trusted_logins = {"trusted"}
+        client.coordinator_logins = {"coordinator"}
+        client.snapshot.side_effect = QueueError("PR #1 is not open")
+        client.externally_integrated_merge.return_value = "e" * 40
+        client.comments.return_value = []
+
+        merged = command_merge(
+            client,
+            "1",
+            str(batch["batch_id"]),
+            frozen_entry=value,
+            frozen_batch=batch,
+            active_numbers={1},
+        )
+
+        self.assertEqual(merged, "e" * 40)
+        client.externally_integrated_merge.assert_called_once_with(1, value.head_sha)
+        client.merge.assert_not_called()
+
+    def test_external_merge_must_be_exact_and_ancestral_to_main(self) -> None:
+        head_sha = "a" * 40
+        merge_sha = "m" * 40
+        base_sha = "b" * 40
+        client = object.__new__(GitHub)
+        client.repository = "example/repo"
+        client._json = Mock(
+            return_value={
+                "headRefOid": head_sha,
+                "mergeCommit": {"oid": merge_sha},
+                "state": "MERGED",
+            }
+        )
+        client.base_sha = Mock(return_value=base_sha)
+        client.is_ancestor = Mock(return_value=True)
+
+        self.assertEqual(
+            client.externally_integrated_merge(1, head_sha),
+            merge_sha,
+        )
+        self.assertEqual(
+            [call.args for call in client.is_ancestor.call_args_list],
+            [(head_sha, base_sha), (merge_sha, base_sha)],
         )
 
     def test_generated_paths_are_configurable(self) -> None:
