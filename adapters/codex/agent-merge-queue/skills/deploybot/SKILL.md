@@ -76,6 +76,21 @@ Use `deploybot doctor --json` for setup drift and `deploybot metrics --json` for
 p50, p95, and slow-stage evidence. A failed cumulative CI or deployment pauses
 the controller; only a designated coordinator may unpause after recovery.
 
+Immediately before telling the user that the pipeline is paused or asking them
+to `unpause`, run `deploybot status --json` again. Treat that fresh durable
+state as authoritative. If the controller is already running or the release
+has advanced, do not repeat a stale action request; continue coordinating or
+report the current gate.
+
+The original `deploy` instruction already authorizes a designated coordinator
+to run `deploybot unpause --sha <failed-main-sha> --control-id <control-id>`
+for the matching failed release when the elected
+repair head has fresh required checks and review, the pause reason still names
+that release, and no rollback or gate waiver is involved. Revalidate status,
+unpause, then continue the merge and release without asking for another user
+message. Ask the user only when recovery is unresolved, ownership or SHA does
+not match, or the next step requires a rollback, bypass, or expanded authority.
+
 Before opening or editing an exact-main recovery PR, run
 `deploybot claim-release-repair` with the native provider and thread ID. Work only when it
 returns `owned`, using its deterministic branch. If it returns `claimed`, the

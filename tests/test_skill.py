@@ -8,7 +8,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 CANONICAL = ROOT / "skills" / "deploybot" / "SKILL.md"
-RELEASE_COMMIT = "01c8c6e48c3a92155803cd4232b56b0c1d3363c2"
+RELEASE_COMMIT = "992048a90e1db410b9197fe056c591d91c1b2019"
 CHECKOUT_COMMIT = "9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0"
 
 
@@ -86,6 +86,45 @@ class DeployBotSkillTest(unittest.TestCase):
         self.assertIn("Never publish prompts, transcripts", skill)
         self.assertIn("Never call `freeze_queue` merely to view status", skill)
         self.assertIn("exact `deploy` instruction", skill)
+        self.assertIn("Immediately before telling the user", skill)
+        self.assertIn("do not repeat a stale action request", skill)
+        self.assertIn("original `deploy` instruction already authorizes", skill)
+
+    def test_every_adapter_revalidates_before_unpause_handoff(self) -> None:
+        paths = [
+            ROOT / "skills" / "manage-merge-queue" / "SKILL.md",
+            ROOT / "adapters" / "claude-code" / "skills" / "deploybot" / "SKILL.md",
+            ROOT
+            / "adapters"
+            / "claude-code"
+            / "skills"
+            / "manage-merge-queue"
+            / "SKILL.md",
+            ROOT
+            / "adapters"
+            / "codex"
+            / "agent-merge-queue"
+            / "skills"
+            / "deploybot"
+            / "SKILL.md",
+            ROOT
+            / "adapters"
+            / "codex"
+            / "agent-merge-queue"
+            / "skills"
+            / "manage-merge-queue"
+            / "SKILL.md",
+            ROOT / "adapters" / "cursor" / ".cursor" / "rules" / "deploybot.mdc",
+        ]
+        for path in paths:
+            text = path.read_text(encoding="utf-8")
+            with self.subTest(path=path):
+                if "adapters/codex" in path.as_posix():
+                    self.assertIn("deploybot status --json", text)
+                else:
+                    self.assertIn("pipeline_status", text)
+                self.assertIn("original", text.lower())
+                self.assertIn("unpause", text)
 
     def test_cursor_adapter_exposes_status_workflow(self) -> None:
         rule = (

@@ -11,11 +11,11 @@ integration PRs, follows `main` through production, and pauses after failures.
 
 ## Install
 
-Install the reviewed `v0.2.12` source commit directly from GitHub:
+Install the reviewed `v0.2.13` source commit directly from GitHub:
 
 ```bash
 python3 -m pip install \
-  'deploybot-merge-queue[mcp] @ git+https://github.com/Forward-Future/DeployBot.git@01c8c6e48c3a92155803cd4232b56b0c1d3363c2'
+  'deploybot-merge-queue[mcp] @ git+https://github.com/Forward-Future/DeployBot.git@992048a90e1db410b9197fe056c591d91c1b2019'
 deploybot init
 ```
 
@@ -95,7 +95,7 @@ worker can dispatch deployment when GitHub suppresses the `workflow_run` event
 for token-dispatched CI. Pin the Action to the full reviewed release commit:
 
 ```yaml
-- uses: Forward-Future/DeployBot@01c8c6e48c3a92155803cd4232b56b0c1d3363c2
+- uses: Forward-Future/DeployBot@992048a90e1db410b9197fe056c591d91c1b2019
 ```
 
 The Action uses GitHub's built-in workflow token. GitHub intentionally does not
@@ -190,6 +190,14 @@ deploybot resume <pr-number>
 and emits a new wake-up event. `follow` tracks newer cumulative `main` revisions
 until exact CI, deployment, and optional HTTP checks pass. A CI or deploy failure
 can pause further merges until `deploybot unpause`.
+Before presenting an unpause request, adapters must refresh `deploybot status
+--json` and suppress stale prompts when the durable controller is already
+running or the release advanced. The original deploy instruction authorizes the
+coordinator to unpause the matching failed release after its elected repair
+head passes fresh checks and review. Pass that status result's failed main SHA
+and unique `control_id` to `deploybot unpause --sha SHA --control-id ID` so a
+concurrent newer pause remains authoritative. Rollback,
+bypass, and mismatched recovery still require explicit user direction.
 
 Before starting an exact-main recovery, an agent runs
 `deploybot claim-release-repair --provider CLIENT --thread-id ID`. A
@@ -323,7 +331,7 @@ deploybot integrate [--all]
 deploybot follow [--timeout SECONDS] [--poll SECONDS] [--json]
 deploybot metrics --json
 deploybot pause --reason "main CI failed"
-deploybot unpause
+deploybot unpause --sha FAILED_MAIN_SHA --control-id PAUSE_CONTROL_ID
 deploybot block [PR] --reason "..."
 deploybot unblock [PR]
 deploybot resume [PR]

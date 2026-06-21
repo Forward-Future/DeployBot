@@ -120,6 +120,63 @@ def latest_payload(
     return max(found, key=lambda item: item[0])[1] if found else None
 
 
+def latest_control(
+    comments: Iterable[dict[str, Any]], trusted_logins: Iterable[str]
+) -> dict[str, Any]:
+    """Resolve pause/resume records without letting a stale resume clear a new pause."""
+    trusted = {value.lower() for value in trusted_logins}
+    found: list[tuple[tuple[str, int, int], dict[str, Any]]] = []
+    for index, comment in enumerate(comments):
+        if comment_login(comment) not in trusted:
+            continue
+        value = _payload(str(comment.get("body") or ""), CONTROL_MARKER)
+        if value is not None:
+            if value.get("state") == "paused" and not value.get("control_id"):
+                comment_id = comment.get("id")
+                legacy_id = (
+                    f"legacy-comment:{comment_id}"
+                    if comment_id is not None
+                    else f"legacy-record:{_comment_key(comment, index)}"
+                )
+                value = {
+                    **value,
+                    "control_id": legacy_id,
+                    "legacy_control": True,
+                }
+            found.append((_comment_key(comment, index), value))
+
+    state: dict[str, Any] = {"state": "running"}
+    for _, value in sorted(found, key=lambda item: item[0]):
+        if value.get("state") == "paused":
+            requires_control_id = str(value.get("requires_control_id") or "")
+            if requires_control_id and not (
+                state.get("state") == "running"
+                and state.get("control_id") == requires_control_id
+            ):
+                continue
+            state = value
+            continue
+        if value.get("state") != "running":
+            continue
+        resumed_control_id = str(value.get("resumes_control_id") or "")
+        if not resumed_control_id:
+            # Backward-compatible unconditional running records from v0.2.12.
+            # They may clear only legacy pauses; a rolling-upgrade client must
+            # never override a modern pause that requires a matching token.
+            if not (
+                state.get("state") == "paused"
+                and state.get("control_id")
+                and not state.get("legacy_control")
+            ):
+                state = value
+        elif (
+            state.get("state") == "paused"
+            and state.get("control_id") == resumed_control_id
+        ):
+            state = value
+    return state
+
+
 @dataclass(frozen=True)
 class ThreadRecord:
     provider: str
@@ -474,12 +531,31 @@ def latest_release_repair(
     return max(found, key=lambda item: item[0])[1] if found else None
 
 
-def control_body(*, state: str, reason: str | None = None) -> str:
+def control_body(
+    *,
+    state: str,
+    control_id: str,
+    reason: str | None = None,
+    main_sha: str | None = None,
+    requires_control_id: str | None = None,
+    resumes_control_id: str | None = None,
+) -> str:
     if state not in {"running", "paused"}:
         raise ValueError(f"unsupported pipeline control state: {state}")
-    payload = {"recorded_at": utc_now(), "schema": 1, "state": state}
+    payload = {
+        "control_id": control_id,
+        "recorded_at": utc_now(),
+        "schema": 1,
+        "state": state,
+    }
     if reason:
         payload["reason"] = reason
+    if main_sha:
+        payload["main_sha"] = main_sha
+    if requires_control_id:
+        payload["requires_control_id"] = requires_control_id
+    if resumes_control_id:
+        payload["resumes_control_id"] = resumes_control_id
     return marker_body(CONTROL_PREFIX, payload, "Recorded DeployBot pipeline control.")
 
 

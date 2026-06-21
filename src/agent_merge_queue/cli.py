@@ -8,6 +8,7 @@ import fnmatch
 import hashlib
 import json
 import re
+import secrets
 import shutil
 import subprocess
 import sys
@@ -31,7 +32,6 @@ from .pipeline import (
     summarize_metrics,
 )
 from .records import (
-    CONTROL_MARKER,
     INTEGRATION_MARKER,
     REPAIR_MARKER,
     RELEASE_WATERMARK_MARKER,
@@ -43,6 +43,7 @@ from .records import (
     integration_body,
     intent_body,
     latest_intent,
+    latest_control,
     latest_release_repair,
     latest_deployment_notifications,
     latest_payload,
@@ -1393,18 +1394,43 @@ class GitHub:
         ]
 
     def pipeline_control(self) -> dict[str, Any]:
-        value = latest_payload(
-            self.registry_comments(),
-            CONTROL_MARKER,
-            self.coordinator_logins,
-        )
-        return value or {"state": "running"}
+        control = latest_control(self.registry_comments(), self.coordinator_logins)
+        if (
+            control.get("state") == "paused"
+            and control.get("legacy_control")
+            and not control.get("main_sha")
+        ):
+            # v0.2.12 pause records predate release binding. The immutable
+            # comment ID still supplies a unique compare-and-set token; bind
+            # the migration view to the current main and recheck it at write.
+            return {**control, "main_sha": self.base_sha()}
+        return control
 
-    def set_pipeline_control(self, state: str, reason: str | None = None) -> None:
+    def set_pipeline_control(
+        self,
+        state: str,
+        reason: str | None = None,
+        *,
+        main_sha: str | None = None,
+        requires_control_id: str | None = None,
+        resumes_control_id: str | None = None,
+    ) -> str:
         number = self.registry_issue_number(create=True)
         if number is None:  # pragma: no cover
             raise QueueError("could not create DeployBot registry")
-        self.issue_comment(number, control_body(state=state, reason=reason))
+        control_id = secrets.token_hex(16)
+        self.issue_comment(
+            number,
+            control_body(
+                state=state,
+                control_id=control_id,
+                reason=reason,
+                main_sha=(main_sha or self.base_sha()) if state == "paused" else None,
+                requires_control_id=requires_control_id,
+                resumes_control_id=resumes_control_id,
+            ),
+        )
+        return control_id
 
     def verified_main_sha(self) -> str | None:
         value = latest_payload(
@@ -4441,6 +4467,7 @@ def command_follow(
         client.set_pipeline_control(
             "paused",
             f"{result['state']} on {result['main_sha']}",
+            main_sha=str(result["main_sha"]),
         )
     if result["state"] == "verified":
         client.record_verified_main(str(result["main_sha"]))
@@ -5080,6 +5107,57 @@ def command_control(client: GitHub, *, state: str, reason: str | None) -> None:
     print(f"DeployBot pipeline is {state}")
 
 
+def command_unpause(
+    client: GitHub,
+    *,
+    main_sha: str,
+    control_id: str,
+) -> None:
+    control = client.pipeline_control()
+    if control.get("state") != "paused":
+        raise QueueError("DeployBot pipeline is no longer paused; refresh status")
+    if str(control.get("control_id") or "") != control_id:
+        raise QueueError("DeployBot pause record changed; refresh status")
+    if str(control.get("main_sha") or "") != main_sha:
+        raise QueueError("DeployBot pause belongs to a different main; refresh status")
+    current_sha = client.base_sha()
+    if current_sha != main_sha:
+        raise QueueError(
+            f"DeployBot main advanced from {main_sha} to {current_sha}; refresh status"
+        )
+    resume_control_id = client.set_pipeline_control(
+        "running", None, resumes_control_id=control_id
+    )
+    refreshed = client.pipeline_control()
+    if refreshed.get("state") != "running" or (
+        refreshed.get("resumes_control_id") != control_id
+    ) or refreshed.get("control_id") != resume_control_id:
+        raise QueueError("DeployBot pause changed during unpause; refresh status")
+    refreshed_main = client.base_sha()
+    if refreshed_main != main_sha:
+        latest_control = client.pipeline_control()
+        if latest_control.get("state") == "running" and (
+            latest_control.get("resumes_control_id") == control_id
+        ):
+            client.set_pipeline_control(
+                "paused",
+                f"main advanced during unpause from {main_sha} to {refreshed_main}",
+                main_sha=refreshed_main,
+                requires_control_id=resume_control_id,
+            )
+        raise QueueError(
+            f"DeployBot main advanced from {main_sha} to {refreshed_main} "
+            "during unpause; pipeline remains paused"
+        )
+    # This is the compare-and-set boundary. A main advance after this final
+    # read occurs after the matching pause was successfully resumed and may be
+    # the expected repair merge. The release-admission fence then blocks every
+    # later batch until that newer exact main passes CI, deploy, and health
+    # verification; binding `running` to the failed SHA forever would instead
+    # re-pause the repair merge and strand takeover workers.
+    print(f"DeployBot pipeline is running for recovered main {main_sha}")
+
+
 def command_claim_release_repair(
     client: GitHub,
     *,
@@ -5261,7 +5339,11 @@ def build_parser() -> argparse.ArgumentParser:
         "pause", help="pause merging after a delivery failure"
     )
     pause.add_argument("--reason", required=True)
-    subparsers.add_parser("unpause", help="resume a paused delivery pipeline")
+    unpause = subparsers.add_parser(
+        "unpause", help="resume the exact revalidated failed release"
+    )
+    unpause.add_argument("--sha", required=True, dest="main_sha")
+    unpause.add_argument("--control-id", required=True)
     claim_repair = subparsers.add_parser(
         "claim-release-repair",
         help="atomically claim ownership of the current failed release",
@@ -5387,7 +5469,11 @@ def main(argv: list[str] | None = None) -> int:
         elif arguments.command == "pause":
             command_control(client, state="paused", reason=arguments.reason)
         elif arguments.command == "unpause":
-            command_control(client, state="running", reason=None)
+            command_unpause(
+                client,
+                main_sha=arguments.main_sha,
+                control_id=arguments.control_id,
+            )
         elif arguments.command == "claim-release-repair":
             command_claim_release_repair(
                 client,

@@ -15,6 +15,14 @@ the stable Cursor thread ID, never prompts or transcripts. Refresh intent only
 after replacement-head review. Only the coordinator may react, integrate,
 drain, follow, pause, or resume repaired work.
 
+Immediately before asking the user to unpause or take repair action, call
+`pipeline_status` again and suppress the request if durable state is already
+running or the release advanced. The original deploy instruction authorizes the
+coordinator to unpause the matching failed release after its elected repair head
+passes fresh checks and review, unless recovery requires a rollback, gate
+waiver, or different authority. Use the exact failed main SHA and the refreshed
+unique `control_id` so a newer pause remains authoritative.
+
 After exact-main verification, deliver each returned `thread_notifications`
 message into its native source thread, then call
 `acknowledge_thread_deployment` with the matching `notification_id`. Leave a
