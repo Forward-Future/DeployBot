@@ -11,11 +11,11 @@ integration PRs, follows `main` through production, and pauses after failures.
 
 ## Install
 
-Install the reviewed `v0.2.10` source commit directly from GitHub:
+Install the reviewed `v0.2.11` source commit directly from GitHub:
 
 ```bash
 python3 -m pip install \
-  'deploybot-merge-queue[mcp] @ git+https://github.com/Forward-Future/DeployBot.git@78208849bb743d649a6e3e5e1c452b9d21ec7e2b'
+  'deploybot-merge-queue[mcp] @ git+https://github.com/Forward-Future/DeployBot.git@bf1ccadb3a4110dd29b70efe4f621f822110bfcc'
 deploybot init
 ```
 
@@ -95,7 +95,7 @@ worker can dispatch deployment when GitHub suppresses the `workflow_run` event
 for token-dispatched CI. Pin the Action to the full reviewed release commit:
 
 ```yaml
-- uses: Forward-Future/DeployBot@78208849bb743d649a6e3e5e1c452b9d21ec7e2b
+- uses: Forward-Future/DeployBot@bf1ccadb3a4110dd29b70efe4f621f822110bfcc
 ```
 
 The Action uses GitHub's built-in workflow token. GitHub intentionally does not
@@ -263,12 +263,15 @@ commit SHA so an older score can never authorize a replacement head.
 
 ## Clients
 
-- Codex: install the plugin under `adapters/codex/agent-merge-queue`.
+- Codex: install the CLI and the CLI-only plugin under
+  `adapters/codex/agent-merge-queue`. The Codex adapter intentionally does not
+  start an MCP subprocess.
 - Claude Code: install the plugin under `adapters/claude-code`.
 - Cursor: copy the files under `adapters/cursor` or use its MCP configuration.
 - Other clients: connect `deploybot-mcp` over stdio or call the CLI directly.
 
-The bundled MCP configurations launch the pinned public release with `uvx`.
+The Claude Code and Cursor MCP configurations launch the pinned public release
+with `uvx`.
 The `mergeq` and `mergeq-mcp` command aliases remain for compatibility.
 
 ## Command overview

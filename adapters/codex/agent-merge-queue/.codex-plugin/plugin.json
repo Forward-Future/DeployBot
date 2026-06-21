@@ -1,6 +1,6 @@
 {
   "name": "deploybot",
-  "version": "0.2.10",
+  "version": "0.2.11",
   "description": "Coordinate exact-head pull requests through verified deployment and thread notification",
   "author": {
     "name": "DeployBot contributors"
@@ -20,6 +20,5 @@
       "Deploy this PR through the agent merge queue.",
       "Show me what is blocking the merge queue."
     ]
-  },
-  "mcpServers": "./.mcp.json"
+  }
 }
