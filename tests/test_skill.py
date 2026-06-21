@@ -150,6 +150,22 @@ class DeployBotSkillTest(unittest.TestCase):
         self.assertIn('cron: "*/5 * * * *"', workflow)
         self.assertIn("workflows: [CI]", workflow)
         self.assertIn("github.event.repository.default_branch", workflow)
+        self.assertNotIn("branches: [main]", workflow)
+        self.assertIn("fromJSON(", workflow)
+        self.assertIn("github.event.workflow_run.conclusion", workflow)
+        self.assertIn('"success"', workflow)
+        self.assertIn('"stale"', workflow)
+        self.assertIn('"startup_failure"', workflow)
+        self.assertIn('"timed_out"', workflow)
+        self.assertIn("github.event.workflow_run.event != 'pull_request'", workflow)
+        self.assertIn(
+            "github.event.workflow_run.event != 'pull_request_target'", workflow
+        )
+        self.assertIn("github.event.workflow_run.head_repository.full_name", workflow)
+        self.assertIn("github.event.workflow_run.head_branch", workflow)
+        self.assertIn("protected release", workflow)
+        condition = workflow.split("    if: >-\n", 1)[1].split("    runs-on:", 1)[0]
+        self.assertNotIn("#", condition)
         self.assertIn(
             "github.event.pull_request.head.repo.full_name == github.repository",
             workflow,

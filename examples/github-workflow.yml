@@ -30,6 +30,8 @@ concurrency:
 
 jobs:
   react:
+    # If CI intentionally hands off from a protected release branch, replace
+    # the default-branch guard below with that exact branch name.
     if: >-
       (
         github.event_name != 'pull_request_target' ||
@@ -43,6 +45,22 @@ jobs:
         (
           github.event.action != 'labeled' &&
           github.event.pull_request.head.repo.full_name == github.repository
+        )
+      ) &&
+      (
+        github.event_name != 'workflow_run' ||
+        (
+          contains(
+            fromJSON(
+              '["action_required","cancelled","failure","neutral","skipped","stale","startup_failure","success","timed_out"]'
+            ),
+            github.event.workflow_run.conclusion
+          ) &&
+          github.event.workflow_run.event != 'pull_request' &&
+          github.event.workflow_run.event != 'pull_request_target' &&
+          github.event.workflow_run.head_repository.full_name == github.repository &&
+          github.event.workflow_run.head_branch ==
+            github.event.repository.default_branch
         )
       ) &&
       (
