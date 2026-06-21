@@ -215,6 +215,8 @@ def follow_release(
     last_verifications: list[dict[str, Any]] = []
     dispatched_deployments: list[dict[str, Any]] = []
     dispatched_for: set[tuple[str, int]] = set()
+    failed_ci_key: tuple[str, int] | None = None
+    failed_ci_deadline = 0.0
     while True:
         main_sha = client.base_sha()
         runs = client.workflow_runs()
@@ -222,7 +224,26 @@ def follow_release(
             main_sha=main_sha, runs=runs, config=client.config.pipeline
         )
         observed_sha = main_sha
-        if value["state"] in {"ci-failed", "deploy-failed"}:
+        clock: float | None = None
+        if value["state"] == "ci-failed":
+            ci = value.get("latest_ci") or {}
+            key = (main_sha, int(ci.get("id") or 0))
+            clock = time.monotonic()
+            if key != failed_ci_key:
+                failed_ci_key = key
+                failed_ci_deadline = (
+                    clock + client.config.pipeline.ci_failure_grace_seconds
+                )
+            if (
+                not client.config.pipeline.ci_failure_grace_seconds
+                or clock >= failed_ci_deadline
+            ):
+                return {
+                    **value,
+                    "dispatched_deployments": dispatched_deployments,
+                    "verifications": [],
+                }
+        elif value["state"] == "deploy-failed":
             return {
                 **value,
                 "dispatched_deployments": dispatched_deployments,
@@ -250,7 +271,7 @@ def follow_release(
                     "dispatched_deployments": dispatched_deployments,
                     "verifications": checks,
                 }
-        if time.monotonic() >= deadline:
+        if (clock if clock is not None else time.monotonic()) >= deadline:
             state = (
                 "verify-failed"
                 if value["state"] == "verified" and last_verifications

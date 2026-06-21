@@ -12,10 +12,12 @@ import shutil
 import subprocess
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable
+from urllib.parse import quote
 
 from . import __version__
 from .config import ConfigError, QueueConfig, initialize_config, load_config
@@ -137,8 +139,11 @@ def check_states(checks: Iterable[dict[str, Any]]) -> dict[str, str]:
             continue
         timestamp = str(
             check.get("startedAt")
+            or check.get("started_at")
             or check.get("createdAt")
+            or check.get("created_at")
             or check.get("completedAt")
+            or check.get("completed_at")
             or ""
         )
         if timestamp.startswith("0001-01-01"):
@@ -282,11 +287,17 @@ def marker_queued_at(marker: dict[str, Any] | None) -> str | None:
     return str(value) if value else None
 
 
+def marker_priority_at(marker: dict[str, Any] | None) -> str | None:
+    value = marker.get("priority_at") if marker else None
+    return str(value) if value else None
+
+
 def queue_state_body(
     state: str,
     head_sha: str,
     *,
     queued_at: str | None,
+    priority_at: str | None = None,
     reason: str | None = None,
     intent_id: str | None = None,
     integration_batch_id: str | None = None,
@@ -301,6 +312,8 @@ def queue_state_body(
     }
     if queued_at:
         marker["queued_at"] = queued_at
+    if priority_at:
+        marker["priority_at"] = priority_at
     if reason:
         marker["reason"] = reason
     if intent_id:
@@ -591,6 +604,8 @@ class QueueEntry:
     dependencies: list[int]
     state: str = "waiting"
     reasons: list[str] | None = None
+    priority_at: str | None = None
+    integration_batch_id: str | None = None
 
     def classify(
         self,
@@ -668,6 +683,7 @@ class GitHub:
         if self.repository.count("/") != 1:
             raise QueueError(f"invalid repository name: {self.repository}")
         self.owner, self.name = self.repository.split("/", 1)
+        self._registry_issue_cache: int | None = None
         self.trusted_logins = {
             self.owner if value == "@repository-owner" else value
             for value in self.config.trusted_actors
@@ -708,8 +724,8 @@ class GitHub:
         arguments.extend(["--repo", self.repository, "--json", "number"])
         return int(self._json(*arguments)["number"])
 
-    def ensure_labels(self) -> None:
-        labels = (
+    def label_specs(self) -> tuple[tuple[str, str, str], ...]:
+        return (
             (
                 self.config.queue_label,
                 "0E8A16",
@@ -736,7 +752,40 @@ class GitHub:
                 "DeployBot metadata registry (never transcript contents)",
             ),
         )
-        for name, color, description in labels:
+
+    def ensure_labels(self) -> None:
+        for name, color, description in self.label_specs():
+            self._run(
+                "label",
+                "create",
+                name,
+                "--repo",
+                self.repository,
+                "--color",
+                color,
+                "--description",
+                description,
+                "--force",
+            )
+
+    def ensure_labels_exist(self) -> None:
+        values = self._json(
+            "label",
+            "list",
+            "--repo",
+            self.repository,
+            "--limit",
+            "1000",
+            "--json",
+            "name",
+        )
+        existing = {str(value.get("name") or "") for value in values}
+        for name, color, description in self.label_specs():
+            if name in existing:
+                continue
+            # The pre-read preserves existing label metadata in the normal
+            # path; --force makes the remaining list/create race idempotent if
+            # another first-use worker creates this label concurrently.
             self._run(
                 "label",
                 "create",
@@ -768,6 +817,16 @@ class GitHub:
             )
         ]
 
+    def integration_pull_request_numbers(self) -> list[int]:
+        prefix = self.config.integration.branch_prefix.rstrip("/") + "/"
+        return [
+            int(value["number"])
+            for value in self._paged_api(
+                f"repos/{self.repository}/pulls?state=open&per_page=100"
+            )
+            if str((value.get("head") or {}).get("ref") or "").startswith(prefix)
+        ]
+
     def intent_numbers(self) -> list[int]:
         values = self._paged_api(
             f"repos/{self.repository}/pulls?state=open&per_page=100"
@@ -781,7 +840,7 @@ class GitHub:
 
     def active_integration_sources(self) -> set[int]:
         sources: set[int] = set()
-        for number in self.open_pull_request_numbers():
+        for number in self.integration_pull_request_numbers():
             marker = latest_payload(
                 self.comments(number),
                 INTEGRATION_MARKER,
@@ -804,6 +863,34 @@ class GitHub:
             f"repos/{self.repository}/actions/runs?branch={self.config.base_branch}&per_page=100",
             "workflow_runs",
         )
+
+    def workflow_runs_for_branch(self, branch: str) -> list[dict[str, Any]]:
+        return self._paged_object_items(
+            f"repos/{self.repository}/actions/runs?branch={quote(branch, safe='')}&per_page=100",
+            "workflow_runs",
+        )
+
+    def commit_check_runs(self, head_sha: str) -> list[dict[str, Any]]:
+        return self._paged_object_items(
+            f"repos/{self.repository}/commits/{head_sha}/check-runs?per_page=100",
+            "check_runs",
+        )
+
+    def pull_head(self, number: int) -> dict[str, str]:
+        value = self._json(
+            "pr",
+            "view",
+            str(number),
+            "--repo",
+            self.repository,
+            "--json",
+            "headRefName,headRefOid,state",
+        )
+        return {
+            "branch": str(value.get("headRefName") or ""),
+            "head_sha": str(value.get("headRefOid") or ""),
+            "state": str(value.get("state") or ""),
+        }
 
     def source_deploy_authorized(self, number: int, expected_head: str) -> bool:
         source = self._json(
@@ -848,8 +935,13 @@ class GitHub:
                 return False
         return True
 
-    def dispatch_ci_workflows(self) -> list[dict[str, Any]]:
-        configured = self.config.pipeline.ci_workflows
+    def dispatch_ci_workflows(
+        self,
+        *,
+        ref: str | None = None,
+        names: Iterable[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        configured = tuple(names or self.config.pipeline.ci_workflows)
         if not configured:
             raise QueueError("no CI workflow is configured for post-merge dispatch")
         values = self._json(
@@ -884,7 +976,7 @@ class GitHub:
                 "--repo",
                 self.repository,
                 "--ref",
-                self.config.base_branch,
+                ref or self.config.base_branch,
             )
             dispatched.append({"id": workflow_id, "name": name})
         return dispatched
@@ -962,6 +1054,9 @@ class GitHub:
         return comparison.get("status") in {"ahead", "identical"}
 
     def registry_issue_number(self, *, create: bool) -> int | None:
+        cached = getattr(self, "_registry_issue_cache", None)
+        if cached is not None:
+            return cached
         values = self._paged_api(
             f"repos/{self.repository}/issues?state=all&labels={self.config.pipeline.registry_label}&per_page=100"
         )
@@ -971,13 +1066,17 @@ class GitHub:
             if "pull_request" not in value
             and str(value.get("title") or "") == self.config.pipeline.registry_title
         ]
-        if len(matches) > 1:
-            raise QueueError("more than one DeployBot registry issue exists")
         if matches:
-            return int(matches[0]["number"])
+            # GitHub Issues has no uniqueness constraint. Concurrent first-use
+            # workers can both create a registry after observing none. The
+            # lowest issue number is deterministic and comments remain trusted
+            # by authenticated author, so all workers safely converge there.
+            canonical = min(int(value["number"]) for value in matches)
+            self._registry_issue_cache = canonical
+            return canonical
         if not create:
             return None
-        self.ensure_labels()
+        self.ensure_labels_exist()
         created = self._json(
             "api",
             "--method",
@@ -990,7 +1089,11 @@ class GitHub:
             "-f",
             f"labels[]={self.config.pipeline.registry_label}",
         )
-        return int(created["number"])
+        # Re-read after creation so a concurrent lower-numbered creator wins
+        # before this worker writes any metadata to its candidate issue.
+        canonical = self.registry_issue_number(create=False) or int(created["number"])
+        self._registry_issue_cache = canonical
+        return canonical
 
     def issue_comment(self, number: int, body: str) -> None:
         self._json(
@@ -1101,22 +1204,37 @@ class GitHub:
                 "If a merge conflict remains, an agent must resolve it without "
                 "dropping either side before marking this PR ready."
             )
-            pull = self._json(
-                "api",
-                "--method",
-                "POST",
-                f"repos/{self.repository}/pulls",
-                "-f",
-                f"title={self.config.integration.title_prefix}: {safe_id}",
-                "-f",
-                f"head={branch}",
-                "-f",
-                f"base={self.config.base_branch}",
-                "-f",
-                f"body={body}",
-                "-F",
-                f"draft={'true' if conflict else 'false'}",
-            )
+            try:
+                pull = self._json(
+                    "api",
+                    "--method",
+                    "POST",
+                    f"repos/{self.repository}/pulls",
+                    "-f",
+                    f"title={self.config.integration.title_prefix}: {safe_id}",
+                    "-f",
+                    f"head={branch}",
+                    "-f",
+                    f"base={self.config.base_branch}",
+                    "-f",
+                    f"body={body}",
+                    "-F",
+                    f"draft={'true' if conflict else 'false'}",
+                )
+            except QueueError:
+                # No durable integration marker can exist without its PR. The
+                # batch remains frozen for retry, so remove the private branch
+                # instead of leaving an orphan that can mask a clean replay.
+                try:
+                    self._run(
+                        "api",
+                        "--method",
+                        "DELETE",
+                        f"repos/{self.repository}/git/refs/heads/{branch}",
+                    )
+                except QueueError:
+                    pass
+                raise
         number = int(pull["number"])
         marker = {
             "base_sha": base_sha,
@@ -1183,6 +1301,31 @@ class GitHub:
             f"repos/{self.repository}/pulls/{number}/files?per_page=100"
         )
 
+    def changed_paths(self, number: int) -> tuple[list[str], list[str]]:
+        source_paths: list[str] = []
+        generated_paths: list[str] = []
+        for value in self.files(number):
+            path = str(value.get("filename") or "")
+            if not path:
+                continue
+            if path in self.config.generated_paths:
+                generated_paths.append(path)
+                source_paths.append(path)
+                continue
+            target = (
+                generated_paths
+                if generated_only_change(
+                    path,
+                    value.get("patch"),
+                    generated_paths=self.config.generated_paths,
+                    generated_version_paths=self.config.generated_version_paths,
+                    asset_version_pattern=self.config.asset_version_pattern,
+                )
+                else source_paths
+            )
+            target.append(path)
+        return source_paths, generated_paths
+
     def review_threads(self, number: int) -> list[dict[str, Any]]:
         data = self._json(
             "api",
@@ -1215,6 +1358,11 @@ class GitHub:
         *,
         require_marker: bool = True,
         allow_blocked_label: bool = False,
+        known_comments: list[dict[str, Any]] | None = None,
+        known_checks: dict[str, str] | None = None,
+        known_source_paths: list[str] | None = None,
+        known_generated_paths: list[str] | None = None,
+        defer_paths_until_ready: bool = False,
     ) -> QueueEntry:
         fields = ",".join(
             (
@@ -1244,8 +1392,10 @@ class GitHub:
         if pull.get("state") != "OPEN":
             raise QueueError(f"PR #{number} is not open")
 
-        comments = self.comments(number)
-        reviews = self.reviews(number)
+        comments = (
+            known_comments if known_comments is not None else self.comments(number)
+        )
+        reviews = self.reviews(number) if self.config.review_providers else []
         needs_threads = any(
             provider.kind == "bot" and provider.require_resolved_threads
             for provider in self.config.review_providers
@@ -1253,30 +1403,26 @@ class GitHub:
         threads = self.review_threads(number) if needs_threads else []
         marker = queue_marker_for_client(self, comments)
         head_sha = str(pull["headRefOid"])
-        checks = check_states(pull.get("statusCheckRollup") or [])
-        changed_files = self.files(number)
-        source_paths: list[str] = []
-        generated_paths: list[str] = []
-        for value in changed_files:
-            path = str(value.get("filename") or "")
-            if not path:
-                continue
-            if path in self.config.generated_paths:
-                generated_paths.append(path)
-                source_paths.append(path)
-                continue
-            target = (
-                generated_paths
-                if generated_only_change(
-                    path,
-                    value.get("patch"),
-                    generated_paths=self.config.generated_paths,
-                    generated_version_paths=self.config.generated_version_paths,
-                    asset_version_pattern=self.config.asset_version_pattern,
-                )
-                else source_paths
-            )
-            target.append(path)
+        check_rollup = list(pull.get("statusCheckRollup") or [])
+        checks = check_states(check_rollup)
+        checks.update(known_checks or {})
+        integration = latest_payload(
+            comments,
+            INTEGRATION_MARKER,
+            coordinator_logins(self),
+        )
+        if integration and any(
+            checks.get(name) != "passed" for name in self.config.required_checks
+        ):
+            checks = check_states(check_rollup + self.commit_check_runs(head_sha))
+            checks.update(known_checks or {})
+        source_paths = list(known_source_paths or [])
+        generated_paths = list(known_generated_paths or [])
+        paths_are_known = (
+            known_source_paths is not None and known_generated_paths is not None
+        )
+        if not paths_are_known and not defer_paths_until_ready:
+            source_paths, generated_paths = self.changed_paths(number)
 
         body = str(pull.get("body") or "")
         entry = QueueEntry(
@@ -1306,12 +1452,20 @@ class GitHub:
             dependencies=structured_dependencies(
                 body, self.config.dependency_directive
             ),
+            priority_at=marker_priority_at(marker),
+            integration_batch_id=(
+                str(marker.get("integration_batch_id") or "") or None
+                if marker
+                else None
+            ),
         )
         entry.classify(
             self.config,
             require_marker=require_marker,
             allow_blocked_label=allow_blocked_label,
         )
+        if not paths_are_known and defer_paths_until_ready and entry.state == "ready":
+            entry.source_paths, entry.generated_paths = self.changed_paths(number)
         return entry
 
     def queued_numbers(self) -> list[int]:
@@ -1329,7 +1483,12 @@ class GitHub:
         entries = [self.snapshot(number) for number in self.queued_numbers()]
         return sorted(
             entries,
-            key=lambda entry: (entry.queued_at or "9999", entry.number),
+            key=lambda entry: (
+                entry.priority_at or entry.queued_at or "9999",
+                entry.number if entry.priority_at else 0,
+                entry.queued_at or "9999",
+                entry.number,
+            ),
         )
 
     def add_label(self, number: int, label: str) -> None:
@@ -1400,35 +1559,82 @@ class GitHub:
         )
         return comparison.get("status") in {"ahead", "identical"}
 
-    def merge(self, number: int, head_sha: str) -> str:
-        authorization = self._json(
+    def externally_integrated_merge(
+        self, number: int, expected_head: str
+    ) -> str | None:
+        value = self._json(
             "pr",
             "view",
             str(number),
             "--repo",
             self.repository,
             "--json",
-            "headRefOid,isDraft,labels,state",
+            "headRefOid,mergeCommit,state",
         )
-        labels = {
-            str(label.get("name") or "") for label in authorization.get("labels") or []
-        }
-        if authorization.get("state") != "OPEN":
-            raise QueueError(f"PR #{number} is no longer open")
-        if authorization.get("isDraft"):
-            raise QueueError(f"PR #{number} returned to draft before merge")
-        if authorization.get("headRefOid") != head_sha:
-            raise QueueError(f"PR #{number} changed immediately before merge")
+        merge_sha = str((value.get("mergeCommit") or {}).get("oid") or "")
+        if (
+            value.get("state") != "MERGED"
+            or value.get("headRefOid") != expected_head
+            or not merge_sha
+        ):
+            return None
+        base_sha = self.base_sha()
+        if not self.is_ancestor(expected_head, base_sha):
+            return None
+        if not self.is_ancestor(merge_sha, base_sha):
+            return None
+        return merge_sha
+
+    def merge(
+        self,
+        number: int,
+        head_sha: str,
+        *,
+        authorization_entry: QueueEntry | None = None,
+    ) -> str:
+        if authorization_entry is None:
+            authorization = self._json(
+                "pr",
+                "view",
+                str(number),
+                "--repo",
+                self.repository,
+                "--json",
+                "headRefOid,isDraft,labels,state",
+            )
+            labels = {
+                str(label.get("name") or "")
+                for label in authorization.get("labels") or []
+            }
+            if authorization.get("state") != "OPEN":
+                raise QueueError(f"PR #{number} is no longer open")
+            if authorization.get("isDraft"):
+                raise QueueError(f"PR #{number} returned to draft before merge")
+            if authorization.get("headRefOid") != head_sha:
+                raise QueueError(f"PR #{number} changed immediately before merge")
+            marker = queue_marker_for_client(self, self.comments(number))
+            integration_batch_id = (
+                str(marker.get("integration_batch_id") or "") if marker else ""
+            )
+        else:
+            labels = set(authorization_entry.labels)
+            if authorization_entry.is_draft:
+                raise QueueError(f"PR #{number} returned to draft before merge")
+            if authorization_entry.head_sha != head_sha:
+                raise QueueError(f"PR #{number} changed immediately before merge")
+            marker = {
+                "state": authorization_entry.queue_state,
+                "head_sha": authorization_entry.queued_head_sha,
+            }
+            integration_batch_id = authorization_entry.integration_batch_id or ""
         if self.config.queue_label not in labels or self.config.blocked_label in labels:
             raise QueueError(f"PR #{number} queue authorization was revoked")
-        marker = queue_marker_for_client(self, self.comments(number))
         if (
             not marker
             or marker.get("state") != "queued"
             or marker.get("head_sha") != head_sha
         ):
             raise QueueError(f"PR #{number} durable queue authorization was revoked")
-        integration_batch_id = str(marker.get("integration_batch_id") or "")
         if integration_batch_id:
             integration = latest_payload(
                 self.comments(number),
@@ -1666,8 +1872,14 @@ def command_request(
 ) -> dict[str, Any]:
     number = client.resolve_pr(selector)
     actor = client.require_actor(client.trusted_logins, "request deployment")
-    client.ensure_labels()
-    entry = client.snapshot(number, require_marker=False, allow_blocked_label=True)
+    client.ensure_labels_exist()
+    entry = client.snapshot(
+        number,
+        require_marker=False,
+        allow_blocked_label=True,
+        known_source_paths=[],
+        known_generated_paths=[],
+    )
     requested_at = utc_now()
     intent_id = hashlib.sha256(
         f"{client.repository}:{number}:{actor}:{requested_at}".encode()
@@ -1856,54 +2068,160 @@ def record_repair(
     return payload
 
 
-def command_promote(client: GitHub, *, emit: bool = True) -> dict[str, Any]:
+def reconcile_externally_merged_threads(client: GitHub) -> list[dict[str, Any]]:
+    reconciled: list[dict[str, Any]] = []
+    records = client.thread_records()
+    if not isinstance(records, list):
+        return reconciled
+    for record in records:
+        if record.get("phase") != "deploy-requested" or not record.get("pull_request"):
+            continue
+        number = int(record["pull_request"])
+        comments = client.comments(number)
+        intent = latest_intent(comments, client.trusted_logins)
+        expected_head = str((intent or {}).get("requested_head") or "")
+        if not expected_head:
+            continue
+        try:
+            merge_sha = client.externally_integrated_merge(number, expected_head)
+        except QueueError:
+            continue
+        if not merge_sha:
+            continue
+        updated_at = utc_now()
+        client.record_thread(
+            ThreadRecord(
+                provider=str(record["provider"]),
+                thread_id=str(record["thread_id"]),
+                phase="merged",
+                updated_at=updated_at,
+                title=str(record.get("title") or "") or None,
+                branch=str(record.get("branch") or "") or None,
+                pull_request=number,
+                url=str(record.get("url") or "") or None,
+            )
+        )
+        value = {
+            "head_sha": expected_head,
+            "merge_sha": merge_sha,
+            "pull_request": number,
+        }
+        reconciled.append(value)
+        notify(
+            client.config.pipeline,
+            "externally-merged",
+            {"repository": client.repository, **value},
+        )
+    return reconciled
+
+
+def command_promote(
+    client: GitHub,
+    *,
+    emit: bool = True,
+    captured_entries: list[QueueEntry] | None = None,
+) -> dict[str, Any]:
     promoted: list[int] = []
     waiting: list[dict[str, Any]] = []
     blocked: list[dict[str, Any]] = []
     integration_sources = client.active_integration_sources()
-    for number in client.intent_numbers():
+
+    def evaluate(
+        number: int,
+    ) -> tuple[str, dict[str, Any] | None, QueueEntry | None]:
         if number in integration_sources:
-            waiting.append(
-                {"number": number, "reasons": ["cumulative integration PR is active"]}
+            return (
+                "waiting",
+                {"number": number, "reasons": ["cumulative integration PR is active"]},
+                None,
             )
-            continue
         comments = client.comments(number)
         intent = latest_intent(comments, client.trusted_logins)
         if not intent or intent.get("state") != "requested":
-            continue
-        entry = client.snapshot(number, require_marker=False, allow_blocked_label=True)
+            return "skip", None, None
+        entry = client.snapshot(
+            number,
+            require_marker=False,
+            allow_blocked_label=True,
+            known_comments=comments,
+            defer_paths_until_ready=True,
+        )
         if (
             client.config.pipeline.intent_scope == "head"
             and intent.get("requested_head") != entry.head_sha
         ):
-            waiting.append(
+            return (
+                "waiting",
                 {
                     "number": number,
                     "reasons": [
                         "deploy intent is bound to an older head; the trusted source "
                         "agent must run deploybot refresh-request"
                     ],
-                }
+                },
+                entry,
             )
-            continue
+        if client.config.blocked_label in entry.labels:
+            return (
+                "waiting",
+                {
+                    "number": number,
+                    "reasons": [
+                        "repair is blocked; the trusted source agent must run "
+                        "deploybot resume after fresh gates pass"
+                    ],
+                },
+                entry,
+            )
         if entry.state == "ready":
-            queue_from_intent(client, entry, intent)
-            promoted.append(number)
-        elif entry.state == "blocked":
+            changed = queue_from_intent(
+                client,
+                entry,
+                intent,
+                comments=comments,
+                labels=set(entry.labels),
+            )
+            if changed:
+                return "promoted", {"number": number}, entry
+            return "ready", None, entry
+        if entry.state == "blocked":
             reason = "; ".join(entry.reasons or ["blocked"])
             record_repair(client, entry, intent, reason)
-            blocked.append({"number": number, "reason": reason})
-        else:
-            waiting.append({"number": number, "reasons": entry.reasons or []})
+            return "blocked", {"number": number, "reason": reason}, entry
+        return (
+            "waiting",
+            {"number": number, "reasons": entry.reasons or []},
+            entry,
+        )
+
+    numbers = sorted(client.intent_numbers())
+    if numbers:
+        with ThreadPoolExecutor(
+            max_workers=min(client.config.pipeline.promotion_workers, len(numbers))
+        ) as executor:
+            outcomes = executor.map(evaluate, numbers)
+            for state, payload, entry in outcomes:
+                if captured_entries is not None and entry is not None:
+                    captured_entries.append(entry)
+                if state == "promoted" and payload is not None:
+                    promoted.append(int(payload["number"]))
+                elif state == "blocked" and payload is not None:
+                    blocked.append(payload)
+                elif state == "waiting" and payload is not None:
+                    waiting.append(payload)
     result = {"promoted": promoted, "waiting": waiting, "blocked": blocked}
     if emit:
         print(json.dumps(result, indent=2, sort_keys=True))
     return result
 
 
-def promote_integrations(client: GitHub) -> list[int]:
+def promote_integrations(
+    client: GitHub,
+    *,
+    known_checks_by_number: dict[int, dict[str, str]] | None = None,
+) -> list[int]:
     promoted: list[int] = []
-    for number in client.open_pull_request_numbers():
+    for number in client.integration_pull_request_numbers():
         comments = client.comments(number)
         integration = latest_payload(
             comments,
@@ -1915,7 +2233,12 @@ def promote_integrations(client: GitHub) -> list[int]:
         labels = client.labels(number)
         if client.config.queue_label in labels:
             continue
-        entry = client.snapshot(number, require_marker=False, allow_blocked_label=True)
+        entry = client.snapshot(
+            number,
+            require_marker=False,
+            allow_blocked_label=True,
+            known_checks=(known_checks_by_number or {}).get(number),
+        )
         if entry.state != "ready":
             continue
         batch_id = str(integration.get("batch_id") or "")
@@ -1945,6 +2268,116 @@ def promote_integrations(client: GitHub) -> list[int]:
             },
         )
     return promoted
+
+
+def settle_integration_checks(
+    client: GitHub,
+    *,
+    timeout_seconds: int,
+    poll_seconds: int,
+    numbers: Iterable[int] | None = None,
+) -> list[dict[str, Any]]:
+    """Own token-created integration CI until each clean PR is merge-ready."""
+    if numbers is None:
+        values = client.integration_pull_request_numbers()
+        if not isinstance(values, list):
+            return []
+        selected = [int(value) for value in values]
+    else:
+        selected = [int(value) for value in numbers]
+    results: list[dict[str, Any]] = []
+    configured = tuple(client.config.pipeline.ci_workflows)
+    for number in selected:
+        comments = client.comments(number)
+        integration = latest_payload(
+            comments,
+            INTEGRATION_MARKER,
+            coordinator_logins(client),
+        )
+        if not integration or integration.get("conflict"):
+            continue
+        pull = client.pull_head(number)
+        branch = str(pull.get("branch") or "")
+        head_sha = str(pull.get("head_sha") or "")
+        if pull.get("state") != "OPEN" or not branch or not head_sha:
+            raise QueueError(f"integration PR #{number} is no longer open")
+        deadline = time.monotonic() + timeout_seconds
+        dispatched: list[dict[str, Any]] = []
+        while True:
+            current = client.pull_head(number)
+            if current.get("state") != "OPEN":
+                raise QueueError(f"integration PR #{number} is no longer open")
+            if current.get("head_sha") != head_sha:
+                raise QueueError(
+                    f"integration PR #{number} changed while CI ownership was active"
+                )
+            runs = client.workflow_runs_for_branch(branch)
+            latest: dict[str, dict[str, Any]] = {}
+            for run in runs:
+                name = str(run.get("name") or "")
+                if (
+                    name not in configured
+                    or str(run.get("head_sha") or "") != head_sha
+                    or str(run.get("event") or "") != "workflow_dispatch"
+                ):
+                    continue
+                previous = latest.get(name)
+                key = (str(run.get("created_at") or ""), int(run.get("id") or 0))
+                previous_key = (
+                    str((previous or {}).get("created_at") or ""),
+                    int((previous or {}).get("id") or 0),
+                )
+                if previous is None or key > previous_key:
+                    latest[name] = run
+            missing = [name for name in configured if name not in latest]
+            if missing:
+                dispatched.extend(
+                    client.dispatch_ci_workflows(ref=branch, names=missing)
+                )
+            else:
+                failed = [
+                    name
+                    for name, run in latest.items()
+                    if str(run.get("status") or "") == "completed"
+                    and str(run.get("conclusion") or "") != "success"
+                ]
+                if failed:
+                    raise QueueError(
+                        f"integration PR #{number} CI failed: " + ", ".join(failed)
+                    )
+                if all(
+                    str(run.get("status") or "") == "completed"
+                    and str(run.get("conclusion") or "") == "success"
+                    for run in latest.values()
+                ):
+                    exact_checks = check_states(client.commit_check_runs(head_sha))
+                    entry = client.snapshot(
+                        number,
+                        require_marker=False,
+                        allow_blocked_label=True,
+                        known_checks=exact_checks,
+                    )
+                    if entry.state == "ready":
+                        results.append(
+                            {
+                                "branch": branch,
+                                "dispatched_ci": dispatched,
+                                "checks": exact_checks,
+                                "head_sha": head_sha,
+                                "pull_request": number,
+                                "state": "ready",
+                            }
+                        )
+                        break
+                    if entry.state == "blocked":
+                        raise QueueError(
+                            f"integration PR #{number} is blocked: "
+                            + "; ".join(entry.reasons or ["unknown gate"])
+                        )
+            if time.monotonic() >= deadline:
+                raise QueueError(f"integration PR #{number} CI timed out")
+            time.sleep(poll_seconds)
+    return results
 
 
 def command_resume(client: GitHub, selector: str | None) -> None:
@@ -2029,6 +2462,7 @@ def command_enqueue(client: GitHub, selector: str | None) -> None:
     previous = (
         {
             "head_sha": entry.queued_head_sha,
+            "priority_at": entry.priority_at,
             "queued_at": entry.queued_at,
             "state": entry.queue_state,
         }
@@ -2055,7 +2489,14 @@ def command_enqueue(client: GitHub, selector: str | None) -> None:
         already_queued=client.config.queue_label in entry.labels,
         now=utc_now(),
     )
-    body = queue_state_body("queued", entry.head_sha, queued_at=queued_at)
+    body = queue_state_body(
+        "queued",
+        entry.head_sha,
+        queued_at=queued_at,
+        priority_at=(
+            str(previous.get("priority_at") or "") or None if previous else None
+        ),
+    )
     client.comment(number, body)
     if client.config.queue_label in entry.labels:
         # Re-adding the label emits a fresh `labeled` event for GitHub-hosted
@@ -2071,7 +2512,10 @@ def queue_from_intent(
     client: GitHub,
     entry: QueueEntry,
     intent: dict[str, Any],
-) -> None:
+    *,
+    comments: list[dict[str, Any]] | None = None,
+    labels: set[str] | None = None,
+) -> bool:
     if entry.state != "ready":
         raise QueueError(
             f"PR #{entry.number} is not ready to queue: "
@@ -2088,12 +2532,32 @@ def queue_from_intent(
             f"PR #{entry.number} deploy intent is bound to an older head; "
             "run deploybot refresh-request after fresh review"
         )
-    comments = client.comments(entry.number)
-    previous = queue_marker_for_client(client, comments)
+    current_comments = (
+        comments if comments is not None else client.comments(entry.number)
+    )
+    previous = queue_marker_for_client(client, current_comments)
+    current_labels = labels if labels is not None else client.labels(entry.number)
+    if (
+        client.config.queue_label in current_labels
+        and previous
+        and previous.get("state") == "queued"
+        and previous.get("head_sha") == entry.head_sha
+        and previous.get("intent_id") == intent_id
+    ):
+        entry.queued_head_sha = entry.head_sha
+        entry.queued_at = marker_queued_at(previous)
+        entry.priority_at = marker_priority_at(previous)
+        entry.queue_state = "queued"
+        return False
     queued_at = queue_timestamp(
         previous,
         already_queued=client.config.queue_label in entry.labels,
         now=utc_now(),
+    )
+    priority_at = (
+        marker_priority_at(previous)
+        or str(intent.get("requested_at") or "")
+        or queued_at
     )
     client.comment(
         entry.number,
@@ -2101,15 +2565,22 @@ def queue_from_intent(
             "queued",
             entry.head_sha,
             queued_at=queued_at,
+            priority_at=priority_at,
             intent_id=intent_id,
         ),
     )
-    labels = client.labels(entry.number)
-    if client.config.queue_label in labels:
+    if client.config.queue_label in current_labels:
         client.remove_label(entry.number, client.config.queue_label)
     client.add_label(entry.number, client.config.queue_label)
-    if client.config.blocked_label in labels:
+    if client.config.blocked_label in current_labels:
         client.remove_label(entry.number, client.config.blocked_label)
+    entry.labels = sorted(
+        (current_labels - {client.config.blocked_label}) | {client.config.queue_label}
+    )
+    entry.queued_head_sha = entry.head_sha
+    entry.queued_at = queued_at
+    entry.priority_at = priority_at
+    entry.queue_state = "queued"
     notify(
         client.config.pipeline,
         "queued",
@@ -2120,6 +2591,7 @@ def queue_from_intent(
             "intent_id": intent_id,
         },
     )
+    return True
 
 
 @dataclass
@@ -2140,8 +2612,65 @@ class FreezeResult:
         }
 
 
-def freeze_queue(client: GitHub) -> FreezeResult:
-    all_entries = client.queue()
+def freeze_queue(
+    client: GitHub,
+    *,
+    known_entries: list[QueueEntry] | None = None,
+    held_numbers: set[int] | None = None,
+) -> FreezeResult:
+    held_numbers = held_numbers or set()
+    if known_entries is None:
+        all_entries = [
+            entry for entry in client.queue() if entry.number not in held_numbers
+        ]
+    else:
+        queued_numbers = set(client.queued_numbers()) - held_numbers
+        known_by_number = {
+            entry.number: entry
+            for entry in known_entries
+            if entry.number in queued_numbers
+        }
+        entries_by_number = dict(known_by_number)
+        for number in sorted(queued_numbers - entries_by_number.keys()):
+            entries_by_number[number] = client.snapshot(number)
+
+        # Deferred path reads are safe while an intent is only waiting, but a
+        # frozen batch must persist a complete overlap graph. GitHub can report
+        # transient UNKNOWN mergeability for an already-queued PR; hydrate its
+        # paths here so a later retry cannot merge overlapping sources as if
+        # they were independent.
+        needs_paths = [
+            entry
+            for entry in known_by_number.values()
+            if not entry.source_paths and not entry.generated_paths
+        ]
+
+        def load_paths(entry: QueueEntry) -> tuple[int, list[str], list[str]]:
+            source_paths, generated_paths = client.changed_paths(entry.number)
+            return entry.number, source_paths, generated_paths
+
+        if needs_paths:
+            with ThreadPoolExecutor(
+                max_workers=min(
+                    client.config.pipeline.promotion_workers, len(needs_paths)
+                )
+            ) as executor:
+                for number, source_paths, generated_paths in executor.map(
+                    load_paths, needs_paths
+                ):
+                    entries_by_number[number].source_paths = sorted(set(source_paths))
+                    entries_by_number[number].generated_paths = sorted(
+                        set(generated_paths)
+                    )
+        all_entries = sorted(
+            entries_by_number.values(),
+            key=lambda entry: (
+                entry.priority_at or entry.queued_at or "9999",
+                entry.number if entry.priority_at else 0,
+                entry.queued_at or "9999",
+                entry.number,
+            ),
+        )
     entries, blocked_entries = split_blocked_entries(
         all_entries, client.config.blocked_label
     )
@@ -2259,6 +2788,7 @@ def command_block(client: GitHub, selector: str | None, reason: str) -> None:
             "blocked",
             entry.head_sha,
             queued_at=str(previous.get("queued_at") or "") or None,
+            priority_at=str(previous.get("priority_at") or "") or None,
             reason=reason,
             intent_id=str(previous.get("intent_id") or "") or None,
         ),
@@ -2288,6 +2818,7 @@ def command_unblock(client: GitHub, selector: str | None) -> None:
             "queued",
             entry.head_sha,
             queued_at=str(previous.get("queued_at") or "") or None,
+            priority_at=str(previous.get("priority_at") or "") or None,
             intent_id=str(previous.get("intent_id") or "") or None,
         ),
     )
@@ -2316,6 +2847,9 @@ def command_dequeue(client: GitHub, selector: str | None, reason: str) -> None:
             queued_at=(
                 str(previous.get("queued_at") or "") or None if previous else None
             ),
+            priority_at=(
+                str(previous.get("priority_at") or "") or None if previous else None
+            ),
             reason=reason,
             intent_id=(
                 str(previous.get("intent_id") or "") or None if previous else None
@@ -2334,22 +2868,39 @@ def command_merge(
     batch_id: str,
     *,
     emit: bool = True,
+    frozen_entry: QueueEntry | None = None,
+    frozen_batch: dict[str, Any] | None = None,
+    active_numbers: set[int] | None = None,
 ) -> str:
-    require_running_pipeline(client)
-    number = client.resolve_pr(selector)
-    batch = latest_batch_marker(
-        client.comments(number),
-        coordinator_logins(client),
-        batch_id=batch_id,
+    if frozen_entry is None or frozen_batch is None:
+        require_running_pipeline(client)
+    number = (
+        frozen_entry.number if frozen_entry is not None else client.resolve_pr(selector)
     )
+    batch = frozen_batch
+    if batch is not None and str(batch.get("batch_id") or "") != batch_id:
+        raise QueueError(f"frozen context does not match batch {batch_id}")
+    if batch is None:
+        batch = latest_batch_marker(
+            client.comments(number),
+            coordinator_logins(client),
+            batch_id=batch_id,
+        )
     if batch is None:
         raise QueueError(f"PR #{number} has no trusted marker for batch {batch_id}")
     frozen = {int(value) for value in batch.get("pull_requests") or []}
     if number not in frozen:
         raise QueueError(f"PR #{number} is not a member of batch {batch_id}")
-    entries = client.queue()
-    frozen_entries = [value for value in entries if value.number in frozen]
-    entry = next((value for value in frozen_entries if value.number == number), None)
+    if frozen_entry is None:
+        entries = client.queue()
+        frozen_entries = [value for value in entries if value.number in frozen]
+        entry = next(
+            (value for value in frozen_entries if value.number == number), None
+        )
+        current_numbers = {value.number for value in frozen_entries}
+    else:
+        entry = frozen_entry
+        current_numbers = active_numbers or {number}
     if entry is None:
         raise QueueError(f"PR #{number} is not in the merge queue")
     if entry.state != "ready":
@@ -2364,9 +2915,7 @@ def command_merge(
     if entry.queued_at and str(batch.get("frozen_at") or "") < entry.queued_at:
         raise QueueError(f"batch {batch_id} predates the current queue authorization")
 
-    peers = batch_overlap_peers(
-        batch, number, {value.number for value in frozen_entries}
-    )
+    peers = batch_overlap_peers(batch, number, current_numbers)
     if peers:
         peers = ", ".join(f"#{value}" for value in peers)
         raise QueueError(
@@ -2389,20 +2938,43 @@ def command_merge(
             + ", ".join(f"#{value}" for value in missing_dependencies)
         )
 
-    fresh = client.snapshot(number)
-    if fresh.state != "ready":
-        raise QueueError(
-            f"PR #{number} changed before merge: "
-            + "; ".join(fresh.reasons or ["unknown gate"])
+    externally_integrated = False
+    try:
+        fresh = client.snapshot(
+            number,
+            known_source_paths=entry.source_paths,
+            known_generated_paths=entry.generated_paths,
         )
-    if str((batch.get("heads") or {}).get(str(number)) or "") != fresh.head_sha:
-        raise QueueError(f"PR #{number} changed after batch {batch_id} was frozen")
-    if fresh.dependencies != expected_dependencies:
-        raise QueueError(f"PR #{number} dependencies changed before merge")
-    if fresh.queued_at and str(batch.get("frozen_at") or "") < fresh.queued_at:
-        raise QueueError(f"batch {batch_id} predates the current queue authorization")
+    except QueueError as error:
+        merge_sha = (
+            client.externally_integrated_merge(number, expected_head)
+            if "is not open" in str(error)
+            else None
+        )
+        if not merge_sha:
+            raise
+        fresh = entry
+        externally_integrated = True
+    if not externally_integrated:
+        if fresh.state != "ready":
+            raise QueueError(
+                f"PR #{number} changed before merge: "
+                + "; ".join(fresh.reasons or ["unknown gate"])
+            )
+        if str((batch.get("heads") or {}).get(str(number)) or "") != fresh.head_sha:
+            raise QueueError(f"PR #{number} changed after batch {batch_id} was frozen")
+        if fresh.dependencies != expected_dependencies:
+            raise QueueError(f"PR #{number} dependencies changed before merge")
+        if fresh.queued_at and str(batch.get("frozen_at") or "") < fresh.queued_at:
+            raise QueueError(
+                f"batch {batch_id} predates the current queue authorization"
+            )
 
-    merge_sha = client.merge(number, fresh.head_sha)
+        merge_sha = client.merge(
+            number,
+            fresh.head_sha,
+            authorization_entry=fresh,
+        )
     merged_comments = client.comments(number)
     intent = latest_intent(merged_comments, client.trusted_logins)
     integration = latest_payload(
@@ -2430,6 +3002,7 @@ def command_merge(
             "head_sha": fresh.head_sha,
             "merge_sha": merge_sha,
             "intent_id": (intent or {}).get("intent_id"),
+            "ownership": "external" if externally_integrated else "deploybot",
         },
     )
     if integration:
@@ -2490,7 +3063,15 @@ def drain_frozen_batch(
             if any(dependency in pending for dependency in entry.dependencies):
                 continue
             try:
-                merge_sha = command_merge(client, str(number), batch_id, emit=False)
+                merge_sha = command_merge(
+                    client,
+                    str(number),
+                    batch_id,
+                    emit=False,
+                    frozen_entry=entry,
+                    frozen_batch=frozen.batch,
+                    active_numbers=set(pending),
+                )
             except QueueError as error:
                 if "GitHub is still computing mergeability" in str(error):
                     retryable = True
@@ -2538,7 +3119,11 @@ def drain_frozen_batch(
 
 
 def command_drain(
-    client: GitHub, *, json_output: bool, emit: bool = True
+    client: GitHub,
+    *,
+    json_output: bool,
+    emit: bool = True,
+    initial_frozen: FreezeResult | None = None,
 ) -> dict[str, Any]:
     require_running_pipeline(client)
     batch_ids: list[str] = []
@@ -2548,7 +3133,8 @@ def command_drain(
     next_batch: list[int] = []
 
     while True:
-        frozen = freeze_queue(client)
+        frozen = initial_frozen or freeze_queue(client)
+        initial_frozen = None
         if frozen.batch is None:
             break
         batch_id = str(frozen.batch["batch_id"])
@@ -2711,6 +3297,100 @@ def release_follow_needed(client: GitHub) -> bool:
     return True
 
 
+def should_settle_batch(client: GitHub, entries: list[QueueEntry]) -> bool:
+    has_ready = any(
+        client.config.queue_label in entry.labels and entry.state == "ready"
+        for entry in entries
+    )
+    has_near_ready = any(
+        client.config.queue_label not in entry.labels
+        and client.config.blocked_label not in entry.labels
+        and entry.state == "waiting"
+        for entry in entries
+    )
+    return has_ready and has_near_ready
+
+
+def near_ready_overlap_holds(
+    client: GitHub, entries: list[QueueEntry]
+) -> dict[int, list[int]]:
+    """Keep ready overlap peers together while another active intent settles."""
+    if client.config.integration.mode != "overlap":
+        return {}
+    ready = {
+        entry.number: entry
+        for entry in entries
+        if entry.state == "ready"
+        and client.config.queue_label in entry.labels
+        and client.config.blocked_label not in entry.labels
+    }
+    waiting = {
+        entry.number: entry
+        for entry in entries
+        if entry.state == "waiting"
+        and client.config.queue_label not in entry.labels
+        and client.config.blocked_label not in entry.labels
+    }
+    if not ready or not waiting:
+        return {}
+
+    def load_paths(entry: QueueEntry) -> tuple[int, list[str], list[str]]:
+        source_paths, generated_paths = client.changed_paths(entry.number)
+        return entry.number, source_paths, generated_paths
+
+    values = list(waiting.values())
+    with ThreadPoolExecutor(
+        max_workers=min(client.config.pipeline.promotion_workers, len(values))
+    ) as executor:
+        for number, source_paths, generated_paths in executor.map(load_paths, values):
+            waiting[number].source_paths = sorted(set(source_paths))
+            waiting[number].generated_paths = sorted(set(generated_paths))
+
+    waiting_numbers = set(waiting)
+    holds: dict[int, list[int]] = {}
+    for group in overlap_groups([*ready.values(), *waiting.values()]):
+        members = {int(value) for value in group["pull_requests"]}
+        waiting_peers = sorted(members & waiting_numbers)
+        if not waiting_peers:
+            continue
+        for number in sorted(members & ready.keys()):
+            entry = ready[number]
+            comments = client.comments(number)
+            marker = latest_batch_marker(comments, coordinator_logins(client))
+            completed = completed_batch_ids(comments, coordinator_logins(client))
+            if active_batch([entry], {number: marker}, completed) is not None:
+                continue
+            holds[number] = waiting_peers
+    return holds
+
+
+def combine_drain_results(
+    first: dict[str, Any], second: dict[str, Any]
+) -> dict[str, Any]:
+    batch_ids: list[str] = []
+    for value in (first, second):
+        candidates = list(value.get("batch_ids") or [])
+        if not candidates and value.get("batch_id"):
+            candidates = [str(value["batch_id"])]
+        batch_ids.extend(
+            candidate for candidate in candidates if candidate not in batch_ids
+        )
+    waiting = {
+        int(value["number"]): value
+        for result in (first, second)
+        for value in result.get("waiting") or []
+    }
+    return {
+        "batch_id": batch_ids[-1] if batch_ids else None,
+        "batch_ids": batch_ids,
+        "integration_required": list(first.get("integration_required") or [])
+        + list(second.get("integration_required") or []),
+        "merged": list(first.get("merged") or []) + list(second.get("merged") or []),
+        "next_batch": list(second.get("next_batch") or []),
+        "waiting": list(waiting.values()),
+    }
+
+
 def command_react(
     client: GitHub,
     *,
@@ -2723,30 +3403,122 @@ def command_react(
         result = {"state": "paused", "reason": control.get("reason")}
         print(json.dumps(result, indent=2, sort_keys=True))
         return result
-    promoted_integrations = promote_integrations(client)
-    promoted = command_promote(client, emit=False)
-    frozen = freeze_queue(client)
-    integrations: list[dict[str, Any]] = []
-    if (
-        frozen.batch is not None
-        and client.config.integration.mode == "all"
-        and not promoted_integrations
+
+    reconciled_merges = reconcile_externally_merged_threads(client)
+
+    def own_integration_checks(
+        numbers: Iterable[int] | None = None,
+    ) -> list[dict[str, Any]]:
+        try:
+            return settle_integration_checks(
+                client,
+                timeout_seconds=timeout_seconds,
+                poll_seconds=10,
+                numbers=numbers,
+            )
+        except QueueError as error:
+            if client.config.pipeline.pause_on_failure:
+                client.set_pipeline_control(
+                    "paused", "integration CI ownership failed: " + str(error)
+                )
+            raise
+
+    integration_checks = own_integration_checks()
+    promoted_integrations = promote_integrations(
+        client,
+        known_checks_by_number={
+            int(value["pull_request"]): dict(value.get("checks") or {})
+            for value in integration_checks
+        },
+    )
+    captured_entries: list[QueueEntry] = []
+    promoted = command_promote(
+        client,
+        emit=False,
+        captured_entries=captured_entries,
+    )
+    if client.config.pipeline.batch_settle_seconds and should_settle_batch(
+        client, captured_entries
     ):
+        time.sleep(client.config.pipeline.batch_settle_seconds)
+        settled_entries: list[QueueEntry] = []
+        settled = command_promote(
+            client,
+            emit=False,
+            captured_entries=settled_entries,
+        )
+        promoted["promoted"] = list(
+            dict.fromkeys(promoted["promoted"] + settled["promoted"])
+        )
+        promoted["blocked"] = promoted["blocked"] + settled["blocked"]
+        promoted["waiting"] = settled["waiting"]
+        captured_entries = settled_entries
+
+    drained: dict[str, Any] = {}
+    queued_integrations: set[int] = set()
+    if client.config.integration.mode == "all":
+        queued_numbers = set(client.queued_numbers())
+        queued_integrations = queued_numbers.intersection(
+            client.integration_pull_request_numbers()
+        )
+        if queued_integrations:
+            # A ready integration PR owns an earlier frozen source batch. Drain
+            # those integration PRs first, while holding newly queued sources,
+            # so the older integration cannot suppress all-mode integration of
+            # the new work or let that work merge directly.
+            integration_frozen = freeze_queue(
+                client,
+                held_numbers=queued_numbers - queued_integrations,
+            )
+            drained = command_drain(
+                client,
+                json_output=False,
+                emit=False,
+                initial_frozen=integration_frozen,
+            )
+
+    overlap_holds = near_ready_overlap_holds(client, captured_entries)
+    promoted["held"] = [
+        {
+            "number": number,
+            "overlapping_waiting": waiting,
+            "reason": "waiting for overlapping deploy intents to finish gates",
+        }
+        for number, waiting in overlap_holds.items()
+    ]
+    merged_integrations = {
+        int(value["number"]) for value in drained.get("merged") or []
+    }
+    if queued_integrations - merged_integrations:
+        frozen = FreezeResult(None, [], [], [], [])
+    else:
+        frozen = freeze_queue(
+            client,
+            known_entries=captured_entries,
+            held_numbers=set(overlap_holds),
+        )
+    integrations: list[dict[str, Any]] = []
+    if frozen.batch is not None and client.config.integration.mode == "all":
         integrations.append(
             client.create_integration_pull_request(
                 batch=frozen.batch,
                 entries=frozen.queue,
             )
         )
-        drained: dict[str, Any] = {
+        deferred_drain: dict[str, Any] = {
             "batch_id": frozen.batch["batch_id"],
+            "batch_ids": [frozen.batch["batch_id"]],
             "merged": [],
             "waiting": [],
             "integration_required": frozen.overlap_groups,
             "next_batch": [],
         }
+        drained = (
+            combine_drain_results(drained, deferred_drain)
+            if drained
+            else deferred_drain
+        )
     else:
-        drained = command_drain(client, json_output=False, emit=False)
         if (
             frozen.batch is not None
             and client.config.integration.mode == "overlap"
@@ -2766,6 +3538,47 @@ def command_react(
                     entries=overlap_entries,
                 )
             )
+    created_clean = [
+        int(value["number"])
+        for value in integrations
+        if value.get("number") and not value.get("conflict")
+    ]
+    newly_promoted_integrations: list[int] = []
+    if created_clean:
+        # GITHUB_TOKEN-created pull requests do not emit a dependable recursive
+        # pull_request/workflow_run chain. Dispatch and own their exact-head CI
+        # under this coordinator before any source batch is allowed to drain.
+        integration_checks.extend(own_integration_checks(created_clean))
+        newly_promoted_integrations = promote_integrations(
+            client,
+            known_checks_by_number={
+                int(value["pull_request"]): dict(value.get("checks") or {})
+                for value in integration_checks
+                if int(value["pull_request"]) in created_clean
+            },
+        )
+        promoted_integrations = list(
+            dict.fromkeys(promoted_integrations + newly_promoted_integrations)
+        )
+
+    if not drained:
+        # Establish durable ownership for every overlapping source before any
+        # independent member of the frozen batch is allowed to merge. A setup
+        # or integration-CI failure leaves the batch intact and cannot strand
+        # an already-merged partial batch before exact-main CI.
+        drained = command_drain(
+            client,
+            json_output=False,
+            emit=False,
+            initial_frozen=frozen,
+        )
+    if newly_promoted_integrations:
+        integration_drain = command_drain(
+            client,
+            json_output=False,
+            emit=False,
+        )
+        drained = combine_drain_results(drained, integration_drain)
     dispatched_ci: list[dict[str, Any]] = []
     if dispatch_ci and drained.get("merged"):
         try:
@@ -2799,6 +3612,8 @@ def command_react(
         "drain": drained,
         "dispatched_ci": dispatched_ci,
         "integrations": integrations,
+        "integration_checks": integration_checks,
+        "reconciled_merges": reconciled_merges,
         "release": release,
     }
     print(json.dumps(result, indent=2, sort_keys=True))

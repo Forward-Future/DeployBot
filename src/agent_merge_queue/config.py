@@ -44,6 +44,9 @@ class PipelineConfig:
     thread_active_hours: int
     ci_workflows: tuple[str, ...]
     deploy_workflows: tuple[str, ...]
+    batch_settle_seconds: int
+    ci_failure_grace_seconds: int
+    promotion_workers: int
     ready_to_merge_target_minutes: int
     merge_to_live_target_minutes: int
     auto_promote: bool
@@ -116,6 +119,9 @@ registry_title = "DeployBot delivery registry"
 thread_active_hours = 72
 ci_workflows = ["CI"]
 deploy_workflows = ["Deploy"]
+batch_settle_seconds = 15
+ci_failure_grace_seconds = 90
+promotion_workers = 4
 ready_to_merge_target_minutes = 15
 merge_to_live_target_minutes = 10
 auto_promote = true
@@ -155,6 +161,14 @@ def _positive_int(value: Any, field: str, default: int) -> int:
         return default
     if not isinstance(value, int) or isinstance(value, bool) or value < 1:
         raise ConfigError(f"{field} must be a positive integer")
+    return value
+
+
+def _non_negative_int(value: Any, field: str, default: int) -> int:
+    if value is None:
+        return default
+    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+        raise ConfigError(f"{field} must be a non-negative integer")
     return value
 
 
@@ -414,6 +428,21 @@ def parse_config(payload: dict[str, Any]) -> QueueConfig:
             deploy_workflows=_string_tuple(
                 pipeline.get("deploy_workflows", ["Deploy"]),
                 "pipeline.deploy_workflows",
+            ),
+            batch_settle_seconds=_non_negative_int(
+                pipeline.get("batch_settle_seconds"),
+                "pipeline.batch_settle_seconds",
+                15,
+            ),
+            ci_failure_grace_seconds=_non_negative_int(
+                pipeline.get("ci_failure_grace_seconds"),
+                "pipeline.ci_failure_grace_seconds",
+                90,
+            ),
+            promotion_workers=_positive_int(
+                pipeline.get("promotion_workers"),
+                "pipeline.promotion_workers",
+                4,
             ),
             ready_to_merge_target_minutes=_positive_int(
                 pipeline.get("ready_to_merge_target_minutes"),

@@ -88,7 +88,10 @@ Install `examples/github-workflow.yml` on the default branch. It reacts to
 deploy labels, ready/synchronize events, reviews, named CI `workflow_run`
 completions, and completed external check suites. Keep its `workflows` list
 aligned with `pipeline.ci_workflows`. The privileged worker never checks out or
-executes pull-request code. Pin the Action to the full reviewed release commit:
+executes pull-request code. The Action follows releases by default so the same
+serialized worker can dispatch deployment when GitHub suppresses the
+`workflow_run` event for token-dispatched CI. Pin the Action to the full
+reviewed release commit:
 
 ```yaml
 - uses: Forward-Future/DeployBot@13d7293b181581d2e4d59d8a605df76f7feb88a6
@@ -155,6 +158,10 @@ work, and creates integration PRs when configured. A conflict produces a repair
 handoff containing the source thread, base/head SHAs, source paths, and one
 return command:
 
+In `overlap` mode, a ready source waits when another active, near-ready intent
+belongs to the same source-overlap component. Unrelated ready work still drains,
+and the held component freezes together once its remaining gates pass.
+
 ```bash
 deploybot resume <pr-number>
 ```
@@ -168,6 +175,9 @@ can pause further merges until `deploybot unpause`.
 [pipeline]
 ci_workflows = ["CI"]
 deploy_workflows = ["Deploy"]
+batch_settle_seconds = 15
+ci_failure_grace_seconds = 90
+promotion_workers = 4
 ready_to_merge_target_minutes = 15
 merge_to_live_target_minutes = 10
 auto_promote = true
@@ -183,6 +193,10 @@ expected_status = 200
 # manual, overlap, or all (one cumulative pre-merge validation PR)
 mode = "overlap"
 ```
+
+For `overlap` or `all` mode with the hosted coordinator, enable **Allow GitHub
+Actions to create and approve pull requests** under the repository's Actions
+workflow-permission settings. `deploybot doctor` reports this prerequisite.
 
 ## Review providers
 

@@ -59,9 +59,7 @@ class DeployBotSkillTest(unittest.TestCase):
             "github.event.pull_request.head.repo.full_name == github.repository",
             workflow,
         )
-        self.assertIn(
-            "github.event.check_suite.app.slug != 'github-actions'", workflow
-        )
+        self.assertIn("github.event.check_suite.app.slug != 'github-actions'", workflow)
         self.assertIn("github.event.check_suite.pull_requests[0].base.ref", workflow)
         self.assertIn("persist-credentials: false", workflow)
 
@@ -86,6 +84,12 @@ class DeployBotSkillTest(unittest.TestCase):
         self.assertIn("args+=(--dispatch-ci)", action)
         self.assertIn("actions: write", example)
         self.assertIn("workflow_dispatch:", workflow)
+
+    def test_action_follows_release_when_workflow_run_is_suppressed(self) -> None:
+        action = (ROOT / "action.yml").read_text(encoding="utf-8")
+        follow_input = action.split("  follow:\n", 1)[1].split("  dispatch_ci:\n", 1)[0]
+        self.assertIn('default: "true"', follow_input)
+        self.assertIn("args+=(--follow)", action)
 
     def test_clients_pin_the_immutable_status_release(self) -> None:
         paths = [

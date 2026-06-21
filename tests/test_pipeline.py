@@ -172,6 +172,45 @@ class PipelineTest(unittest.TestCase):
         self.assertEqual(result["state"], "verified")
         self.assertEqual(result["dispatched_deployments"][0]["id"], 9)
 
+    def test_follow_absorbs_a_ci_rerun_during_failure_grace(self) -> None:
+        sha = "a" * 40
+        failed = {
+            "id": 1,
+            "name": "CI",
+            "head_sha": sha,
+            "status": "completed",
+            "conclusion": "failure",
+            "event": "workflow_dispatch",
+        }
+        retrying = {**failed, "status": "in_progress", "conclusion": None}
+        passed = {**failed, "conclusion": "success"}
+        deploy = {
+            "id": 2,
+            "name": "Deploy",
+            "head_sha": sha,
+            "status": "completed",
+            "conclusion": "success",
+        }
+        client = Mock()
+        client.config = CONFIG
+        client.base_sha.return_value = sha
+        client.workflow_runs.side_effect = [
+            [failed],
+            [retrying],
+            [passed, deploy],
+        ]
+
+        with (
+            patch("agent_merge_queue.pipeline.time.sleep"),
+            patch(
+                "agent_merge_queue.pipeline.time.monotonic",
+                side_effect=[0, 1, 2],
+            ),
+        ):
+            result = follow_release(client, timeout_seconds=10, poll_seconds=1)
+
+        self.assertEqual(result["state"], "verified")
+
     def test_follow_switches_to_newer_cumulative_main(self) -> None:
         old = "a" * 40
         new = "b" * 40

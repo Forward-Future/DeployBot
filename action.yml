@@ -8,7 +8,7 @@ inputs:
   follow:
     description: Follow cumulative main through CI and deployment
     required: false
-    default: "false"
+    default: "true"
   dispatch_ci:
     description: Dispatch configured CI after a merge made with github.token
     required: false

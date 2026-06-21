@@ -101,13 +101,45 @@ def diagnose(
             )
             return rows
         repo = str(value.get("nameWithOwner") or "")
-    code, _, detail = _json("repo", "view", repo, "--json", "nameWithOwner", cwd=root)
+    code, repository, detail = _json(
+        "repo",
+        "view",
+        repo,
+        "--json",
+        "nameWithOwner,hasIssuesEnabled",
+        cwd=root,
+    )
     if code:
         rows.append(row("repository", "fail", detail, "Check repository access."))
         return rows
     rows.append(row("repository", "ok", f"Can read {repo}"))
     if config is None:
         return rows
+
+    issues_enabled = (repository or {}).get("hasIssuesEnabled")
+    issues_status = "ok" if issues_enabled is True else "fail"
+    if issues_enabled is None:
+        issues_status = "warn"
+    rows.append(
+        row(
+            "issue-registry",
+            issues_status,
+            (
+                "GitHub Issues is enabled for durable DeployBot metadata"
+                if issues_enabled is True
+                else (
+                    "GitHub Issues is disabled"
+                    if issues_enabled is False
+                    else "Could not confirm whether GitHub Issues is enabled"
+                )
+            ),
+            (
+                None
+                if issues_enabled is True
+                else "Enable Issues before recording deploy intent or pipeline state."
+            ),
+        )
+    )
 
     code, workflows, detail = _json(
         "workflow", "list", "--repo", repo, "--json", "name,path,state", cwd=root
@@ -133,6 +165,44 @@ def diagnose(
                 else "Install examples/github-workflow.yml on the default branch.",
             )
         )
+
+    if (
+        config.integration.mode in {"overlap", "all"}
+        and "github-actions[bot]" in config.coordinator_actors
+    ):
+        code, workflow_permissions, detail = _json(
+            "api", f"repos/{repo}/actions/permissions/workflow", cwd=root
+        )
+        if code:
+            rows.append(
+                row(
+                    "actions-integration-prs",
+                    "warn",
+                    detail or "Could not read GitHub Actions workflow permissions",
+                    "Confirm Actions may create integration pull requests.",
+                )
+            )
+        else:
+            allowed = bool(
+                (workflow_permissions or {}).get("can_approve_pull_request_reviews")
+            )
+            rows.append(
+                row(
+                    "actions-integration-prs",
+                    "ok" if allowed else "fail",
+                    (
+                        "GitHub Actions may create integration pull requests"
+                        if allowed
+                        else "GitHub Actions cannot create integration pull requests"
+                    ),
+                    (
+                        None
+                        if allowed
+                        else "Enable Settings > Actions > General > Allow GitHub "
+                        "Actions to create and approve pull requests."
+                    ),
+                )
+            )
 
     code, labels, detail = _json(
         "label", "list", "--repo", repo, "--limit", "1000", "--json", "name", cwd=root
