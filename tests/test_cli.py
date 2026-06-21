@@ -254,6 +254,41 @@ class QueueCoreTest(unittest.TestCase):
             )
         )
 
+    def test_waiting_promotion_defers_changed_file_fetch(self) -> None:
+        client = object.__new__(GitHub)
+        client.config = CONFIG
+        client.repository = "example/repo"
+        client.trusted_logins = {"trusted"}
+        client.coordinator_logins = {"trusted"}
+        client.comments = Mock(return_value=[])
+        client.changed_paths = Mock(return_value=(["a.py"], []))
+        client._json = Mock(
+            return_value={
+                "baseRefName": "main",
+                "body": "",
+                "headRefOid": "a" * 40,
+                "isDraft": False,
+                "labels": [{"name": "deploy-requested"}],
+                "mergeStateStatus": "CLEAN",
+                "mergeable": "MERGEABLE",
+                "number": 1,
+                "state": "OPEN",
+                "statusCheckRollup": [],
+                "title": "Waiting",
+                "url": "https://example.test/1",
+            }
+        )
+
+        value = client.snapshot(
+            1,
+            require_marker=False,
+            allow_blocked_label=True,
+            defer_paths_until_ready=True,
+        )
+
+        self.assertEqual(value.state, "waiting")
+        client.changed_paths.assert_not_called()
+
     def test_required_checks_do_not_accept_skipped(self) -> None:
         states = check_states(
             [

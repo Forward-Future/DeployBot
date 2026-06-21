@@ -173,6 +173,7 @@ ci_workflows = ["CI"]
 deploy_workflows = ["Deploy"]
 batch_settle_seconds = 15
 ci_failure_grace_seconds = 90
+promotion_workers = 4
 ready_to_merge_target_minutes = 15
 merge_to_live_target_minutes = 10
 auto_promote = true

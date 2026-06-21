@@ -12,6 +12,7 @@ import shutil
 import subprocess
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -1245,6 +1246,31 @@ class GitHub:
             f"repos/{self.repository}/pulls/{number}/files?per_page=100"
         )
 
+    def changed_paths(self, number: int) -> tuple[list[str], list[str]]:
+        source_paths: list[str] = []
+        generated_paths: list[str] = []
+        for value in self.files(number):
+            path = str(value.get("filename") or "")
+            if not path:
+                continue
+            if path in self.config.generated_paths:
+                generated_paths.append(path)
+                source_paths.append(path)
+                continue
+            target = (
+                generated_paths
+                if generated_only_change(
+                    path,
+                    value.get("patch"),
+                    generated_paths=self.config.generated_paths,
+                    generated_version_paths=self.config.generated_version_paths,
+                    asset_version_pattern=self.config.asset_version_pattern,
+                )
+                else source_paths
+            )
+            target.append(path)
+        return source_paths, generated_paths
+
     def review_threads(self, number: int) -> list[dict[str, Any]]:
         data = self._json(
             "api",
@@ -1280,6 +1306,7 @@ class GitHub:
         known_comments: list[dict[str, Any]] | None = None,
         known_source_paths: list[str] | None = None,
         known_generated_paths: list[str] | None = None,
+        defer_paths_until_ready: bool = False,
     ) -> QueueEntry:
         fields = ",".join(
             (
@@ -1321,29 +1348,11 @@ class GitHub:
         checks = check_states(pull.get("statusCheckRollup") or [])
         source_paths = list(known_source_paths or [])
         generated_paths = list(known_generated_paths or [])
-        if known_source_paths is None or known_generated_paths is None:
-            source_paths = []
-            generated_paths = []
-            for value in self.files(number):
-                path = str(value.get("filename") or "")
-                if not path:
-                    continue
-                if path in self.config.generated_paths:
-                    generated_paths.append(path)
-                    source_paths.append(path)
-                    continue
-                target = (
-                    generated_paths
-                    if generated_only_change(
-                        path,
-                        value.get("patch"),
-                        generated_paths=self.config.generated_paths,
-                        generated_version_paths=self.config.generated_version_paths,
-                        asset_version_pattern=self.config.asset_version_pattern,
-                    )
-                    else source_paths
-                )
-                target.append(path)
+        paths_are_known = (
+            known_source_paths is not None and known_generated_paths is not None
+        )
+        if not paths_are_known and not defer_paths_until_ready:
+            source_paths, generated_paths = self.changed_paths(number)
 
         body = str(pull.get("body") or "")
         entry = QueueEntry(
@@ -1385,6 +1394,8 @@ class GitHub:
             require_marker=require_marker,
             allow_blocked_label=allow_blocked_label,
         )
+        if not paths_are_known and defer_paths_until_ready and entry.state == "ready":
+            entry.source_paths, entry.generated_paths = self.changed_paths(number)
         return entry
 
     def queued_numbers(self) -> list[int]:
@@ -1969,49 +1980,54 @@ def command_promote(
     waiting: list[dict[str, Any]] = []
     blocked: list[dict[str, Any]] = []
     integration_sources = client.active_integration_sources()
-    for number in client.intent_numbers():
+
+    def evaluate(
+        number: int,
+    ) -> tuple[str, dict[str, Any] | None, QueueEntry | None]:
         if number in integration_sources:
-            waiting.append(
-                {"number": number, "reasons": ["cumulative integration PR is active"]}
+            return (
+                "waiting",
+                {"number": number, "reasons": ["cumulative integration PR is active"]},
+                None,
             )
-            continue
         comments = client.comments(number)
         intent = latest_intent(comments, client.trusted_logins)
         if not intent or intent.get("state") != "requested":
-            continue
+            return "skip", None, None
         entry = client.snapshot(
             number,
             require_marker=False,
             allow_blocked_label=True,
             known_comments=comments,
+            defer_paths_until_ready=True,
         )
-        if captured_entries is not None:
-            captured_entries.append(entry)
         if (
             client.config.pipeline.intent_scope == "head"
             and intent.get("requested_head") != entry.head_sha
         ):
-            waiting.append(
+            return (
+                "waiting",
                 {
                     "number": number,
                     "reasons": [
                         "deploy intent is bound to an older head; the trusted source "
                         "agent must run deploybot refresh-request"
                     ],
-                }
+                },
+                entry,
             )
-            continue
         if client.config.blocked_label in entry.labels:
-            waiting.append(
+            return (
+                "waiting",
                 {
                     "number": number,
                     "reasons": [
                         "repair is blocked; the trusted source agent must run "
                         "deploybot resume after fresh gates pass"
                     ],
-                }
+                },
+                entry,
             )
-            continue
         if entry.state == "ready":
             changed = queue_from_intent(
                 client,
@@ -2021,13 +2037,33 @@ def command_promote(
                 labels=set(entry.labels),
             )
             if changed:
-                promoted.append(number)
-        elif entry.state == "blocked":
+                return "promoted", {"number": number}, entry
+            return "ready", None, entry
+        if entry.state == "blocked":
             reason = "; ".join(entry.reasons or ["blocked"])
             record_repair(client, entry, intent, reason)
-            blocked.append({"number": number, "reason": reason})
-        else:
-            waiting.append({"number": number, "reasons": entry.reasons or []})
+            return "blocked", {"number": number, "reason": reason}, entry
+        return (
+            "waiting",
+            {"number": number, "reasons": entry.reasons or []},
+            entry,
+        )
+
+    numbers = sorted(client.intent_numbers())
+    if numbers:
+        with ThreadPoolExecutor(
+            max_workers=min(client.config.pipeline.promotion_workers, len(numbers))
+        ) as executor:
+            outcomes = executor.map(evaluate, numbers)
+            for state, payload, entry in outcomes:
+                if captured_entries is not None and entry is not None:
+                    captured_entries.append(entry)
+                if state == "promoted" and payload is not None:
+                    promoted.append(int(payload["number"]))
+                elif state == "blocked" and payload is not None:
+                    blocked.append(payload)
+                elif state == "waiting" and payload is not None:
+                    waiting.append(payload)
     result = {"promoted": promoted, "waiting": waiting, "blocked": blocked}
     if emit:
         print(json.dumps(result, indent=2, sort_keys=True))
