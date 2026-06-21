@@ -15,7 +15,7 @@ Install the reviewed `v0.2.10` source commit directly from GitHub:
 
 ```bash
 python3 -m pip install \
-  'deploybot-merge-queue[mcp] @ git+https://github.com/Forward-Future/DeployBot.git@1d7d6c6a60eb5cf3e6a285240406cbdaa54fe9a8'
+  'deploybot-merge-queue[mcp] @ git+https://github.com/Forward-Future/DeployBot.git@aaae80acc496a21c825d674289136365e0bc6578'
 deploybot init
 ```
 
@@ -95,7 +95,7 @@ worker can dispatch deployment when GitHub suppresses the `workflow_run` event
 for token-dispatched CI. Pin the Action to the full reviewed release commit:
 
 ```yaml
-- uses: Forward-Future/DeployBot@1d7d6c6a60eb5cf3e6a285240406cbdaa54fe9a8
+- uses: Forward-Future/DeployBot@aaae80acc496a21c825d674289136365e0bc6578
 ```
 
 The Action uses GitHub's built-in workflow token. GitHub intentionally does not
