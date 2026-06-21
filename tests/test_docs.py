@@ -130,6 +130,7 @@ class DocumentationTest(unittest.TestCase):
                 "batch_settle_seconds",
                 "ci_failure_grace_seconds",
                 "promotion_workers",
+                "repair_hold_minutes",
                 "ready_to_merge_target_minutes",
                 "merge_to_live_target_minutes",
                 "auto_promote",
@@ -177,6 +178,18 @@ class DocumentationTest(unittest.TestCase):
         for name in names:
             with self.subTest(name=name):
                 self.assertIn(f"`{name}`", reference)
+
+        for match in re.finditer(
+            r"^  (?P<name>[a-z][a-z0-9_]*):\n(?P<body>(?:    .*\n)+)",
+            inputs,
+            re.MULTILINE,
+        ):
+            default = re.search(r"^    default: (.+)$", match.group("body"), re.MULTILINE)
+            if default:
+                self.assertIn(
+                    f"| `{match.group('name')}` | `{default.group(1)}` |",
+                    reference,
+                )
 
     def test_reference_version_matches_package(self) -> None:
         reference = REFERENCE.read_text(encoding="utf-8")

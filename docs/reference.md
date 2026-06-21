@@ -1,7 +1,7 @@
 # DeployBot reference
 
 This reference describes the CLI, MCP server, policy file, and GitHub Action in
-DeployBot v0.2.9. GitHub labels and authenticated comments are the durable state;
+DeployBot v0.2.10. GitHub labels and authenticated comments are the durable state;
 the CLI and MCP tools are two interfaces to the same operations.
 
 ## CLI
@@ -164,6 +164,7 @@ Provider fields are:
 | `batch_settle_seconds` | Non-negative window for coalescing near-ready deploy requests before freezing a batch. Default: 15. |
 | `ci_failure_grace_seconds` | Non-negative window for an exact-main CI retry to replace a failed attempt before the release fails. Default: 90. |
 | `promotion_workers` | Positive maximum number of deploy requests promoted concurrently. Default: 4. |
+| `repair_hold_minutes` | Positive maximum time that a genuine repair may hold overlapping ready work without becoming merge-eligible. Default: 60. |
 | `ready_to_merge_target_minutes` | Positive request-to-ready and queued-to-merge timing target; default 15. |
 | `merge_to_live_target_minutes` | Positive timing target; default 10. |
 | `auto_promote` | Default `true`. |
@@ -190,7 +191,7 @@ The composite Action runs `deploybot react` from the checked-out default branch.
 | Input | Default | Purpose |
 | --- | --- | --- |
 | `config` | `.mergequeue.toml` | Repository-relative policy path. |
-| `follow` | `"false"` | Add `--follow` to the event worker. |
+| `follow` | `"true"` | Add `--follow` to the event worker. |
 | `dispatch_ci` | `"true"` | Dispatch configured CI after a merge made with `github.token`. |
 | `timeout` | `"1800"` | Release-follow timeout in seconds. |
 

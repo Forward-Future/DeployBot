@@ -71,6 +71,10 @@ resolution. Return the repair packet to its source thread, then call `resume`
 after its new exact head passes. Finish with `follow_release`, following newer
 cumulative base heads until CI, deployment, and configured health checks verify.
 
+Genuine repair blocks may hold overlapping ready work for the configured bounded
+repair window, but they remain merge-ineligible until the trusted source agent
+resumes the freshly reviewed exact head.
+
 Use `diagnose`/`deploybot doctor` for setup drift and `delivery_metrics` for p50,
 p95, and slow-stage evidence. A failed cumulative CI or deployment pauses the
 controller; only a designated coordinator may unpause after recovery.

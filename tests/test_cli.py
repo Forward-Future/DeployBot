@@ -52,6 +52,8 @@ from agent_merge_queue.cli import (
     queue_from_intent,
     queue_timestamp,
     reconcile_externally_merged_threads,
+    record_repair,
+    repair_overlap_hold_active,
     reusable_batch,
     settle_integration_checks,
     should_settle_batch,
@@ -427,6 +429,132 @@ class QueueCoreTest(unittest.TestCase):
 
         self.assertEqual(holds, {1: [3]})
         client.changed_paths.assert_called_once_with(3)
+
+    def test_overlap_mode_holds_ready_peer_for_bounded_genuine_repair(
+        self,
+    ) -> None:
+        config = parse_config(
+            {
+                "queue": {"required_checks": ["CI"], "trusted_actors": ["trusted"]},
+                "integration": {"mode": "overlap"},
+            }
+        )
+        ready = entry(1, "shared.py")
+        repairing = entry(2, state="blocked")
+        repairing.labels = ["deploy-requested", "merge-queue-blocked"]
+        repairing.repair_overlap_hold = True
+        client = Mock()
+        client.config = config
+        client.coordinator_logins = {"coordinator"}
+        client.changed_paths.return_value = (["shared.py"], [])
+        client.comments.return_value = []
+
+        self.assertTrue(should_settle_batch(client, [ready, repairing]))
+        self.assertEqual(
+            near_ready_overlap_holds(client, [ready, repairing]),
+            {1: [2]},
+        )
+
+    def test_repair_overlap_hold_is_bounded_and_intent_scoped(self) -> None:
+        value = entry(7, state="blocked")
+        value.labels = ["deploy-requested", "merge-queue-blocked"]
+        intent = {"intent_id": "intent-7"}
+        repair = {
+            "created_at": "2026-06-21T12:00:00Z",
+            "head_sha": value.head_sha,
+            "intent_id": "intent-7",
+            "pull_request": 7,
+            "reason": "pull request conflicts with main",
+        }
+        client = Mock()
+        client.config = parse_config(
+            {
+                "queue": {"required_checks": ["CI"], "trusted_actors": ["trusted"]},
+                "pipeline": {"repair_hold_minutes": 60},
+            }
+        )
+
+        self.assertTrue(
+            repair_overlap_hold_active(
+                client,
+                value,
+                intent,
+                repair,
+                now="2026-06-21T12:59:59Z",
+            )
+        )
+        self.assertFalse(
+            repair_overlap_hold_active(
+                client,
+                value,
+                intent,
+                repair,
+                now="2026-06-21T13:00:01Z",
+            )
+        )
+        self.assertFalse(
+            repair_overlap_hold_active(
+                client,
+                value,
+                {"intent_id": "intent-new"},
+                repair,
+                now="2026-06-21T12:30:00Z",
+            )
+        )
+        renewed = {
+            **repair,
+            "created_at": "2026-06-21T12:50:00Z",
+            "hold_started_at": "2026-06-21T11:45:00Z",
+        }
+        self.assertFalse(
+            repair_overlap_hold_active(
+                client,
+                value,
+                intent,
+                renewed,
+                now="2026-06-21T12:50:01Z",
+            )
+        )
+
+    @patch("agent_merge_queue.cli.utc_now", return_value="2026-06-21T13:00:00Z")
+    def test_record_repair_does_not_reuse_marker_from_previous_intent(
+        self,
+        _utc_now: Mock,
+    ) -> None:
+        value = entry(7, state="blocked")
+        previous = {
+            "created_at": "2026-06-21T12:00:00Z",
+            "head_sha": value.head_sha,
+            "hold_started_at": "2026-06-21T12:00:00Z",
+            "intent_id": "intent-old",
+            "pull_request": 7,
+            "reason": "pull request conflicts with main",
+        }
+        client = Mock()
+        client.config = CONFIG
+        client.repository = "example/repo"
+        client.coordinator_logins = {"coordinator"}
+        client.comments.return_value = [
+            {
+                "body": repair_body(previous),
+                "created_at": previous["created_at"],
+                "user": {"login": "coordinator"},
+            }
+        ]
+        client.base_sha.return_value = "b" * 40
+        client.labels.return_value = []
+
+        repair = record_repair(
+            client,
+            value,
+            {"intent_id": "intent-new"},
+            str(previous["reason"]),
+        )
+
+        self.assertEqual(repair["intent_id"], "intent-new")
+        self.assertEqual(repair["hold_started_at"], "2026-06-21T13:00:00Z")
+        self.assertIn("merge-queue-blocked", value.labels)
+        client.comment.assert_called_once_with(7, repair_body(repair))
 
     def test_reconciles_an_externally_merged_requested_thread(self) -> None:
         head_sha = "a" * 40
@@ -1178,7 +1306,6 @@ class QueueCoreTest(unittest.TestCase):
         client.merge.assert_called_once_with(
             1,
             value.head_sha,
-            authorization_entry=value,
         )
 
     def test_frozen_merge_accepts_the_same_head_already_integrated_externally(
@@ -2141,25 +2268,6 @@ class QueueCoreTest(unittest.TestCase):
             client.merge(1, value.head_sha)
         self.assertEqual(client._json.call_count, 1)
 
-    def test_prevalidated_merge_avoids_duplicate_authorization_reads(self) -> None:
-        value = entry(1)
-        client = object.__new__(GitHub)
-        client.config = CONFIG
-        client.repository = "example/repo"
-        client.trusted_logins = {"trusted"}
-        client._json = Mock(return_value={"merged": True, "sha": "m" * 40})
-        client.comments = Mock()
-
-        result = client.merge(
-            1,
-            value.head_sha,
-            authorization_entry=value,
-        )
-
-        self.assertEqual(result, "m" * 40)
-        client.comments.assert_not_called()
-        self.assertEqual(client._json.call_count, 1)
-
     def test_final_integration_merge_requires_current_exact_head_intent(self) -> None:
         integration_head = "f" * 40
         source_head = "a" * 40
@@ -2405,6 +2513,52 @@ class QueueCoreTest(unittest.TestCase):
         self.assertIn("deploybot resume", result["waiting"][0]["reasons"][0])
         client.add_label.assert_not_called()
 
+    def test_promote_does_not_hold_resumed_repair_against_itself(self) -> None:
+        ready = entry(1)
+        ready.labels = ["deploy-requested", "merge-queue"]
+        intent_comment = {
+            "id": 1,
+            "created_at": "2026-06-20T00:00:00Z",
+            "user": {"login": "trusted"},
+            "body": intent_body(
+                intent_id="intent-1",
+                state="requested",
+                requested_at="2026-06-20T00:00:00Z",
+                requested_head=ready.head_sha,
+            ),
+        }
+        repair_comment = {
+            "id": 2,
+            "created_at": "2026-06-20T00:01:00Z",
+            "user": {"login": "coordinator"},
+            "body": repair_body(
+                {
+                    "created_at": "2026-06-20T00:01:00Z",
+                    "head_sha": ready.head_sha,
+                    "hold_started_at": "2026-06-20T00:01:00Z",
+                    "intent_id": "intent-1",
+                    "pull_request": 1,
+                    "reason": "pull request conflicts with main",
+                }
+            ),
+        }
+        client = Mock()
+        client.config = CONFIG
+        client.repository = "example/repo"
+        client.trusted_logins = {"trusted"}
+        client.coordinator_logins = {"coordinator"}
+        client.intent_numbers.return_value = [1]
+        client.active_integration_sources.return_value = set()
+        client.comments.return_value = [intent_comment, repair_comment]
+        client.snapshot.return_value = ready
+
+        captured: list[QueueEntry] = []
+        with redirect_stdout(io.StringIO()):
+            command_promote(client, captured_entries=captured)
+
+        self.assertFalse(captured[0].repair_overlap_hold)
+        self.assertEqual(near_ready_overlap_holds(client, captured), {})
+
     def test_promote_clears_a_transitional_draft_block(self) -> None:
         ready = entry(1)
         ready.labels = ["deploy-requested", "merge-queue-blocked"]
@@ -2478,12 +2632,14 @@ class QueueCoreTest(unittest.TestCase):
         client.labels.return_value = {"deploy-requested"}
         client.base_sha.return_value = "b" * 40
 
+        captured: list[QueueEntry] = []
         with redirect_stdout(io.StringIO()):
-            result = command_promote(client)
+            result = command_promote(client, captured_entries=captured)
 
         self.assertEqual(result["promoted"], [])
         self.assertEqual(result["blocked"][0]["number"], 1)
         self.assertIn("older head", result["blocked"][0]["reason"])
+        self.assertTrue(captured[0].repair_overlap_hold)
         client.add_label.assert_called_with(1, "merge-queue-blocked")
         self.assertEqual(client.record_thread.call_args.args[0].phase, "blocked")
 

@@ -43,6 +43,10 @@ fresh checks and review, call `resume_pull_request` once. If policy requests an
 integration PR, let DeployBot scaffold it, resolve source once, run tests once,
 and obtain one final review. Never hand-merge generated output.
 
+A genuine repair remains merge-ineligible, but DeployBot may temporarily hold
+overlapping ready work for the configured bounded repair window so concurrent
+merges do not repeatedly invalidate the replacement head.
+
 Finish with `follow_release`, tracking newer cumulative base heads through CI,
 deployment, and configured health checks. A failure pauses further merges until
 the coordinator verifies recovery and unpauses. Record exact heads, review
