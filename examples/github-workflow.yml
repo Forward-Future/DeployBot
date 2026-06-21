@@ -55,5 +55,5 @@ jobs:
         with:
           ref: ${{ github.event.repository.default_branch }}
           persist-credentials: false
-      # v0.2.5 implementation; keep the full commit for privileged workflows.
-      - uses: Forward-Future/DeployBot@94fe042a58c731343c8bbd73d0bdfcb38a55866f
+      # v0.2.6 implementation; keep the full commit for privileged workflows.
+      - uses: Forward-Future/DeployBot@a0e2c833282e63bf5db4339f99773aa9ba2f0c82
