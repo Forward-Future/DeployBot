@@ -1191,6 +1191,37 @@ class QueueCoreTest(unittest.TestCase):
         client.dispatch_ci_workflows.assert_called_once_with()
         self.assertEqual(result["dispatched_ci"], [{"id": 7, "name": "CI"}])
 
+    def test_reactor_follows_release_without_a_new_merge(self) -> None:
+        client = Mock()
+        client.config = CONFIG
+        client.pipeline_control.return_value = {"state": "running"}
+        empty = FreezeResult(None, [], [], [], [])
+        release = {"state": "verified", "main_sha": "a" * 40}
+        with (
+            patch("agent_merge_queue.cli.promote_integrations", return_value=[]),
+            patch("agent_merge_queue.cli.command_promote", return_value={}),
+            patch("agent_merge_queue.cli.freeze_queue", return_value=empty),
+            patch(
+                "agent_merge_queue.cli.command_drain",
+                return_value={"merged": []},
+            ),
+            patch(
+                "agent_merge_queue.cli.command_follow",
+                return_value=release,
+            ) as follow_release,
+            redirect_stdout(io.StringIO()),
+        ):
+            result = command_react(client, follow=True, timeout_seconds=10)
+
+        follow_release.assert_called_once_with(
+            client,
+            timeout_seconds=10,
+            poll_seconds=10,
+            json_output=False,
+            emit=False,
+        )
+        self.assertEqual(result["release"], release)
+
     def test_reactor_pauses_when_post_merge_ci_dispatch_fails(self) -> None:
         client = Mock()
         client.config = CONFIG
