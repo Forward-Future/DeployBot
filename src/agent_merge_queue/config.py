@@ -127,6 +127,7 @@ merge_to_live_target_minutes = 10
 auto_promote = true
 intent_scope = "head"
 pause_on_failure = true
+# Receives best-effort events, including retryable thread-deployed messages.
 # webhook_url_env = "DEPLOYBOT_WEBHOOK_URL"
 
 [integration]

@@ -14,6 +14,7 @@ INTENT_PREFIX = "deploybot-intent:v1"
 REPAIR_PREFIX = "deploybot-repair:v1"
 CONTROL_PREFIX = "deploybot-control:v1"
 INTEGRATION_PREFIX = "deploybot-integration:v1"
+NOTIFICATION_PREFIX = "deploybot-notification:v1"
 
 THREAD_PHASES = {
     "working",
@@ -23,6 +24,7 @@ THREAD_PHASES = {
     "deploy-requested",
     "queued",
     "merged",
+    "deployed",
     "blocked",
     "completed",
     "abandoned",
@@ -61,6 +63,9 @@ REPAIR_MARKER = _marker(REPAIR_PREFIX, "Recorded DeployBot repair handoff.")
 CONTROL_MARKER = _marker(CONTROL_PREFIX, "Recorded DeployBot pipeline control.")
 INTEGRATION_MARKER = _marker(
     INTEGRATION_PREFIX, "Recorded DeployBot integration pull request."
+)
+NOTIFICATION_MARKER = _marker(
+    NOTIFICATION_PREFIX, "Recorded DeployBot thread notification."
 )
 
 
@@ -117,9 +122,40 @@ class ThreadRecord:
     branch: str | None = None
     pull_request: int | None = None
     url: str | None = None
+    merge_sha: str | None = None
+    deployed_sha: str | None = None
+    ci_url: str | None = None
+    deployment_url: str | None = None
 
     def as_dict(self) -> dict[str, Any]:
         return asdict(self)
+
+
+@dataclass(frozen=True)
+class DeploymentNotificationRecord:
+    notification_id: str
+    provider: str
+    thread_id: str
+    state: str
+    updated_at: str
+    repository: str
+    merge_sha: str
+    main_sha: str | None = None
+    message: str | None = None
+    pull_request: int | None = None
+    thread_url: str | None = None
+    ci_url: str | None = None
+    deployment_url: str | None = None
+
+    def as_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+    def payload(self) -> dict[str, Any]:
+        return {
+            key: value
+            for key, value in self.as_dict().items()
+            if key not in {"state", "updated_at"} and value is not None
+        }
 
 
 def thread_record_body(record: ThreadRecord) -> str:
@@ -131,15 +167,122 @@ def thread_record_body(record: ThreadRecord) -> str:
     return marker_body(THREAD_PREFIX, payload, "Recorded DeployBot thread metadata.")
 
 
+def deployment_notification_body(record: DeploymentNotificationRecord) -> str:
+    if record.state not in {"awaiting-verification", "pending", "delivered"}:
+        raise ValueError(f"unsupported notification state: {record.state}")
+    required = (
+        record.notification_id,
+        record.provider,
+        record.thread_id,
+        record.repository,
+        record.merge_sha,
+    )
+    if any(not value.strip() for value in required):
+        raise ValueError("deployment notification fields are required")
+    if record.state != "awaiting-verification" and (
+        not record.main_sha or not record.message
+    ):
+        raise ValueError("delivered notification content is required")
+    payload = {"schema": 1, **record.as_dict()}
+    return marker_body(
+        NOTIFICATION_PREFIX,
+        payload,
+        "Recorded DeployBot thread notification.",
+    )
+
+
+def latest_deployment_notifications(
+    comments: Iterable[dict[str, Any]],
+    trusted_logins: Iterable[str],
+    *,
+    include_delivered: bool = False,
+) -> list[DeploymentNotificationRecord]:
+    trusted = {value.lower() for value in trusted_logins}
+    latest: dict[str, tuple[tuple[str, int, int], DeploymentNotificationRecord]] = {}
+    for index, comment in enumerate(comments):
+        if comment_login(comment) not in trusted:
+            continue
+        value = _payload(str(comment.get("body") or ""), NOTIFICATION_MARKER)
+        if value is None or value.get("state") not in {
+            "awaiting-verification",
+            "pending",
+            "delivered",
+        }:
+            continue
+        try:
+            record = DeploymentNotificationRecord(
+                notification_id=str(value["notification_id"]),
+                provider=str(value["provider"]),
+                thread_id=str(value["thread_id"]),
+                state=str(value["state"]),
+                updated_at=str(value["updated_at"]),
+                repository=str(value["repository"]),
+                merge_sha=str(value["merge_sha"]),
+                main_sha=str(value["main_sha"]) if value.get("main_sha") else None,
+                message=str(value["message"]) if value.get("message") else None,
+                pull_request=(
+                    int(value["pull_request"])
+                    if value.get("pull_request") is not None
+                    else None
+                ),
+                thread_url=(
+                    str(value["thread_url"]) if value.get("thread_url") else None
+                ),
+                ci_url=str(value["ci_url"]) if value.get("ci_url") else None,
+                deployment_url=(
+                    str(value["deployment_url"])
+                    if value.get("deployment_url")
+                    else None
+                ),
+            )
+        except (KeyError, TypeError, ValueError):
+            continue
+        required = (
+            record.notification_id,
+            record.provider,
+            record.thread_id,
+            record.repository,
+            record.merge_sha,
+        )
+        content_missing = record.state != "awaiting-verification" and (
+            not record.main_sha or not record.message
+        )
+        if (
+            any(not item.strip() for item in required)
+            or content_missing
+            or parse_time(record.updated_at) is None
+        ):
+            continue
+        candidate = (_comment_key(comment, index), record)
+        previous = latest.get(record.notification_id)
+        if previous is None:
+            latest[record.notification_id] = candidate
+        else:
+            ranks = {"awaiting-verification": 0, "pending": 1, "delivered": 2}
+            previous_rank = ranks[previous[1].state]
+            candidate_rank = ranks[record.state]
+            if candidate_rank > previous_rank or (
+                candidate_rank == previous_rank and candidate[0] > previous[0]
+            ):
+                latest[record.notification_id] = candidate
+    records = [record for _, record in latest.values()]
+    if not include_delivered:
+        records = [record for record in records if record.state == "pending"]
+    return sorted(records, key=lambda value: value.updated_at, reverse=True)
+
+
 def latest_thread_records(
     comments: Iterable[dict[str, Any]],
     trusted_logins: Iterable[str],
     *,
     active_hours: int,
+    include_terminal: bool = False,
     now: datetime | None = None,
 ) -> list[ThreadRecord]:
     trusted = {value.lower() for value in trusted_logins}
-    latest: dict[tuple[str, str], tuple[tuple[str, int, int], ThreadRecord]] = {}
+    candidates: dict[
+        tuple[str, str], list[tuple[tuple[str, int, int], ThreadRecord]]
+    ] = {}
     current = now or datetime.now(timezone.utc)
     for index, comment in enumerate(comments):
         if comment_login(comment) not in trusted:
@@ -161,6 +304,16 @@ def latest_thread_records(
                     else None
                 ),
                 url=str(value["url"]) if value.get("url") else None,
+                merge_sha=str(value["merge_sha"]) if value.get("merge_sha") else None,
+                deployed_sha=(
+                    str(value["deployed_sha"]) if value.get("deployed_sha") else None
+                ),
+                ci_url=str(value["ci_url"]) if value.get("ci_url") else None,
+                deployment_url=(
+                    str(value["deployment_url"])
+                    if value.get("deployment_url")
+                    else None
+                ),
             )
         except (KeyError, TypeError, ValueError):
             continue
@@ -169,8 +322,55 @@ def latest_thread_records(
             continue
         key = (record.provider.lower(), record.thread_id)
         candidate = (_comment_key(comment, index), record)
-        if key not in latest or candidate[0] > latest[key][0]:
-            latest[key] = candidate
+        candidates.setdefault(key, []).append(candidate)
+    latest: dict[tuple[str, str], tuple[tuple[str, int, int], ThreadRecord]] = {}
+    for key, values in candidates.items():
+        state: tuple[tuple[str, int, int], ThreadRecord] | None = None
+        for candidate in sorted(values, key=lambda item: item[0]):
+            record = candidate[1]
+            if record.phase == "deployed" and state:
+                current_record = state[1]
+                matches_current_merge = (
+                    bool(record.merge_sha)
+                    and current_record.phase in {"merged", "deployed"}
+                    and current_record.merge_sha == record.merge_sha
+                )
+                matches_legacy_merge = (
+                    current_record.phase == "merged"
+                    and not current_record.merge_sha
+                    and current_record.pull_request == record.pull_request
+                )
+                if not (matches_current_merge or matches_legacy_merge):
+                    # A newer source-thread state won the append race. Keep it
+                    # authoritative instead of applying this late transition.
+                    continue
+            if record.phase == "completed" and state:
+                current_record = state[1]
+                acknowledges_current_deployment = (
+                    bool(record.deployed_sha)
+                    and current_record.phase in {"deployed", "completed"}
+                    and current_record.deployed_sha == record.deployed_sha
+                )
+                acknowledges_current_merge = (
+                    bool(record.merge_sha)
+                    and current_record.phase == "merged"
+                    and current_record.merge_sha == record.merge_sha
+                )
+                if (
+                    current_record.phase == "deployed"
+                    and not acknowledges_current_deployment
+                ) or (
+                    record.deployed_sha
+                    and not (
+                        acknowledges_current_deployment or acknowledges_current_merge
+                    )
+                ):
+                    # An acknowledgement for an older deployment must not
+                    # overwrite a newer state appended during its API race.
+                    continue
+            state = candidate
+        if state is not None:
+            latest[key] = state
     terminal = {"completed", "abandoned"}
     result = []
     for _, record in latest.values():
@@ -178,7 +378,9 @@ def latest_thread_records(
         age_hours = (
             (current - timestamp).total_seconds() / 3600 if timestamp else 999999
         )
-        if record.phase not in terminal and age_hours <= active_hours:
+        if include_terminal or (
+            record.phase not in terminal and age_hours <= active_hours
+        ):
             result.append(record)
     return sorted(
         result, key=lambda value: (value.updated_at, value.provider), reverse=True

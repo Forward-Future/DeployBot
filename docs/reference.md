@@ -23,7 +23,7 @@ DeployBot resolves the pull request for the current branch.
 | `deploybot init [--force]` | Write a safe starter policy. Existing files are preserved unless `--force` is supplied. |
 | `deploybot ensure-labels` | Create or refresh the configured queue, blocked, intent, pause, and registry labels. |
 | `deploybot doctor [--json]` | Check authentication, policy, labels, actors, checks, workflows, and branch protection without changing repository state. |
-| `deploybot status [--json]` | Read active thread metadata, PR stages, deploy intent, queue state, exact-main CI, deployment, and pipeline control state. |
+| `deploybot status [--json]` | Read active thread metadata, pending native notifications, PR stages, deploy intent, queue state, exact-main CI, deployment, and pipeline control state. |
 | `deploybot plan [--json]` | Read the ordered queue, dependencies, blockers, and source-overlap groups. |
 | `deploybot inspect [PR] [--json]` | Evaluate one exact PR head without granting merge authority. |
 | `deploybot metrics [--limit N] [--json]` | Summarize p50, p95, and maximum delivery timings for recent merged PRs. The default limit is 25. |
@@ -36,7 +36,8 @@ batch marker.
 
 | Command | Purpose |
 | --- | --- |
-| `deploybot thread update --provider CLIENT --thread-id ID --phase PHASE [--title TEXT] [--branch NAME] [--pr NUMBER] [--url URL]` | Publish metadata-only thread state. Valid phases are `working`, `pr-draft`, `pr-review`, `ready`, `deploy-requested`, `queued`, `merged`, `blocked`, `completed`, and `abandoned`. |
+| `deploybot thread update --provider CLIENT --thread-id ID --phase PHASE [--title TEXT] [--branch NAME] [--pr NUMBER] [--url URL]` | Publish metadata-only thread state. Valid client-published phases are `working`, `pr-draft`, `pr-review`, `ready`, `deploy-requested`, `queued`, `merged`, `blocked`, `completed`, and `abandoned`; `deployed` is controller-owned. |
+| `deploybot thread acknowledge --provider CLIENT --thread-id ID --notification-id ID` | Mark the matching `deployed` notification `completed` only after its native-thread message is delivered. Repeated acknowledgement is safe; stale IDs are rejected. |
 | `deploybot request [PR] [--provider CLIENT] [--thread-id ID] [--thread-url URL]` | Record the user's durable deploy intent for the current exact head, even while gates are pending. |
 | `deploybot cancel-request [PR]` | Cancel an unmerged durable deploy request. |
 | `deploybot refresh-request [PR]` | Bind existing user intent to a freshly reviewed replacement head. |
@@ -97,6 +98,7 @@ arguments shown below are the tool-specific arguments.
 | `follow_release` | `follow --json` | optional `timeout_seconds` |
 | `delivery_metrics` | `metrics --json` | optional `limit` |
 | `update_agent_thread` | `thread update` | `provider`, `thread_id`, `phase`; optional `pull_request`, `title`, `branch`, `url` |
+| `acknowledge_thread_deployment` | `thread acknowledge` | `provider`, `thread_id`, `notification_id` |
 | `block_pull_request` | `block PR` | `pull_request`, `reason` |
 | `unblock_pull_request` | `unblock PR` | `pull_request` |
 | `resume_pull_request` | `resume PR` | `pull_request` |
@@ -156,7 +158,7 @@ Provider fields are:
 | `pause_label` | `"deploybot-paused"` |
 | `registry_label` | `"deploybot-registry"` |
 | `registry_title` | `"DeployBot delivery registry"` |
-| `thread_active_hours` | Positive integer; default 72. |
+| `thread_active_hours` | Positive integer; default 72. Notification obligations and pending messages use their own non-expiring outbox. |
 | `ci_workflows` | Workflow names followed as exact-main CI. Default: `["CI"]`. |
 | `deploy_workflows` | Deployment workflow names. Default: `["Deploy"]`. |
 | `batch_settle_seconds` | Non-negative window for coalescing near-ready deploy requests before freezing a batch. Default: 15. |
@@ -167,7 +169,7 @@ Provider fields are:
 | `auto_promote` | Default `true`. |
 | `intent_scope` | Currently must be `"head"`. |
 | `pause_on_failure` | Default `true`. |
-| `webhook_url_env` | Optional environment-variable name containing a best-effort event webhook URL. GitHub remains authoritative if notification fails. |
+| `webhook_url_env` | Optional environment-variable name containing a best-effort event webhook URL. It receives retryable `thread-deployed` payloads after exact-main verification. GitHub remains authoritative if notification fails. |
 | `verifications` | Optional array of post-deployment HTTP verification tables. Default: empty. |
 | `name` | Required health-check display name in each `pipeline.verifications` entry. |
 | `url` | Required URL checked after deployment in each `pipeline.verifications` entry. |
@@ -207,3 +209,11 @@ list aligned with `pipeline.ci_workflows`.
   webhook URL.
 - The composite Action maps `github.token` to `GH_TOKEN`; callers do not need to
   create a separate token when its documented permissions are sufficient.
+
+The `thread-deployed` event contains `notification_id`, `repository`,
+`provider`, `thread_id`, `main_sha`, and a user-facing `message`, plus available
+thread, pull-request, CI, and deployment URLs. Consumers must deduplicate on
+`notification_id`, deliver `message` into the native provider thread, and call
+`acknowledge_thread_deployment` only after that succeeds. Until acknowledgement,
+the independent outbox record remains `pending` even if thread lifecycle moves
+on, and later release followers can retry the same notification.
