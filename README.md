@@ -226,10 +226,10 @@ DeployBot does not treat a registry comment as user notification. If native
 delivery fails, an independent outbox entry stays visible under pending
 `notifications`, even if the source thread starts new work, and the same
 `notification_id` can be retried. When `pipeline.webhook_url_env` is configured,
-the provider-neutral webhook also receives the `thread-deployed` payload.
-Source adapters attach a native thread heartbeat before returning from an
-asynchronous deploy request, so the originating thread can retrieve, acknowledge,
-and display the final notification even when no interactive coordinator remains.
+the provider-neutral webhook also receives the `thread-deployed` payload and
+scheduled followers retry it. Without a configured webhook, pending receipts do
+not keep the release worker running; the source adapter's native thread heartbeat
+retrieves, acknowledges, and displays the final notification instead.
 
 ```toml
 [pipeline]

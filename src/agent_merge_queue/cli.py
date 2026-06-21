@@ -7,6 +7,7 @@ import argparse
 import fnmatch
 import hashlib
 import json
+import os
 import re
 import secrets
 import shutil
@@ -806,6 +807,7 @@ class GitHub:
             raise QueueError(f"invalid repository name: {self.repository}")
         self.owner, self.name = self.repository.split("/", 1)
         self._registry_issue_cache: int | None = None
+        self._registry_comments_cache: list[dict[str, Any]] | None = None
         self.trusted_logins = {
             self.owner if value == "@repository-owner" else value
             for value in self.config.trusted_actors
@@ -1341,7 +1343,7 @@ class GitHub:
         return canonical
 
     def issue_comment(self, number: int, body: str) -> None:
-        self._json(
+        created = self._json(
             "api",
             "--method",
             "POST",
@@ -1349,10 +1351,25 @@ class GitHub:
             "-f",
             f"body={body}",
         )
+        if number != getattr(self, "_registry_issue_cache", None):
+            return
+        cached = getattr(self, "_registry_comments_cache", None)
+        if cached is not None and isinstance(created, dict):
+            cached.append(created)
+        elif cached is not None:
+            # Tests and alternate GitHub adapters may not return the created
+            # comment. Force the next reader to refresh instead of serving a
+            # stale registry snapshot.
+            self._registry_comments_cache = None
 
     def registry_comments(self) -> list[dict[str, Any]]:
+        cached = getattr(self, "_registry_comments_cache", None)
+        if cached is not None:
+            return cached
         number = self.registry_issue_number(create=False)
-        return self.comments(number) if number is not None else []
+        comments = self.comments(number) if number is not None else []
+        self._registry_comments_cache = comments
+        return comments
 
     def record_thread(self, record: ThreadRecord) -> None:
         number = self.registry_issue_number(create=True)
@@ -4634,11 +4651,16 @@ def release_follow_needed(client: GitHub) -> bool:
         return current.get("latest_ci") is not None
     if current["state"] == "verified":
         # Verification can finish just before the original worker is replaced.
-        # Revisit it while a merge needs an outbox entry or a native-thread
-        # notification is still awaiting acknowledgement.
+        # Revisit it while a merge still needs an outbox entry. A pending
+        # native-thread receipt only needs coordinator retries when a webhook
+        # is actually configured; otherwise the source-thread heartbeat owns
+        # delivery and repeated scheduled followers cannot make progress.
         notifications = client.deployment_notifications(include_delivered=True)
+        webhook_env = client.config.pipeline.webhook_url_env
+        webhook_ready = bool(webhook_env and os.environ.get(webhook_env))
         has_open_notification = isinstance(notifications, list) and any(
-            value.get("state") in {"awaiting-verification", "pending"}
+            value.get("state") == "awaiting-verification"
+            or (value.get("state") == "pending" and webhook_ready)
             for value in notifications
         )
         return has_open_notification or any(
