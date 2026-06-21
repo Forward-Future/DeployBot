@@ -1192,11 +1192,25 @@ class QueueCoreTest(unittest.TestCase):
         self.assertEqual(result["dispatched_ci"], [{"id": 7, "name": "CI"}])
 
     def test_reactor_follows_release_without_a_new_merge(self) -> None:
+        sha = "a" * 40
         client = Mock()
         client.config = CONFIG
         client.pipeline_control.return_value = {"state": "running"}
+        client.base_sha.return_value = sha
+        client.workflow_runs.return_value = [
+            {
+                "id": 42,
+                "name": "CI",
+                "head_sha": sha,
+                "status": "completed",
+                "conclusion": "success",
+                "event": "workflow_dispatch",
+                "created_at": "2026-06-20T00:00:00Z",
+                "updated_at": "2026-06-20T00:01:00Z",
+            }
+        ]
         empty = FreezeResult(None, [], [], [], [])
-        release = {"state": "verified", "main_sha": "a" * 40}
+        release = {"state": "verified", "main_sha": sha}
         with (
             patch("agent_merge_queue.cli.promote_integrations", return_value=[]),
             patch("agent_merge_queue.cli.command_promote", return_value={}),
@@ -1221,6 +1235,66 @@ class QueueCoreTest(unittest.TestCase):
             emit=False,
         )
         self.assertEqual(result["release"], release)
+
+    def test_reactor_does_not_follow_idle_all_mode_integration_batch(self) -> None:
+        config = parse_config(
+            {
+                "queue": {
+                    "required_checks": ["CI"],
+                    "trusted_actors": ["trusted"],
+                    "coordinator_actors": ["coordinator"],
+                },
+                "integration": {"mode": "all"},
+            }
+        )
+        sha = "a" * 40
+        first = entry(1, "a.py")
+        second = entry(2, "b.py")
+        batch = new_batch([first, second], frozen_at="2026-06-20T00:00:00Z")
+        frozen = FreezeResult(batch, [first, second], [], [], [])
+        client = Mock()
+        client.config = config
+        client.coordinator_logins = {"coordinator"}
+        client.pipeline_control.return_value = {"state": "running"}
+        client.create_integration_pull_request.return_value = {"number": 99}
+        client.base_sha.return_value = sha
+        client.workflow_runs.return_value = [
+            {
+                "id": 42,
+                "name": "CI",
+                "head_sha": sha,
+                "status": "completed",
+                "conclusion": "success",
+                "event": "push",
+                "created_at": "2026-06-20T00:00:00Z",
+                "updated_at": "2026-06-20T00:01:00Z",
+            },
+            {
+                "id": 43,
+                "name": "Deploy",
+                "head_sha": sha,
+                "status": "completed",
+                "conclusion": "success",
+                "event": "workflow_run",
+                "created_at": "2026-06-20T00:01:00Z",
+                "updated_at": "2026-06-20T00:02:00Z",
+            },
+        ]
+        client.thread_records.return_value = []
+        with (
+            patch("agent_merge_queue.cli.promote_integrations", return_value=[]),
+            patch("agent_merge_queue.cli.command_promote", return_value={}),
+            patch("agent_merge_queue.cli.freeze_queue", return_value=frozen),
+            patch("agent_merge_queue.cli.command_drain") as drain,
+            patch("agent_merge_queue.cli.command_follow") as follow_release,
+            redirect_stdout(io.StringIO()),
+        ):
+            result = command_react(client, follow=True, timeout_seconds=10)
+
+        drain.assert_not_called()
+        follow_release.assert_not_called()
+        self.assertIsNone(result["release"])
+        self.assertEqual(result["integrations"], [{"number": 99}])
 
     def test_reactor_pauses_when_post_merge_ci_dispatch_fails(self) -> None:
         client = Mock()

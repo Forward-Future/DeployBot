@@ -2691,6 +2691,26 @@ def command_follow(
     return result
 
 
+def release_follow_needed(client: GitHub) -> bool:
+    current = release_state(
+        main_sha=client.base_sha(),
+        runs=client.workflow_runs(),
+        config=client.config.pipeline,
+    )
+    if current["state"] == "testing":
+        # A repository with no current main CI has no release to follow. An
+        # active or queued run is returned as latest_ci and should keep its
+        # release owner.
+        return current.get("latest_ci") is not None
+    if current["state"] == "verified":
+        # Verification can finish just before the original worker is replaced.
+        # Only revisit it when merged thread records still need completion.
+        return any(
+            record.get("phase") == "merged" for record in client.thread_records()
+        )
+    return True
+
+
 def command_react(
     client: GitHub,
     *,
@@ -2757,7 +2777,14 @@ def command_react(
                 )
             raise
     release: dict[str, Any] | None = None
-    if follow:
+    should_follow = bool(drained.get("merged"))
+    if follow and not should_follow:
+        # The worker that performed the merge may be replaced while waiting for
+        # CI. Let a later event take over only when a release actually remains;
+        # an idle all-mode integration batch must not occupy the coordinator for
+        # the full follow timeout.
+        should_follow = release_follow_needed(client)
+    if follow and should_follow:
         release = command_follow(
             client,
             timeout_seconds=timeout_seconds,
