@@ -1164,22 +1164,37 @@ class GitHub:
                 "If a merge conflict remains, an agent must resolve it without "
                 "dropping either side before marking this PR ready."
             )
-            pull = self._json(
-                "api",
-                "--method",
-                "POST",
-                f"repos/{self.repository}/pulls",
-                "-f",
-                f"title={self.config.integration.title_prefix}: {safe_id}",
-                "-f",
-                f"head={branch}",
-                "-f",
-                f"base={self.config.base_branch}",
-                "-f",
-                f"body={body}",
-                "-F",
-                f"draft={'true' if conflict else 'false'}",
-            )
+            try:
+                pull = self._json(
+                    "api",
+                    "--method",
+                    "POST",
+                    f"repos/{self.repository}/pulls",
+                    "-f",
+                    f"title={self.config.integration.title_prefix}: {safe_id}",
+                    "-f",
+                    f"head={branch}",
+                    "-f",
+                    f"base={self.config.base_branch}",
+                    "-f",
+                    f"body={body}",
+                    "-F",
+                    f"draft={'true' if conflict else 'false'}",
+                )
+            except QueueError:
+                # No durable integration marker can exist without its PR. The
+                # batch remains frozen for retry, so remove the private branch
+                # instead of leaving an orphan that can mask a clean replay.
+                try:
+                    self._run(
+                        "api",
+                        "--method",
+                        "DELETE",
+                        f"repos/{self.repository}/git/refs/heads/{branch}",
+                    )
+                except QueueError:
+                    pass
+                raise
         number = int(pull["number"])
         marker = {
             "base_sha": base_sha,
@@ -2359,13 +2374,43 @@ def freeze_queue(
         ]
     else:
         queued_numbers = set(client.queued_numbers()) - held_numbers
-        entries_by_number = {
+        known_by_number = {
             entry.number: entry
             for entry in known_entries
             if entry.number in queued_numbers
         }
+        entries_by_number = dict(known_by_number)
         for number in sorted(queued_numbers - entries_by_number.keys()):
             entries_by_number[number] = client.snapshot(number)
+
+        # Deferred path reads are safe while an intent is only waiting, but a
+        # frozen batch must persist a complete overlap graph. GitHub can report
+        # transient UNKNOWN mergeability for an already-queued PR; hydrate its
+        # paths here so a later retry cannot merge overlapping sources as if
+        # they were independent.
+        needs_paths = [
+            entry
+            for entry in known_by_number.values()
+            if not entry.source_paths and not entry.generated_paths
+        ]
+
+        def load_paths(entry: QueueEntry) -> tuple[int, list[str], list[str]]:
+            source_paths, generated_paths = client.changed_paths(entry.number)
+            return entry.number, source_paths, generated_paths
+
+        if needs_paths:
+            with ThreadPoolExecutor(
+                max_workers=min(
+                    client.config.pipeline.promotion_workers, len(needs_paths)
+                )
+            ) as executor:
+                for number, source_paths, generated_paths in executor.map(
+                    load_paths, needs_paths
+                ):
+                    entries_by_number[number].source_paths = sorted(set(source_paths))
+                    entries_by_number[number].generated_paths = sorted(
+                        set(generated_paths)
+                    )
         all_entries = sorted(
             entries_by_number.values(),
             key=lambda entry: (

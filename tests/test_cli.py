@@ -30,6 +30,7 @@ from agent_merge_queue.cli import (
     completed_batch_ids,
     entries_in_batch,
     effective_queue_marker,
+    freeze_queue,
     generated_only_change,
     latest_batch_marker,
     latest_marker,
@@ -683,6 +684,33 @@ class QueueCoreTest(unittest.TestCase):
 
         self.assertEqual(completed, {batch["batch_id"]})
         self.assertIsNone(active_batch([first], {1: batch}, completed))
+
+    def test_freeze_hydrates_paths_for_transiently_waiting_queued_entries(
+        self,
+    ) -> None:
+        first = entry(1, state="waiting")
+        second = entry(2, state="waiting")
+        client = Mock()
+        client.config = CONFIG
+        client.coordinator_logins = {"coordinator"}
+        client.queued_numbers.return_value = [1, 2]
+        client.changed_paths.side_effect = lambda _number: (["shared.py"], [])
+        client.comments.return_value = []
+
+        with patch(
+            "agent_merge_queue.cli.utc_now", return_value="2026-06-20T00:01:00Z"
+        ):
+            frozen = freeze_queue(client, known_entries=[first, second])
+
+        self.assertEqual(client.changed_paths.call_count, 2)
+        self.assertEqual(
+            frozen.overlap_groups,
+            [{"pull_requests": [1, 2], "source_paths": ["shared.py"]}],
+        )
+        self.assertEqual(
+            frozen.batch["source_paths"],
+            {"1": ["shared.py"], "2": ["shared.py"]},
+        )
 
     def test_queue_timestamp_preserves_refresh_but_resets_reenqueue(self) -> None:
         previous = {"queued_at": "2026-06-20T00:00:00Z"}
@@ -1420,6 +1448,46 @@ class QueueCoreTest(unittest.TestCase):
                 (2, "merge-queue"),
                 (2, "deploy-requested"),
             ],
+        )
+
+    def test_failed_integration_pr_creation_removes_its_orphan_branch(self) -> None:
+        first = entry(1, "shared.py")
+        second = entry(2, "shared.py")
+        batch = new_batch([first, second], frozen_at="2026-06-20T00:00:00Z")
+        client = object.__new__(GitHub)
+        client.config = parse_config(
+            {
+                "queue": {
+                    "required_checks": ["CI"],
+                    "trusted_actors": ["trusted"],
+                },
+                "integration": {"mode": "overlap"},
+            }
+        )
+        client.repository = "example/repo"
+        client.owner = "example"
+        client.name = "repo"
+        client.base_sha = Mock(return_value="b" * 40)
+        client._json = Mock(
+            side_effect=[
+                {},
+                {"sha": "1" * 40},
+                {"sha": "2" * 40},
+                [],
+                QueueError("GitHub Actions may not create pull requests"),
+            ]
+        )
+        client._run = Mock(return_value="")
+
+        with self.assertRaisesRegex(QueueError, "may not create"):
+            client.create_integration_pull_request(batch=batch, entries=[first, second])
+
+        branch = f"deploybot/integration/{batch['batch_id']}"
+        client._run.assert_called_once_with(
+            "api",
+            "--method",
+            "DELETE",
+            f"repos/example/repo/git/refs/heads/{branch}",
         )
 
     def test_reactor_uses_cumulative_pr_in_all_mode(self) -> None:
