@@ -5,11 +5,17 @@ description: Prepare, review, enqueue, and land GitHub pull requests through a p
 
 # Manage Merge Queue
 
-Read `.mergequeue.toml` and use the `deploybot` MCP tools. Keep changing
-PRs draft and make the final ready head immutable. Address valid feedback from
-the configured providers; do not assume a specific review service.
+Read `.mergequeue.toml` and use the `deploybot` MCP tools. Keep changing PRs
+draft and make the final ready head immutable. Address valid feedback from the
+configured providers; do not assume a specific review service.
 
-Only the user's exact `deploy` instruction authorizes enqueueing this thread's
-PR. The queue label wakes GitHub immediately. Never poll or merge an unlabeled
-PR. Drain independent ready work in order, skip blockers, honor dependencies,
-and route overlapping source through one integration PR.
+Only the user's exact `deploy` instruction authorizes `request_deployment` for
+this thread's PR. Include the stable Claude thread ID. If review fixes change
+the head, call `refresh_deployment_request` after fresh exact-head gates. Never
+poll or merge an unlabeled PR.
+
+Use `pipeline_status` and `react_to_delivery_event` for bursts. Skip blockers,
+honor dependencies, route overlap or cumulative validation through
+`create_integration_pull_request`, return repair packets to the source thread,
+and use `resume_pull_request` after fresh review. Finish with `follow_release`;
+a failed CI or deployment pauses the pipeline until verified recovery.

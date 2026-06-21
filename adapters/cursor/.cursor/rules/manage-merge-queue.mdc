@@ -7,7 +7,10 @@ Read `.mergequeue.toml` and use the `deploybot` MCP tools. Keep changing
 PRs draft and make the final ready head immutable. Address valid feedback from
 whatever review providers the repository configures.
 
-Only the user's exact `deploy` instruction authorizes enqueueing the current
-thread's PR. The queue label wakes GitHub immediately; never poll or merge an
-unlabeled PR. Merge independent ready work in order, skip blockers, honor
-dependencies, and route overlapping source through one integration PR.
+Only the user's exact `deploy` instruction authorizes `request_deployment` for
+the current thread's PR. Include the stable Cursor thread ID. Durable intent
+wakes GitHub and promotes only after fresh exact-head gates; never poll or merge
+an unlabeled PR. Use `pipeline_status` and `react_to_delivery_event`, skip
+blockers, honor dependencies, route overlaps or cumulative validation through
+one integration PR, return repair packets to their source thread, atomically
+resume after fresh review, and follow cumulative `main` through deployment.

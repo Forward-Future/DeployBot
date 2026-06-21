@@ -19,27 +19,32 @@ the repository's policy; never assume a particular review vendor.
 
 Do not merge merely because review is complete.
 
-## Enqueue On Deploy
+## Record Deploy Intent
 
 Treat the user's exact `deploy` instruction as authority for this thread's PR
-only. Call `enqueue_pull_request` through the DeployBot MCP server, or run
-`deploybot enqueue <pr-number>`. The command fails closed on stale heads,
-missing checks, unresolved findings, conflicts, or missing review evidence.
+only. Call `request_deployment` through the DeployBot MCP server, or run
+`deploybot request <pr-number> --provider <client> --thread-id <stable-id>`.
+This records intent immediately. If review fixes change the head, call
+`refresh_deployment_request` only after its fresh checks and review pass; the
+event worker then promotes that exact head without another user instruction.
 
-The queue label wakes the GitHub coordinator. Do not create a polling timer and
-do not merge the PR independently.
+The intent label wakes the GitHub coordinator. Review, check, ready, and push
+events retry promotion without a polling timer. Do not merge independently.
 
 ## Coordinate A Burst
 
-Use `queue_plan`, then `freeze_queue` or `drain_queue`. Preserve first-in order
-unless explicit dependencies require another order. Merge independent ready
-PRs back-to-back without rebasing merely because the base branch moved.
+Use `pipeline_status`, then `react_to_delivery_event` or the narrower queue
+tools. Preserve first-in order unless dependencies require another order. Merge
+independent ready PRs back-to-back without rebasing merely because `main` moved.
 
-Skip blocked or waiting PRs so they do not stop independent work. If the plan
-returns `integration_required`, combine that overlap group on one integration
-branch, resolve source once, run tests once, and obtain one final review. Never
-hand-merge generated output.
+Skip blocked or waiting PRs so they do not stop independent work. A blocker
+creates a structured repair handoff to the source thread. After the repair has
+fresh checks and review, call `resume_pull_request` once. If policy requests an
+integration PR, let DeployBot scaffold it, resolve source once, run tests once,
+and obtain one final review. Never hand-merge generated output.
 
-Finish by following the newest cumulative base-branch CI and deployment owned
-by the repository. Record exact heads, review verdicts, merged commits, waiting
-items, and integration groups.
+Finish with `follow_release`, tracking newer cumulative base heads through CI,
+deployment, and configured health checks. A failure pauses further merges until
+the coordinator verifies recovery and unpauses. Record exact heads, review
+verdicts, merged commits, waiting items, repair packets, integration groups, and
+delivery timing.

@@ -35,3 +35,29 @@ asset_version_pattern = '\?v=[0-9a-f]{12}'
 # check_name = "Review Bot"
 # require_formal_review = true
 # require_resolved_threads = true
+
+[pipeline]
+intent_label = "deploy-requested"
+pause_label = "deploybot-paused"
+registry_label = "deploybot-registry"
+registry_title = "DeployBot delivery registry"
+thread_active_hours = 72
+ci_workflows = ["CI"]
+deploy_workflows = ["Deploy"]
+ready_to_merge_target_minutes = 15
+merge_to_live_target_minutes = 10
+auto_promote = true
+intent_scope = "head" # safest: a trusted source agent refreshes replacement heads
+pause_on_failure = true
+# webhook_url_env = "DEPLOYBOT_WEBHOOK_URL"
+
+# [[pipeline.verifications]]
+# name = "Public login"
+# url = "https://example.com/login"
+# expected_status = 200
+
+[integration]
+# manual, overlap, or all
+mode = "manual"
+branch_prefix = "deploybot/integration"
+title_prefix = "DeployBot integration"

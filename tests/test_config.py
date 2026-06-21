@@ -68,9 +68,7 @@ class ConfigTest(unittest.TestCase):
                         "required_checks": ["CI"],
                         "trusted_actors": ["trusted"],
                     },
-                    "review": {
-                        "providers": [{"kind": "bot", "name": "Broken"}]
-                    },
+                    "review": {"providers": [{"kind": "bot", "name": "Broken"}]},
                 }
             )
 
@@ -83,9 +81,7 @@ class ConfigTest(unittest.TestCase):
                         "trusted_actors": ["trusted"],
                     },
                     "review": {
-                        "providers": [
-                            {"kind": "github-approvals", "name": "Humans"}
-                        ]
+                        "providers": [{"kind": "github-approvals", "name": "Humans"}]
                     },
                 }
             )
@@ -141,9 +137,7 @@ class ConfigTest(unittest.TestCase):
                         "trusted_actors": ["trusted"],
                     },
                     "review": {
-                        "providers": [
-                            {"kind": "bot", "name": "Bot", "login": "bot"}
-                        ]
+                        "providers": [{"kind": "bot", "name": "Bot", "login": "bot"}]
                     },
                 }
             )
@@ -176,6 +170,65 @@ class ConfigTest(unittest.TestCase):
                         "required_checks": ["CI"],
                         "trusted_actors": ["github-actions[bot]"],
                     }
+                }
+            )
+
+    def test_parses_pipeline_integration_and_health_policy(self) -> None:
+        config = parse_config(
+            {
+                "queue": {
+                    "required_checks": ["CI"],
+                    "trusted_actors": ["trusted"],
+                },
+                "pipeline": {
+                    "ci_workflows": ["Main CI"],
+                    "deploy_workflows": ["Production"],
+                    "auto_promote": False,
+                    "verifications": [
+                        {
+                            "name": "Login boundary",
+                            "url": "https://example.test/login",
+                            "expected_status": 200,
+                        }
+                    ],
+                },
+                "integration": {"mode": "all"},
+            }
+        )
+        self.assertEqual(config.pipeline.ci_workflows, ("Main CI",))
+        self.assertFalse(config.pipeline.auto_promote)
+        self.assertEqual(config.pipeline.verifications[0].expected_status, 200)
+        self.assertEqual(config.integration.mode, "all")
+
+    def test_rejects_invalid_integration_mode_and_boolean(self) -> None:
+        with self.assertRaisesRegex(ConfigError, "integration.mode"):
+            parse_config(
+                {
+                    "queue": {
+                        "required_checks": ["CI"],
+                        "trusted_actors": ["trusted"],
+                    },
+                    "integration": {"mode": "magic"},
+                }
+            )
+        with self.assertRaisesRegex(ConfigError, "auto_promote"):
+            parse_config(
+                {
+                    "queue": {
+                        "required_checks": ["CI"],
+                        "trusted_actors": ["trusted"],
+                    },
+                    "pipeline": {"auto_promote": "yes"},
+                }
+            )
+        with self.assertRaisesRegex(ConfigError, "intent_scope"):
+            parse_config(
+                {
+                    "queue": {
+                        "required_checks": ["CI"],
+                        "trusted_actors": ["trusted"],
+                    },
+                    "pipeline": {"intent_scope": "pull-request"},
                 }
             )
 

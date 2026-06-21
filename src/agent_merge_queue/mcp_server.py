@@ -21,6 +21,7 @@ def _run(
     *arguments: str,
     repository: str | None = None,
     config: str | None = None,
+    allow_nonzero: bool = False,
 ) -> str:
     argv = [sys.executable, "-m", "agent_merge_queue.cli"]
     if config:
@@ -30,7 +31,7 @@ def _run(
     argv.append(command)
     argv.extend(arguments)
     completed = subprocess.run(argv, text=True, capture_output=True, check=False)
-    if completed.returncode:
+    if completed.returncode and not allow_nonzero:
         raise RuntimeError(completed.stderr.strip() or completed.stdout.strip())
     return completed.stdout.strip()
 
@@ -39,6 +40,24 @@ def _run(
 def queue_plan(repository: str | None = None, config: str | None = None) -> str:
     """Read the ordered queue, blockers, and source-overlap groups."""
     return _run("plan", "--json", repository=repository, config=config)
+
+
+@mcp.tool()
+def pipeline_status(repository: str | None = None, config: str | None = None) -> str:
+    """Read active threads, PR stages, queue, CI, and deployment status."""
+    return _run("status", "--json", repository=repository, config=config)
+
+
+@mcp.tool()
+def diagnose(repository: str | None = None, config: str | None = None) -> str:
+    """Run read-only installation, policy, and GitHub health checks."""
+    return _run(
+        "doctor",
+        "--json",
+        repository=repository,
+        config=config,
+        allow_nonzero=True,
+    )
 
 
 @mcp.tool()
@@ -62,6 +81,55 @@ def enqueue_pull_request(
 
 
 @mcp.tool()
+def request_deployment(
+    pull_request: str,
+    provider: str | None = None,
+    thread_id: str | None = None,
+    thread_url: str | None = None,
+    repository: str | None = None,
+    config: str | None = None,
+) -> str:
+    """Persist the user's deploy intent even while exact-head gates are pending."""
+    arguments = [pull_request]
+    for flag, value in (
+        ("--provider", provider),
+        ("--thread-id", thread_id),
+        ("--thread-url", thread_url),
+    ):
+        if value:
+            arguments.extend((flag, value))
+    return _run("request", *arguments, repository=repository, config=config)
+
+
+@mcp.tool()
+def cancel_deployment_request(
+    pull_request: str,
+    repository: str | None = None,
+    config: str | None = None,
+) -> str:
+    """Cancel one durable deploy request before it merges."""
+    return _run("cancel-request", pull_request, repository=repository, config=config)
+
+
+@mcp.tool()
+def refresh_deployment_request(
+    pull_request: str,
+    repository: str | None = None,
+    config: str | None = None,
+) -> str:
+    """Bind existing user intent to a freshly reviewed replacement head."""
+    return _run("refresh-request", pull_request, repository=repository, config=config)
+
+
+@mcp.tool()
+def promote_deployment_requests(
+    repository: str | None = None, config: str | None = None
+) -> str:
+    """Promote every exact-head-ready deploy request into the merge queue."""
+    return _run("promote", repository=repository, config=config)
+
+
+@mcp.tool()
 def freeze_queue(repository: str | None = None, config: str | None = None) -> str:
     """Freeze the current queue membership and exact head SHAs."""
     return _run("freeze", "--json", repository=repository, config=config)
@@ -71,6 +139,93 @@ def freeze_queue(repository: str | None = None, config: str | None = None) -> st
 def drain_queue(repository: str | None = None, config: str | None = None) -> str:
     """Merge every independent ready PR in the frozen batch."""
     return _run("drain", "--json", repository=repository, config=config)
+
+
+@mcp.tool()
+def react_to_delivery_event(
+    follow: bool = False,
+    timeout_seconds: int = 1800,
+    repository: str | None = None,
+    config: str | None = None,
+) -> str:
+    """Run the event-driven promotion, batching, merge, and optional release flow."""
+    arguments = ["--timeout", str(timeout_seconds)]
+    if follow:
+        arguments.append("--follow")
+    return _run("react", *arguments, repository=repository, config=config)
+
+
+@mcp.tool()
+def create_integration_pull_request(
+    include_all: bool = False,
+    repository: str | None = None,
+    config: str | None = None,
+) -> str:
+    """Scaffold a cumulative PR for overlaps or full-batch validation."""
+    arguments = ["--all"] if include_all else []
+    return _run("integrate", *arguments, repository=repository, config=config)
+
+
+@mcp.tool()
+def follow_release(
+    timeout_seconds: int = 1800,
+    repository: str | None = None,
+    config: str | None = None,
+) -> str:
+    """Follow newest exact main through CI, deployment, and health verification."""
+    return _run(
+        "follow",
+        "--timeout",
+        str(timeout_seconds),
+        "--json",
+        repository=repository,
+        config=config,
+    )
+
+
+@mcp.tool()
+def delivery_metrics(
+    limit: int = 25,
+    repository: str | None = None,
+    config: str | None = None,
+) -> str:
+    """Read p50/p95 delivery timing for recent merged pull requests."""
+    return _run(
+        "metrics", "--limit", str(limit), "--json", repository=repository, config=config
+    )
+
+
+@mcp.tool()
+def update_agent_thread(
+    provider: str,
+    thread_id: str,
+    phase: str,
+    pull_request: int | None = None,
+    title: str | None = None,
+    branch: str | None = None,
+    url: str | None = None,
+    repository: str | None = None,
+    config: str | None = None,
+) -> str:
+    """Publish metadata-only thread state for cross-client coordination."""
+    arguments = [
+        "update",
+        "--provider",
+        provider,
+        "--thread-id",
+        thread_id,
+        "--phase",
+        phase,
+    ]
+    for flag, value in (
+        ("--pr", str(pull_request) if pull_request is not None else None),
+        ("--title", title),
+        ("--branch", branch),
+        ("--url", url),
+    ):
+        if value:
+            arguments.extend((flag, value))
+    return _run("thread", *arguments, repository=repository, config=config)
 
 
 @mcp.tool()
@@ -99,6 +254,16 @@ def unblock_pull_request(
 ) -> str:
     """Clear a resolved queue blocker."""
     return _run("unblock", pull_request, repository=repository, config=config)
+
+
+@mcp.tool()
+def resume_pull_request(
+    pull_request: str,
+    repository: str | None = None,
+    config: str | None = None,
+) -> str:
+    """Atomically verify, unblock, requeue, and wake a repaired pull request."""
+    return _run("resume", pull_request, repository=repository, config=config)
 
 
 @mcp.tool()

@@ -29,6 +29,38 @@ class ReviewProviderConfig:
 
 
 @dataclass(frozen=True)
+class VerificationConfig:
+    name: str
+    url: str
+    expected_status: int = 200
+
+
+@dataclass(frozen=True)
+class PipelineConfig:
+    intent_label: str
+    pause_label: str
+    registry_label: str
+    registry_title: str
+    thread_active_hours: int
+    ci_workflows: tuple[str, ...]
+    deploy_workflows: tuple[str, ...]
+    ready_to_merge_target_minutes: int
+    merge_to_live_target_minutes: int
+    auto_promote: bool
+    intent_scope: str
+    pause_on_failure: bool
+    webhook_url_env: str | None
+    verifications: tuple[VerificationConfig, ...]
+
+
+@dataclass(frozen=True)
+class IntegrationConfig:
+    mode: str
+    branch_prefix: str
+    title_prefix: str
+
+
+@dataclass(frozen=True)
 class QueueConfig:
     base_branch: str
     queue_label: str
@@ -42,10 +74,14 @@ class QueueConfig:
     generated_version_paths: frozenset[str]
     asset_version_pattern: str
     review_providers: tuple[ReviewProviderConfig, ...]
+    pipeline: PipelineConfig
+    integration: IntegrationConfig
 
 
 ALLOWED_REVIEW_PROVIDERS = {"bot", "check", "github-approvals"}
 ALLOWED_MERGE_METHODS = {"merge", "squash", "rebase"}
+ALLOWED_INTEGRATION_MODES = {"manual", "overlap", "all"}
+ALLOWED_INTENT_SCOPES = {"head"}
 DEFAULT_CONFIG = """\
 [queue]
 base_branch = "main"
@@ -71,6 +107,28 @@ asset_version_pattern = '\\?v=[0-9a-f]{12}'
 # name = "Human approval"
 # allowed_reviewers = ["reviewer-login"]
 # minimum_approvals = 1
+
+[pipeline]
+intent_label = "deploy-requested"
+pause_label = "deploybot-paused"
+registry_label = "deploybot-registry"
+registry_title = "DeployBot delivery registry"
+thread_active_hours = 72
+ci_workflows = ["CI"]
+deploy_workflows = ["Deploy"]
+ready_to_merge_target_minutes = 15
+merge_to_live_target_minutes = 10
+auto_promote = true
+intent_scope = "head"
+pause_on_failure = true
+# webhook_url_env = "DEPLOYBOT_WEBHOOK_URL"
+
+[integration]
+# manual: report overlap; overlap: scaffold one PR for overlap groups;
+# all: validate every frozen batch through one cumulative integration PR.
+mode = "manual"
+branch_prefix = "deploybot/integration"
+title_prefix = "DeployBot integration"
 """
 
 
@@ -90,6 +148,49 @@ def _string_tuple(value: Any, field: str) -> tuple[str, ...]:
     ):
         raise ConfigError(f"{field} must be an array of non-empty strings")
     return tuple(dict.fromkeys(item.strip() for item in value))
+
+
+def _positive_int(value: Any, field: str, default: int) -> int:
+    if value is None:
+        return default
+    if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+        raise ConfigError(f"{field} must be a positive integer")
+    return value
+
+
+def _boolean(value: Any, field: str, default: bool) -> bool:
+    if value is None:
+        return default
+    if not isinstance(value, bool):
+        raise ConfigError(f"{field} must be true or false")
+    return value
+
+
+def _verifications(value: Any) -> tuple[VerificationConfig, ...]:
+    if value is None:
+        return ()
+    if not isinstance(value, list):
+        raise ConfigError("pipeline.verifications must be an array of tables")
+    result: list[VerificationConfig] = []
+    for index, item in enumerate(value):
+        field = f"pipeline.verifications[{index}]"
+        if not isinstance(item, dict):
+            raise ConfigError(f"{field} must be a table")
+        status = item.get("expected_status", 200)
+        if (
+            not isinstance(status, int)
+            or isinstance(status, bool)
+            or not 100 <= status <= 599
+        ):
+            raise ConfigError(f"{field}.expected_status must be an HTTP status")
+        result.append(
+            VerificationConfig(
+                name=_require_string(item.get("name"), f"{field}.name"),
+                url=_require_string(item.get("url"), f"{field}.url"),
+                expected_status=status,
+            )
+        )
+    return tuple(result)
 
 
 def _provider(value: Any, index: int) -> ReviewProviderConfig:
@@ -172,10 +273,14 @@ def parse_config(payload: dict[str, Any]) -> QueueConfig:
     queue = payload.get("queue") or {}
     files = payload.get("files") or {}
     review = payload.get("review") or {}
+    pipeline = payload.get("pipeline") or {}
+    integration = payload.get("integration") or {}
     if not isinstance(queue, dict) or not isinstance(files, dict):
         raise ConfigError("queue and files must be tables")
     if not isinstance(review, dict):
         raise ConfigError("review must be a table")
+    if not isinstance(pipeline, dict) or not isinstance(integration, dict):
+        raise ConfigError("pipeline and integration must be tables")
 
     merge_method = _require_string(
         queue.get("merge_method"), "queue.merge_method", "merge"
@@ -186,9 +291,7 @@ def parse_config(payload: dict[str, Any]) -> QueueConfig:
     required_checks = _string_tuple(
         queue.get("required_checks"), "queue.required_checks"
     )
-    trusted_actors = _string_tuple(
-        queue.get("trusted_actors"), "queue.trusted_actors"
-    )
+    trusted_actors = _string_tuple(queue.get("trusted_actors"), "queue.trusted_actors")
     if not trusted_actors or "YOUR_GITHUB_LOGIN" in trusted_actors:
         raise ConfigError(
             "queue.trusted_actors must explicitly name every user or bot whose "
@@ -199,9 +302,10 @@ def parse_config(payload: dict[str, Any]) -> QueueConfig:
             "queue.trusted_actors cannot include github-actions[bot]; list it under "
             "queue.coordinator_actors so shared workflows cannot authorize a PR"
         )
-    coordinator_actors = _string_tuple(
-        queue.get("coordinator_actors"), "queue.coordinator_actors"
-    ) or trusted_actors
+    coordinator_actors = (
+        _string_tuple(queue.get("coordinator_actors"), "queue.coordinator_actors")
+        or trusted_actors
+    )
     if not coordinator_actors or "YOUR_GITHUB_LOGIN" in coordinator_actors:
         raise ConfigError(
             "queue.coordinator_actors must explicitly name every user or bot "
@@ -229,8 +333,26 @@ def parse_config(payload: dict[str, Any]) -> QueueConfig:
     except re.error as error:
         raise ConfigError(f"files.asset_version_pattern is invalid: {error}") from error
 
+    integration_mode = _require_string(
+        integration.get("mode"), "integration.mode", "manual"
+    )
+    if integration_mode not in ALLOWED_INTEGRATION_MODES:
+        allowed = ", ".join(sorted(ALLOWED_INTEGRATION_MODES))
+        raise ConfigError(f"integration.mode must be one of: {allowed}")
+    webhook_url_env = pipeline.get("webhook_url_env")
+    if webhook_url_env is not None:
+        webhook_url_env = _require_string(webhook_url_env, "pipeline.webhook_url_env")
+    intent_scope = _require_string(
+        pipeline.get("intent_scope"), "pipeline.intent_scope", "head"
+    )
+    if intent_scope not in ALLOWED_INTENT_SCOPES:
+        allowed = ", ".join(sorted(ALLOWED_INTENT_SCOPES))
+        raise ConfigError(f"pipeline.intent_scope must be one of: {allowed}")
+
     return QueueConfig(
-        base_branch=_require_string(queue.get("base_branch"), "queue.base_branch", "main"),
+        base_branch=_require_string(
+            queue.get("base_branch"), "queue.base_branch", "main"
+        ),
         queue_label=_require_string(
             queue.get("queue_label"), "queue.queue_label", "merge-queue"
         ),
@@ -259,6 +381,75 @@ def parse_config(payload: dict[str, Any]) -> QueueConfig:
         ),
         asset_version_pattern=version_pattern,
         review_providers=providers,
+        pipeline=PipelineConfig(
+            intent_label=_require_string(
+                pipeline.get("intent_label"),
+                "pipeline.intent_label",
+                "deploy-requested",
+            ),
+            pause_label=_require_string(
+                pipeline.get("pause_label"),
+                "pipeline.pause_label",
+                "deploybot-paused",
+            ),
+            registry_label=_require_string(
+                pipeline.get("registry_label"),
+                "pipeline.registry_label",
+                "deploybot-registry",
+            ),
+            registry_title=_require_string(
+                pipeline.get("registry_title"),
+                "pipeline.registry_title",
+                "DeployBot delivery registry",
+            ),
+            thread_active_hours=_positive_int(
+                pipeline.get("thread_active_hours"),
+                "pipeline.thread_active_hours",
+                72,
+            ),
+            ci_workflows=_string_tuple(
+                pipeline.get("ci_workflows", ["CI"]),
+                "pipeline.ci_workflows",
+            ),
+            deploy_workflows=_string_tuple(
+                pipeline.get("deploy_workflows", ["Deploy"]),
+                "pipeline.deploy_workflows",
+            ),
+            ready_to_merge_target_minutes=_positive_int(
+                pipeline.get("ready_to_merge_target_minutes"),
+                "pipeline.ready_to_merge_target_minutes",
+                15,
+            ),
+            merge_to_live_target_minutes=_positive_int(
+                pipeline.get("merge_to_live_target_minutes"),
+                "pipeline.merge_to_live_target_minutes",
+                10,
+            ),
+            auto_promote=_boolean(
+                pipeline.get("auto_promote"), "pipeline.auto_promote", True
+            ),
+            intent_scope=intent_scope,
+            pause_on_failure=_boolean(
+                pipeline.get("pause_on_failure"),
+                "pipeline.pause_on_failure",
+                True,
+            ),
+            webhook_url_env=webhook_url_env,
+            verifications=_verifications(pipeline.get("verifications")),
+        ),
+        integration=IntegrationConfig(
+            mode=integration_mode,
+            branch_prefix=_require_string(
+                integration.get("branch_prefix"),
+                "integration.branch_prefix",
+                "deploybot/integration",
+            ).rstrip("/"),
+            title_prefix=_require_string(
+                integration.get("title_prefix"),
+                "integration.title_prefix",
+                "DeployBot integration",
+            ),
+        ),
     )
 
 
@@ -282,7 +473,9 @@ def load_config(path: str | None = None, *, cwd: Path | None = None) -> QueueCon
     try:
         payload = tomllib.loads(raw.decode("utf-8"))
     except (UnicodeDecodeError, tomllib.TOMLDecodeError) as error:
-        raise ConfigError(f"invalid merge queue config {config_path}: {error}") from error
+        raise ConfigError(
+            f"invalid merge queue config {config_path}: {error}"
+        ) from error
     return parse_config(payload)
 
 

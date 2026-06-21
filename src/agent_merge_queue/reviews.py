@@ -33,9 +33,7 @@ def _check_verdict(
     if status == "passed":
         return ReviewVerdict(policy.name, "passed")
     if status == "failed":
-        return ReviewVerdict(
-            policy.name, "blocked", (f"{policy.check_name} failed",)
-        )
+        return ReviewVerdict(policy.name, "blocked", (f"{policy.check_name} failed",))
     return ReviewVerdict(
         policy.name, "waiting", (f"{policy.check_name} is not complete",)
     )
@@ -50,18 +48,14 @@ def _approval_verdict(
     for index, review in enumerate(reviews):
         if str(review.get("commit_id") or "").lower() != head_sha.lower():
             continue
-        login = normalize_login(
-            str((review.get("user") or {}).get("login") or "")
-        )
+        login = normalize_login(str((review.get("user") or {}).get("login") or ""))
         if not login:
             continue
         timestamp = str(review.get("submitted_at") or "")
         candidate = (timestamp, index, str(review.get("state") or "").upper())
         if login not in latest or candidate[:2] > latest[login][:2]:
             latest[login] = candidate
-    approved = {
-        login for login, value in latest.items() if value[2] == "APPROVED"
-    }
+    approved = {login for login, value in latest.items() if value[2] == "APPROVED"}
     allowed = {normalize_login(value) for value in policy.allowed_reviewers}
     approved.intersection_update(allowed)
     if len(approved) >= policy.minimum_approvals:
@@ -69,9 +63,7 @@ def _approval_verdict(
     return ReviewVerdict(
         policy.name,
         "waiting",
-        (
-            f"{len(approved)}/{policy.minimum_approvals} exact-head approvals complete",
-        ),
+        (f"{len(approved)}/{policy.minimum_approvals} exact-head approvals complete",),
     )
 
 
