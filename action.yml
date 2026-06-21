@@ -17,6 +17,10 @@ inputs:
     description: Maximum release-follow time in seconds
     required: false
     default: "1800"
+  token:
+    description: GitHub App installation token used to author integration PRs
+    required: false
+    default: ""
 runs:
   using: composite
   steps:
@@ -28,7 +32,7 @@ runs:
     - shell: bash
       env:
         DEPLOYBOT_CONFIG: ${{ inputs.config }}
-        GH_TOKEN: ${{ github.token }}
+        GH_TOKEN: ${{ inputs.token || github.token }}
         DEPLOYBOT_FOLLOW: ${{ inputs.follow }}
         DEPLOYBOT_DISPATCH_CI: ${{ inputs.dispatch_ci }}
         DEPLOYBOT_TIMEOUT: ${{ inputs.timeout }}

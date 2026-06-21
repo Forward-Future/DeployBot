@@ -11,11 +11,11 @@ integration PRs, follows `main` through production, and pauses after failures.
 
 ## Install
 
-Install the reviewed `v0.2.11` source commit directly from GitHub:
+Install the reviewed `v0.2.12` source commit directly from GitHub:
 
 ```bash
 python3 -m pip install \
-  'deploybot-merge-queue[mcp] @ git+https://github.com/Forward-Future/DeployBot.git@bf1ccadb3a4110dd29b70efe4f621f822110bfcc'
+  'deploybot-merge-queue[mcp] @ git+https://github.com/Forward-Future/DeployBot.git@d25f7269441e039d00a2ea55a7c9cc502e23cf6a'
 deploybot init
 ```
 
@@ -95,7 +95,7 @@ worker can dispatch deployment when GitHub suppresses the `workflow_run` event
 for token-dispatched CI. Pin the Action to the full reviewed release commit:
 
 ```yaml
-- uses: Forward-Future/DeployBot@bf1ccadb3a4110dd29b70efe4f621f822110bfcc
+- uses: Forward-Future/DeployBot@d25f7269441e039d00a2ea55a7c9cc502e23cf6a
 ```
 
 The Action uses GitHub's built-in workflow token. GitHub intentionally does not
@@ -110,6 +110,13 @@ successful CI for the current base-branch head. Skipped deployment wake-ups
 from pull-request CI are ignored. Set Action input `dispatch_ci: "false"` only
 when a caller supplies a different merge identity that already triggers push
 CI.
+
+When integration PR checks depend on normal PR-authored events, mint a GitHub
+App installation token in an earlier workflow step and pass it as the Action's
+`token` input. Set `integration.require_non_actions_author = true` so a missing
+App token fails before it freezes or creates an unusable integration PR. Add
+the App's exact bot login (for example, `deploybot-app[bot]`) to
+`queue.coordinator_actors` so its integration records are trusted.
 
 The deployment workflow keeps its normal `workflow_run` trigger for push CI
 and adds this exact-input recovery path for DeployBot-dispatched CI:
@@ -158,7 +165,13 @@ ready-to-merge target and names the current gate. It never stores prompts,
 transcripts, source, or credentials.
 
 `deploybot react` promotes ready intent, skips blockers, drains independent
-work, and creates integration PRs when configured. Draft status and incomplete
+work, and creates integration PRs when configured. New batches contain at most
+`integration.max_batch_size` entries; later FIFO work remains in the next batch.
+A larger indivisible source-overlap or dependency closure is the sole exception:
+it ships alone, never mixed with unrelated work.
+After any merge, admission stays closed until the cumulative exact-main release
+is verified live, preventing newer merges from starving an older deployment.
+Draft status and incomplete
 checks or reviews remain waiting states; they do not create a repair latch. A
 conflict, failed gate, unresolved review, manual block, or stale authorized head
 produces a repair handoff containing the source thread, base/head SHAs, source
@@ -177,6 +190,11 @@ deploybot resume <pr-number>
 and emits a new wake-up event. `follow` tracks newer cumulative `main` revisions
 until exact CI, deployment, and optional HTTP checks pass. A CI or deploy failure
 can pause further merges until `deploybot unpause`.
+
+Before starting an exact-main recovery, an agent runs
+`deploybot claim-release-repair --provider CLIENT --thread-id ID`. A
+deterministic branch ref elects exactly one repair owner for that failed SHA;
+other threads receive the recorded owner instead of creating duplicate PRs.
 
 At merge time, DeployBot records a non-expiring notification obligation. At
 exact-main verification, it promotes every contained obligation to `pending`,
@@ -212,6 +230,8 @@ deploy_workflows = ["Deploy"]
 batch_settle_seconds = 15
 ci_failure_grace_seconds = 90
 promotion_workers = 4
+hold_merges_while_releasing = true
+repair_branch_prefix = "deploybot/repair"
 ready_to_merge_target_minutes = 15
 merge_to_live_target_minutes = 10
 auto_promote = true
@@ -226,6 +246,8 @@ expected_status = 200
 [integration]
 # manual, overlap, or all (one cumulative pre-merge validation PR)
 mode = "overlap"
+max_batch_size = 3
+# require_non_actions_author = true
 ```
 
 For `overlap` or `all` mode with the hosted coordinator, enable **Allow GitHub

@@ -1,7 +1,7 @@
 # DeployBot reference
 
 This reference describes the CLI, MCP server, policy file, and GitHub Action in
-DeployBot v0.2.11. GitHub labels and authenticated comments are the durable state;
+DeployBot v0.2.12. GitHub labels and authenticated comments are the durable state;
 the CLI and MCP tools are two interfaces to the same operations.
 
 ## CLI
@@ -59,6 +59,7 @@ has fresh evidence; the user does not need to repeat the instruction.
 | `deploybot follow [--timeout SECONDS] [--poll SECONDS] [--json]` | Follow the newest exact base-branch head through CI, deployment, and HTTP verification. Defaults: 1800-second timeout and 10-second poll. |
 | `deploybot pause --reason TEXT` | Pause merging after a delivery failure. |
 | `deploybot unpause` | Resume a pipeline after verified recovery. |
+| `deploybot claim-release-repair --provider CLIENT --thread-id ID [--thread-url URL] [--sha SHA]` | Atomically claim the owner-encoded deterministic repair branch for the current failed exact-main release. Other threads recover the same owner from the ref instead of creating duplicate repair PRs. |
 
 Only a configured coordinator should run these operations. `react
 --dispatch-ci` is required when the merge identity does not trigger ordinary
@@ -96,6 +97,7 @@ arguments shown below are the tool-specific arguments.
 | `react_to_delivery_event` | `react` | optional `follow`, `dispatch_ci`, `timeout_seconds` |
 | `create_integration_pull_request` | `integrate` | optional `include_all` |
 | `follow_release` | `follow --json` | optional `timeout_seconds` |
+| `claim_release_repair` | `claim-release-repair` | `provider`, `thread_id`; optional `thread_url`, `main_sha` |
 | `delivery_metrics` | `metrics --json` | optional `limit` |
 | `update_agent_thread` | `thread update` | `provider`, `thread_id`, `phase`; optional `pull_request`, `title`, `branch`, `url` |
 | `acknowledge_thread_deployment` | `thread acknowledge` | `provider`, `thread_id`, `notification_id` |
@@ -165,6 +167,8 @@ Provider fields are:
 | `ci_failure_grace_seconds` | Non-negative window for an exact-main CI retry to replace a failed attempt before the release fails. Default: 90. |
 | `promotion_workers` | Positive maximum number of deploy requests promoted concurrently. Default: 4. |
 | `repair_hold_minutes` | Positive maximum time that a genuine repair may hold overlapping ready work without becoming merge-eligible. Default: 60. |
+| `hold_merges_while_releasing` | Default `true`; after a merge, admit no newer batch until the cumulative exact-main revision is verified live. |
+| `repair_branch_prefix` | Deterministic release-repair lease branch prefix; default `"deploybot/repair"`. |
 | `ready_to_merge_target_minutes` | Positive request-to-ready and queued-to-merge timing target; default 15. |
 | `merge_to_live_target_minutes` | Positive timing target; default 10. |
 | `auto_promote` | Default `true`. |
@@ -183,6 +187,8 @@ Provider fields are:
 | `mode` | `"manual"`; allowed: `manual`, `overlap`, `all`. |
 | `branch_prefix` | `"deploybot/integration"` |
 | `title_prefix` | `"DeployBot integration"` |
+| `max_batch_size` | Positive maximum frozen batch size; default 3. Later FIFO entries remain in the next batch. A larger indivisible source-overlap or dependency closure ships alone rather than being split or deadlocked. |
+| `require_non_actions_author` | Default `false`; when `true`, integration creation requires the Action `token` input and an App bot author listed in `queue.coordinator_actors`. |
 
 ## GitHub Action
 
@@ -194,6 +200,7 @@ The composite Action runs `deploybot react` from the checked-out default branch.
 | `follow` | `"true"` | Add `--follow` to the event worker. |
 | `dispatch_ci` | `"true"` | Dispatch configured CI after a merge made with `github.token`. |
 | `timeout` | `"1800"` | Release-follow timeout in seconds. |
+| `token` | `""` | GitHub App installation token used to author integration PRs so normal PR checks and events run; empty falls back to `github.token`. |
 
 The workflow needs `contents: write`, `pull-requests: write`, `checks: read`,
 `issues: write`, and `actions: write`. Use the event filters, concurrency group,
@@ -209,8 +216,11 @@ with `pipeline.ci_workflows`.
 - `MERGE_QUEUE_CONFIG` selects the policy path when `--config` is absent.
 - The variable named by `pipeline.webhook_url_env` supplies the optional event
   webhook URL.
-- The composite Action maps `github.token` to `GH_TOKEN`; callers do not need to
-  create a separate token when its documented permissions are sufficient.
+- The composite Action maps `token` to `GH_TOKEN`, falling back to
+  `github.token`. Repositories that require PR-authored checks for cumulative
+  integration must pass a GitHub App installation token, list that App's bot
+  login in `queue.coordinator_actors`, and set
+  `integration.require_non_actions_author = true`.
 
 The `thread-deployed` event contains `notification_id`, `repository`,
 `provider`, `thread_id`, `main_sha`, and a user-facing `message`, plus available

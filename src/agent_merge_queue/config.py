@@ -48,6 +48,8 @@ class PipelineConfig:
     ci_failure_grace_seconds: int
     promotion_workers: int
     repair_hold_minutes: int
+    hold_merges_while_releasing: bool
+    repair_branch_prefix: str
     ready_to_merge_target_minutes: int
     merge_to_live_target_minutes: int
     auto_promote: bool
@@ -62,6 +64,8 @@ class IntegrationConfig:
     mode: str
     branch_prefix: str
     title_prefix: str
+    max_batch_size: int
+    require_non_actions_author: bool
 
 
 @dataclass(frozen=True)
@@ -124,6 +128,8 @@ batch_settle_seconds = 15
 ci_failure_grace_seconds = 90
 promotion_workers = 4
 repair_hold_minutes = 60
+hold_merges_while_releasing = true
+repair_branch_prefix = "deploybot/repair"
 ready_to_merge_target_minutes = 15
 merge_to_live_target_minutes = 10
 auto_promote = true
@@ -138,6 +144,8 @@ pause_on_failure = true
 mode = "manual"
 branch_prefix = "deploybot/integration"
 title_prefix = "DeployBot integration"
+max_batch_size = 3
+require_non_actions_author = false
 """
 
 
@@ -147,6 +155,28 @@ def _require_string(value: Any, field: str, default: str | None = None) -> str:
     if not isinstance(value, str) or not value.strip():
         raise ConfigError(f"{field} must be a non-empty string")
     return value.strip()
+
+
+def _branch_prefix(value: Any, field: str, default: str) -> str:
+    prefix = _require_string(value, field, default).rstrip("/")
+    components = prefix.split("/")
+    invalid_character = re.search(r"[\x00-\x20\x7f~^:?*\[\\]", prefix)
+    if (
+        not prefix
+        or prefix == "@"
+        or ".." in prefix
+        or "@{" in prefix
+        or invalid_character
+        or any(
+            not component
+            or component.startswith(".")
+            or component.endswith(".")
+            or component.endswith(".lock")
+            for component in components
+        )
+    ):
+        raise ConfigError(f"{field} must be a valid Git branch prefix")
+    return prefix
 
 
 def _string_tuple(value: Any, field: str) -> tuple[str, ...]:
@@ -452,6 +482,16 @@ def parse_config(payload: dict[str, Any]) -> QueueConfig:
                 "pipeline.repair_hold_minutes",
                 60,
             ),
+            hold_merges_while_releasing=_boolean(
+                pipeline.get("hold_merges_while_releasing"),
+                "pipeline.hold_merges_while_releasing",
+                True,
+            ),
+            repair_branch_prefix=_branch_prefix(
+                pipeline.get("repair_branch_prefix"),
+                "pipeline.repair_branch_prefix",
+                "deploybot/repair",
+            ),
             ready_to_merge_target_minutes=_positive_int(
                 pipeline.get("ready_to_merge_target_minutes"),
                 "pipeline.ready_to_merge_target_minutes",
@@ -485,6 +525,16 @@ def parse_config(payload: dict[str, Any]) -> QueueConfig:
                 integration.get("title_prefix"),
                 "integration.title_prefix",
                 "DeployBot integration",
+            ),
+            max_batch_size=_positive_int(
+                integration.get("max_batch_size"),
+                "integration.max_batch_size",
+                3,
+            ),
+            require_non_actions_author=_boolean(
+                integration.get("require_non_actions_author"),
+                "integration.require_non_actions_author",
+                False,
             ),
         ),
     )

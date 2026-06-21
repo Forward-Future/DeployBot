@@ -187,6 +187,29 @@ def follow_release(
 
 
 @mcp.tool()
+def claim_release_repair(
+    provider: str,
+    thread_id: str,
+    thread_url: str | None = None,
+    main_sha: str | None = None,
+    repository: str | None = None,
+    config: str | None = None,
+) -> str:
+    """Elect one native thread to repair the current failed main release."""
+    arguments = ["--provider", provider, "--thread-id", thread_id]
+    if thread_url:
+        arguments.extend(("--thread-url", thread_url))
+    if main_sha:
+        arguments.extend(("--sha", main_sha))
+    return _run(
+        "claim-release-repair",
+        *arguments,
+        repository=repository,
+        config=config,
+    )
+
+
+@mcp.tool()
 def delivery_metrics(
     limit: int = 25,
     repository: str | None = None,
