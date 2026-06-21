@@ -2757,7 +2757,7 @@ def command_react(
                 )
             raise
     release: dict[str, Any] | None = None
-    if follow and drained.get("merged"):
+    if follow:
         release = command_follow(
             client,
             timeout_seconds=timeout_seconds,
