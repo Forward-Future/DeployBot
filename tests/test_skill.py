@@ -6,7 +6,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 CANONICAL = ROOT / "skills" / "deploybot" / "SKILL.md"
-RELEASE_COMMIT = "13d7293b181581d2e4d59d8a605df76f7feb88a6"
+RELEASE_COMMIT = "b06346119a29d0be1c25d1643fdc06a03f7b94a9"
 CHECKOUT_COMMIT = "9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0"
 
 
