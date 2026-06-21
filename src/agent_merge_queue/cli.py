@@ -809,6 +809,16 @@ class GitHub:
             )
         ]
 
+    def integration_pull_request_numbers(self) -> list[int]:
+        prefix = self.config.integration.branch_prefix.rstrip("/") + "/"
+        return [
+            int(value["number"])
+            for value in self._paged_api(
+                f"repos/{self.repository}/pulls?state=open&per_page=100"
+            )
+            if str((value.get("head") or {}).get("ref") or "").startswith(prefix)
+        ]
+
     def intent_numbers(self) -> list[int]:
         values = self._paged_api(
             f"repos/{self.repository}/pulls?state=open&per_page=100"
@@ -822,7 +832,7 @@ class GitHub:
 
     def active_integration_sources(self) -> set[int]:
         sources: set[int] = set()
-        for number in self.open_pull_request_numbers():
+        for number in self.integration_pull_request_numbers():
             marker = latest_payload(
                 self.comments(number),
                 INTEGRATION_MARKER,
@@ -2026,7 +2036,7 @@ def command_promote(
 
 def promote_integrations(client: GitHub) -> list[int]:
     promoted: list[int] = []
-    for number in client.open_pull_request_numbers():
+    for number in client.integration_pull_request_numbers():
         comments = client.comments(number)
         integration = latest_payload(
             comments,

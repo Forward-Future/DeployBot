@@ -184,6 +184,7 @@ class ConfigTest(unittest.TestCase):
                     "ci_workflows": ["Main CI"],
                     "deploy_workflows": ["Production"],
                     "batch_settle_seconds": 30,
+                    "ci_failure_grace_seconds": 45,
                     "auto_promote": False,
                     "verifications": [
                         {
@@ -198,6 +199,7 @@ class ConfigTest(unittest.TestCase):
         )
         self.assertEqual(config.pipeline.ci_workflows, ("Main CI",))
         self.assertEqual(config.pipeline.batch_settle_seconds, 30)
+        self.assertEqual(config.pipeline.ci_failure_grace_seconds, 45)
         self.assertFalse(config.pipeline.auto_promote)
         self.assertEqual(config.pipeline.verifications[0].expected_status, 200)
         self.assertEqual(config.integration.mode, "all")
