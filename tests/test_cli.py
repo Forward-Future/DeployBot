@@ -4,6 +4,7 @@ import io
 import json
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
+from datetime import datetime, timezone
 from unittest.mock import Mock, call, patch
 
 from agent_merge_queue.cli import (
@@ -30,6 +31,8 @@ from agent_merge_queue.cli import (
     command_thread_acknowledge,
     command_unblock,
     completed_batch_ids,
+    delivery_metrics,
+    deployment_repair_required,
     entries_in_batch,
     effective_queue_marker,
     freeze_queue,
@@ -42,6 +45,7 @@ from agent_merge_queue.cli import (
     near_ready_overlap_holds,
     new_batch,
     overlap_groups,
+    pipeline_status,
     promote_integrations,
     pull_request_feature_summary,
     queue_state_body,
@@ -56,7 +60,7 @@ from agent_merge_queue.cli import (
     thread_notification_id,
 )
 from agent_merge_queue.config import parse_config
-from agent_merge_queue.records import integration_body, intent_body
+from agent_merge_queue.records import integration_body, intent_body, repair_body
 from agent_merge_queue.reviews import ReviewVerdict
 
 
@@ -178,6 +182,48 @@ class QueueCoreTest(unittest.TestCase):
             "--force",
         )
 
+    def test_comment_batch_normalizes_graphql_and_falls_back_when_truncated(
+        self,
+    ) -> None:
+        client = object.__new__(GitHub)
+        client.owner = "example"
+        client.name = "repo"
+        client._json = Mock(
+            return_value={
+                "data": {
+                    "repository": {
+                        "pr_1": {
+                            "comments": {
+                                "pageInfo": {"hasPreviousPage": False},
+                                "nodes": [
+                                    {
+                                        "databaseId": 11,
+                                        "body": "one",
+                                        "createdAt": "2026-06-20T00:00:00Z",
+                                        "author": {"login": "trusted"},
+                                    }
+                                ],
+                            }
+                        },
+                        "pr_2": {
+                            "comments": {
+                                "pageInfo": {"hasPreviousPage": True},
+                                "nodes": [],
+                            }
+                        },
+                    }
+                }
+            }
+        )
+        client.comments = Mock(return_value=[{"id": 22, "body": "fallback"}])
+
+        result = client.comments_for_pull_requests([2, 1])
+
+        self.assertEqual(result[1][0]["user"]["login"], "trusted")
+        self.assertEqual(result[1][0]["created_at"], "2026-06-20T00:00:00Z")
+        self.assertEqual(result[2][0]["body"], "fallback")
+        client.comments.assert_called_once_with(2)
+
     def test_status_is_a_read_only_pipeline_view(self) -> None:
         status = {"repository": "example/repo"}
         with (
@@ -248,6 +294,116 @@ class QueueCoreTest(unittest.TestCase):
         waiting.labels.append("merge-queue-blocked")
         self.assertFalse(should_settle_batch(client, [ready, waiting]))
 
+    def test_draft_with_pending_gates_waits_without_repair(self) -> None:
+        value = entry(1, state="blocked")
+        value.is_draft = True
+        value.checks = {"CI": "pending", "Optional": "failed"}
+        value.reasons = [
+            "pull request is draft",
+            "GitHub reports the pull request merge state as DRAFT",
+            "CI is not complete",
+            "Greptile score is missing for the current head",
+            "Greptile has not reviewed the current head",
+            "0/1 exact-head approvals complete",
+        ]
+        value.review_verdicts = (
+            ReviewVerdict(
+                "Greptile",
+                "waiting",
+                (
+                    "Greptile score is missing for the current head",
+                    "Greptile has not reviewed the current head",
+                ),
+            ),
+            ReviewVerdict(
+                "GitHub approvals",
+                "waiting",
+                ("0/1 exact-head approvals complete",),
+            ),
+        )
+
+        self.assertFalse(deployment_repair_required(value))
+
+        value.reasons.append("CI failed")
+        self.assertTrue(deployment_repair_required(value))
+
+    def test_status_exposes_intent_head_overlap_and_request_delay(self) -> None:
+        draft = entry(1, "shared.py", state="blocked")
+        draft.labels = ["deploy-requested"]
+        draft.is_draft = True
+        draft.checks = {"CI": "pending"}
+        draft.reasons = ["pull request is draft", "CI is not complete"]
+        conflict = entry(2, "shared.py", state="blocked")
+        conflict.labels = ["deploy-requested"]
+        conflict.reasons = ["pull request conflicts with main"]
+        intents = {
+            number: {
+                "id": number,
+                "created_at": "2026-06-20T00:00:00Z",
+                "user": {"login": "trusted"},
+                "body": intent_body(
+                    intent_id=f"intent-{number}",
+                    state="requested",
+                    requested_at="2026-06-20T00:00:00Z",
+                    requested_head=value.head_sha,
+                ),
+            }
+            for number, value in ((1, draft), (2, conflict))
+        }
+        client = Mock()
+        client.config = CONFIG
+        client.trusted_logins = {"trusted"}
+        client.queue.return_value = []
+        inactive = entry(3, "shared.py")
+        inactive.labels = []
+        intents[3] = {
+            "id": 3,
+            "created_at": "2026-06-20T00:00:00Z",
+            "user": {"login": "trusted"},
+            "body": intent_body(
+                intent_id="intent-3",
+                state="requested",
+                requested_at="2026-06-20T00:00:00Z",
+                requested_head=inactive.head_sha,
+            ),
+        }
+        client.open_pull_request_numbers.return_value = [1, 2, 3]
+        client.comments.side_effect = lambda number: [intents[number]]
+        client.snapshot.side_effect = lambda number, **_kwargs: {
+            1: draft,
+            2: conflict,
+            3: inactive,
+        }[number]
+        client.base_sha.return_value = "f" * 40
+        client.workflow_runs.return_value = []
+        client.workflow_runs_for_workflows.return_value = []
+        client.pipeline_control.return_value = {"state": "running"}
+        client.thread_records.return_value = []
+        client.deployment_notifications.return_value = []
+
+        result = pipeline_status(client)
+
+        self.assertEqual(
+            [value["number"] for value in result["pull_requests"]["deploy_requested"]],
+            [1],
+        )
+        self.assertEqual(
+            [value["number"] for value in result["pull_requests"]["blocked"]],
+            [2],
+        )
+        self.assertTrue(
+            result["pull_requests"]["deploy_requested"][0]["deploy_intent"][
+                "head_matches"
+            ]
+        )
+        self.assertEqual(
+            result["active_intent_overlap_groups"][0]["pull_requests"], [1, 2]
+        )
+        self.assertEqual({alert["pull_request"] for alert in result["alerts"]}, {1, 2})
+        self.assertTrue(
+            all(alert["stage"] == "request-to-ready" for alert in result["alerts"])
+        )
+
     def test_overlap_mode_holds_only_ready_members_of_near_ready_components(
         self,
     ) -> None:
@@ -316,6 +472,46 @@ class QueueCoreTest(unittest.TestCase):
         obligation = client.record_deployment_notification.call_args.args[0]
         self.assertEqual(obligation.state, "awaiting-verification")
         self.assertEqual(obligation.merge_sha, merge_sha)
+
+    def test_reconcile_marks_closed_unmerged_requested_thread_abandoned(self) -> None:
+        head_sha = "a" * 40
+        client = Mock()
+        client.config = CONFIG
+        client.repository = "example/repo"
+        client.trusted_logins = {"trusted"}
+        client.thread_records.return_value = [
+            {
+                "phase": "deploy-requested",
+                "provider": "codex",
+                "pull_request": 42,
+                "thread_id": "thread-42",
+            }
+        ]
+        client.comments.return_value = [
+            {
+                "created_at": "2026-06-20T00:00:00Z",
+                "user": {"login": "trusted"},
+                "body": intent_body(
+                    intent_id="intent-42",
+                    state="requested",
+                    requested_at="2026-06-20T00:00:00Z",
+                    requested_head=head_sha,
+                ),
+            }
+        ]
+        client.externally_integrated_merge.return_value = None
+        client.pull_head.return_value = {"state": "CLOSED", "head_sha": head_sha}
+
+        with patch("agent_merge_queue.cli.notify") as notify:
+            result = reconcile_externally_merged_threads(client)
+
+        self.assertEqual(result, [{"pull_request": 42, "state": "abandoned"}])
+        self.assertEqual(client.record_thread.call_args.args[0].phase, "abandoned")
+        notify.assert_called_once_with(
+            CONFIG.pipeline,
+            "deploy-abandoned",
+            {"repository": "example/repo", "pull_request": 42, "state": "abandoned"},
+        )
 
     def test_verified_release_creates_native_thread_notification(self) -> None:
         sha = "a" * 40
@@ -656,7 +852,6 @@ class QueueCoreTest(unittest.TestCase):
         self.assertNotIn("/new", first["thread_notifications"][0]["message"])
         client.record_thread.assert_not_called()
         client.record_deployment_notification.assert_not_called()
-        client.is_ancestor.assert_not_called()
 
     def test_delivered_notification_is_not_reopened_by_release_follow(self) -> None:
         sha = "a" * 40
@@ -1300,6 +1495,96 @@ class QueueCoreTest(unittest.TestCase):
             "--slurp",
             "repos/example/repo/actions/runs?branch=main&per_page=100",
         )
+
+    def test_limited_workflow_history_uses_one_page(self) -> None:
+        client = object.__new__(GitHub)
+        client.repository = "example/repo"
+        client.config = CONFIG
+        client._json = Mock(
+            return_value={"workflow_runs": [{"id": number} for number in range(100)]}
+        )
+
+        result = client.workflow_runs(limit=25)
+
+        self.assertEqual([run["id"] for run in result], list(range(25)))
+        self.assertNotIn("--paginate", client._json.call_args.args)
+
+    def test_successful_workflow_history_filters_by_workflow(self) -> None:
+        client = object.__new__(GitHub)
+        client.repository = "example/repo"
+        client.config = CONFIG
+        client._json = Mock(
+            side_effect=[
+                [{"id": 7, "name": "Deploy", "state": "active"}],
+                {"workflow_runs": [{"id": 9, "name": "Deploy"}]},
+            ]
+        )
+
+        result = client.successful_workflow_runs(["Deploy"], limit=25)
+
+        self.assertEqual(result, [{"id": 9, "name": "Deploy"}])
+        self.assertIn(
+            "actions/workflows/7/runs?branch=main&status=success&per_page=25&page=1",
+            client._json.call_args.args[-1],
+        )
+
+    def test_workflow_histories_are_combined_by_recency_before_limit(self) -> None:
+        client = object.__new__(GitHub)
+        client.repository = "example/repo"
+        client.config = CONFIG
+        client._json = Mock(
+            side_effect=[
+                [
+                    {"id": 7, "name": "Deploy A", "state": "active"},
+                    {"id": 8, "name": "Deploy B", "state": "active"},
+                ],
+                {"workflow_runs": [{"id": 70, "created_at": "2026-06-20T00:00:00Z"}]},
+                {"workflow_runs": [{"id": 80, "created_at": "2026-06-20T01:00:00Z"}]},
+            ]
+        )
+
+        result = client.successful_workflow_runs(["Deploy A", "Deploy B"], limit=1)
+
+        self.assertEqual([run["id"] for run in result], [80])
+
+    def test_workflow_history_pages_until_the_requested_time_window(self) -> None:
+        client = object.__new__(GitHub)
+        client.repository = "example/repo"
+        client.config = CONFIG
+        recent = [
+            {"id": number, "created_at": "2026-06-20T02:00:00Z"}
+            for number in range(100)
+        ]
+        client._json = Mock(
+            side_effect=[
+                [{"id": 7, "name": "Deploy", "state": "active"}],
+                {"workflow_runs": recent},
+                {"workflow_runs": [{"id": 101, "created_at": "2026-06-20T00:00:00Z"}]},
+            ]
+        )
+
+        result = client.successful_workflow_runs(
+            ["Deploy"],
+            since=datetime(2026, 6, 20, 1, tzinfo=timezone.utc),
+        )
+
+        self.assertEqual(len(result), 100)
+        self.assertIn("page=2", client._json.call_args.args[-1])
+
+    def test_recent_merged_pulls_stop_after_enough_results(self) -> None:
+        client = object.__new__(GitHub)
+        client.repository = "example/repo"
+        client._json = Mock(
+            return_value=[
+                {"number": number, "merged_at": "2026-06-20T00:00:00Z"}
+                for number in range(1, 31)
+            ]
+        )
+
+        result = client.recent_merged_pull_requests(25)
+
+        self.assertEqual([pull["number"] for pull in result], list(range(1, 26)))
+        client._json.assert_called_once()
 
     def test_integration_status_requires_every_source_authorization(self) -> None:
         client = object.__new__(GitHub)
@@ -2056,18 +2341,21 @@ class QueueCoreTest(unittest.TestCase):
         ready.labels = ["deploy-requested"]
         waiting = entry(2, state="waiting")
         waiting.labels = ["deploy-requested"]
+        waiting.checks = {"CI": "pending"}
         waiting.reasons = ["CI is not complete"]
-        intent = intent_body(
-            intent_id="intent-1",
-            state="requested",
-            requested_at="2026-06-20T00:00:00Z",
-            requested_head=ready.head_sha,
-        )
-        intent_comment = {
-            "id": 1,
-            "created_at": "2026-06-20T00:00:00Z",
-            "user": {"login": "trusted"},
-            "body": intent,
+        intent_comments = {
+            value.number: {
+                "id": value.number,
+                "created_at": "2026-06-20T00:00:00Z",
+                "user": {"login": "trusted"},
+                "body": intent_body(
+                    intent_id=f"intent-{value.number}",
+                    state="requested",
+                    requested_at="2026-06-20T00:00:00Z",
+                    requested_head=value.head_sha,
+                ),
+            }
+            for value in (ready, waiting)
         }
         client = Mock()
         client.config = CONFIG
@@ -2076,7 +2364,7 @@ class QueueCoreTest(unittest.TestCase):
         client.coordinator_logins = {"coordinator"}
         client.intent_numbers.return_value = [1, 2]
         client.active_integration_sources.return_value = set()
-        client.comments.return_value = [intent_comment]
+        client.comments.side_effect = lambda number: [intent_comments[number]]
         client.snapshot.side_effect = [ready, waiting]
         client.labels.return_value = {"deploy-requested"}
         with redirect_stdout(io.StringIO()):
@@ -2116,6 +2404,88 @@ class QueueCoreTest(unittest.TestCase):
         self.assertEqual(result["promoted"], [])
         self.assertIn("deploybot resume", result["waiting"][0]["reasons"][0])
         client.add_label.assert_not_called()
+
+    def test_promote_clears_a_transitional_draft_block(self) -> None:
+        ready = entry(1)
+        ready.labels = ["deploy-requested", "merge-queue-blocked"]
+        intent_comment = {
+            "id": 1,
+            "created_at": "2026-06-20T00:00:00Z",
+            "user": {"login": "trusted"},
+            "body": intent_body(
+                intent_id="intent-1",
+                state="requested",
+                requested_at="2026-06-20T00:00:00Z",
+                requested_head=ready.head_sha,
+            ),
+        }
+        repair_comment = {
+            "id": 2,
+            "created_at": "2026-06-20T00:01:00Z",
+            "user": {"login": "coordinator"},
+            "body": repair_body(
+                {
+                    "head_sha": ready.head_sha,
+                    "reason": (
+                        "pull request is draft; CI is not complete; "
+                        "Greptile score is missing for the current head"
+                    ),
+                }
+            ),
+        }
+        client = Mock()
+        client.config = CONFIG
+        client.repository = "example/repo"
+        client.trusted_logins = {"trusted"}
+        client.coordinator_logins = {"coordinator"}
+        client.intent_numbers.return_value = [1]
+        client.active_integration_sources.return_value = set()
+        client.comments.return_value = [intent_comment, repair_comment]
+        client.snapshot.return_value = ready
+
+        with redirect_stdout(io.StringIO()):
+            result = command_promote(client)
+
+        self.assertEqual(result["promoted"], [1])
+        client.remove_label.assert_called_with(1, "merge-queue-blocked")
+        client.add_label.assert_called_with(1, "merge-queue")
+
+    def test_promote_records_stale_intent_as_thread_repair(self) -> None:
+        value = entry(1)
+        value.labels = ["deploy-requested"]
+        intent_comment = {
+            "id": 1,
+            "created_at": "2026-06-20T00:00:00Z",
+            "user": {"login": "trusted"},
+            "body": intent_body(
+                intent_id="intent-1",
+                state="requested",
+                requested_at="2026-06-20T00:00:00Z",
+                requested_head="a" * 40,
+                provider="codex",
+                thread_id="thread-1",
+            ),
+        }
+        client = Mock()
+        client.config = CONFIG
+        client.repository = "example/repo"
+        client.trusted_logins = {"trusted"}
+        client.coordinator_logins = {"coordinator"}
+        client.intent_numbers.return_value = [1]
+        client.active_integration_sources.return_value = set()
+        client.comments.return_value = [intent_comment]
+        client.snapshot.return_value = value
+        client.labels.return_value = {"deploy-requested"}
+        client.base_sha.return_value = "b" * 40
+
+        with redirect_stdout(io.StringIO()):
+            result = command_promote(client)
+
+        self.assertEqual(result["promoted"], [])
+        self.assertEqual(result["blocked"][0]["number"], 1)
+        self.assertIn("older head", result["blocked"][0]["reason"])
+        client.add_label.assert_called_with(1, "merge-queue-blocked")
+        self.assertEqual(client.record_thread.call_args.args[0].phase, "blocked")
 
     def test_resume_atomically_requeues_repaired_exact_head(self) -> None:
         value = entry(1)
@@ -2212,6 +2582,51 @@ class QueueCoreTest(unittest.TestCase):
                 '"parent_intent_id": "old-intent"' in item["body"]
                 for item in refreshed_comments
             )
+        )
+
+    def test_metrics_skip_deployments_that_finished_before_the_merge(self) -> None:
+        merge_sha = "m" * 40
+        deployed_sha = "d" * 40
+        client = Mock()
+        client.config = CONFIG
+        client.trusted_logins = {"trusted"}
+        client.successful_workflow_runs.return_value = [
+            {
+                "name": "Deploy",
+                "conclusion": "success",
+                "head_sha": "o" * 40,
+                "created_at": "2026-06-20T00:20:00Z",
+                "updated_at": "2026-06-20T00:30:00Z",
+            },
+            {
+                "name": "Deploy",
+                "conclusion": "success",
+                "head_sha": deployed_sha,
+                "created_at": "2026-06-20T01:01:00Z",
+                "updated_at": "2026-06-20T01:05:00Z",
+            },
+        ]
+        client.recent_merged_pull_requests.return_value = [
+            {
+                "number": 42,
+                "merged_at": "2026-06-20T01:00:00Z",
+                "merge_commit_sha": merge_sha,
+            }
+        ]
+        client.comments_for_pull_requests.return_value = {42: []}
+        client.is_ancestor.return_value = True
+
+        result = delivery_metrics(client, limit=25)
+
+        self.assertEqual(result["sample_count"], 1)
+        self.assertEqual(result["samples"][0]["live_at"], "2026-06-20T01:05:00Z")
+        client.is_ancestor.assert_called_once_with(merge_sha, deployed_sha)
+        call_args = client.successful_workflow_runs.call_args
+        self.assertEqual(call_args.args, (CONFIG.pipeline.deploy_workflows,))
+        self.assertEqual(call_args.kwargs["limit"], 100)
+        self.assertEqual(
+            call_args.kwargs["since"],
+            datetime(2026, 6, 20, 1, tzinfo=timezone.utc),
         )
 
     def test_integration_pr_contains_every_frozen_head(self) -> None:

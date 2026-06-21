@@ -586,6 +586,59 @@ def split_blocked_entries(
     return eligible, blocked
 
 
+def reason_requires_repair(reason: str) -> bool:
+    """Return whether a gate needs source-owner action instead of more time."""
+    if reason == "pull request is draft":
+        return False
+    if reason == "GitHub reports the pull request merge state as DRAFT":
+        return False
+    if reason == "GitHub is still computing mergeability":
+        return False
+    if reason.endswith(" is not complete"):
+        return False
+    if "score is missing for the current head" in reason:
+        return False
+    if reason.endswith(" has not reviewed the current head"):
+        return False
+    if re.fullmatch(r"\d+/\d+ exact-head approvals complete", reason):
+        return False
+    return True
+
+
+def deployment_repair_required(entry: "QueueEntry") -> bool:
+    if any(verdict.state == "blocked" for verdict in entry.review_verdicts):
+        return True
+    waiting_reasons = {
+        reason
+        for verdict in entry.review_verdicts
+        if verdict.state == "waiting"
+        for reason in verdict.reasons
+    }
+    waiting_reasons.update(
+        f"{name} is not complete"
+        for name, status in entry.checks.items()
+        if status not in {"failed", "passed"}
+    )
+    transitional = {
+        "pull request is draft",
+        "GitHub reports the pull request merge state as DRAFT",
+        "GitHub is still computing mergeability",
+        *waiting_reasons,
+    }
+    return any(reason not in transitional for reason in entry.reasons or [])
+
+
+def repair_marker_is_transitional(marker: dict[str, Any] | None) -> bool:
+    if not marker:
+        return False
+    reasons = [
+        value.strip()
+        for value in str(marker.get("reason") or "").split(";")
+        if value.strip()
+    ]
+    return bool(reasons) and not any(reason_requires_repair(value) for value in reasons)
+
+
 @dataclass
 class QueueEntry:
     number: int
@@ -861,16 +914,124 @@ class GitHub:
         )
         return str(value["sha"])
 
-    def workflow_runs(self) -> list[dict[str, Any]]:
-        return self._paged_object_items(
-            f"repos/{self.repository}/actions/runs?branch={self.config.base_branch}&per_page=100",
-            "workflow_runs",
+    def workflow_runs(self, *, limit: int | None = None) -> list[dict[str, Any]]:
+        endpoint = (
+            f"repos/{self.repository}/actions/runs?"
+            f"branch={self.config.base_branch}&per_page=100"
         )
+        if limit is None:
+            return self._paged_object_items(endpoint, "workflow_runs")
+        data = self._json("api", endpoint)
+        values = data.get("workflow_runs") if isinstance(data, dict) else None
+        if not isinstance(values, list):
+            raise QueueError(f"unexpected GitHub response for {endpoint}")
+        return [value for value in values if isinstance(value, dict)][:limit]
 
     def workflow_runs_for_branch(self, branch: str) -> list[dict[str, Any]]:
         return self._paged_object_items(
             f"repos/{self.repository}/actions/runs?branch={quote(branch, safe='')}&per_page=100",
             "workflow_runs",
+        )
+
+    def workflow_runs_for_workflows(
+        self,
+        names: Iterable[str],
+        *,
+        limit: int = 100,
+        status: str | None = None,
+        since: datetime | None = None,
+    ) -> list[dict[str, Any]]:
+        configured = tuple(dict.fromkeys(names))
+        if not configured:
+            return []
+        values = self._json(
+            "workflow",
+            "list",
+            "--repo",
+            self.repository,
+            "--all",
+            "--limit",
+            "1000",
+            "--json",
+            "id,name,state",
+        )
+        workflows = values if isinstance(values, list) else []
+        runs: list[dict[str, Any]] = []
+        for name in configured:
+            matches = [
+                value
+                for value in workflows
+                if str(value.get("name") or "") == name
+                and str(value.get("state") or "") == "active"
+            ]
+            if len(matches) != 1:
+                raise QueueError(
+                    f"configured workflow {name!r} did not resolve to one active workflow"
+                )
+            workflow_id = int(matches[0]["id"])
+            status_filter = f"&status={quote(status, safe='')}" if status else ""
+            page = 1
+            workflow_runs: list[dict[str, Any]] = []
+            while True:
+                endpoint = (
+                    f"repos/{self.repository}/actions/workflows/{workflow_id}/runs?"
+                    f"branch={quote(self.config.base_branch, safe='')}{status_filter}&"
+                    f"per_page={min(max(limit, 1), 100)}&page={page}"
+                )
+                data = self._json("api", endpoint)
+                values = data.get("workflow_runs") if isinstance(data, dict) else None
+                if not isinstance(values, list):
+                    raise QueueError(f"unexpected GitHub response for {endpoint}")
+                workflow_runs.extend(
+                    value for value in values if isinstance(value, dict)
+                )
+                oldest = min(
+                    (
+                        parse_time(
+                            str(
+                                value.get("created_at") or value.get("updated_at") or ""
+                            )
+                        )
+                        for value in values
+                        if isinstance(value, dict)
+                    ),
+                    default=None,
+                )
+                if (
+                    len(values) < min(max(limit, 1), 100)
+                    or (since is not None and oldest is not None and oldest <= since)
+                    or (since is None and len(workflow_runs) >= limit)
+                ):
+                    break
+                page += 1
+            runs.extend(workflow_runs)
+        ordered = sorted(
+            runs,
+            key=lambda value: str(
+                value.get("created_at") or value.get("updated_at") or ""
+            ),
+            reverse=True,
+        )
+        if since is not None:
+            return [
+                value
+                for value in ordered
+                if (parse_time(str(value.get("created_at") or "")) or since) >= since
+            ]
+        return ordered[:limit]
+
+    def successful_workflow_runs(
+        self,
+        names: Iterable[str],
+        *,
+        limit: int = 100,
+        since: datetime | None = None,
+    ) -> list[dict[str, Any]]:
+        return self.workflow_runs_for_workflows(
+            names,
+            limit=limit,
+            status="success",
+            since=since,
         )
 
     def commit_check_runs(self, head_sha: str) -> list[dict[str, Any]]:
@@ -1044,11 +1205,26 @@ class GitHub:
         return dispatched
 
     def recent_merged_pull_requests(self, limit: int) -> list[dict[str, Any]]:
-        values = self._paged_api(
-            "repos/"
-            f"{self.repository}/pulls?state=closed&sort=updated&direction=desc&per_page=100"
-        )
-        return [value for value in values if value.get("merged_at")][:limit]
+        merged: list[dict[str, Any]] = []
+        page = 1
+        while len(merged) < limit:
+            endpoint = (
+                "repos/"
+                f"{self.repository}/pulls?state=closed&sort=updated&direction=desc"
+                f"&per_page=100&page={page}"
+            )
+            values = self._json("api", endpoint)
+            if not isinstance(values, list):
+                raise QueueError(f"unexpected GitHub response for {endpoint}")
+            merged.extend(
+                value
+                for value in values
+                if isinstance(value, dict) and value.get("merged_at")
+            )
+            if len(values) < 100:
+                break
+            page += 1
+        return merged[:limit]
 
     def is_ancestor(self, ancestor: str, descendant: str) -> bool:
         comparison = self._json(
@@ -1315,6 +1491,59 @@ class GitHub:
         return self._paged_api(
             f"repos/{self.repository}/issues/{number}/comments?per_page=100"
         )
+
+    def comments_for_pull_requests(
+        self, numbers: Iterable[int]
+    ) -> dict[int, list[dict[str, Any]]]:
+        selected = sorted({int(number) for number in numbers})
+        if not selected:
+            return {}
+        selections = "\n".join(
+            f"""pr_{number}: pullRequest(number: {number}) {{
+              comments(last: 100) {{
+                pageInfo {{ hasPreviousPage }}
+                nodes {{ databaseId body createdAt author {{ login }} }}
+              }}
+            }}"""
+            for number in selected
+        )
+        query = f"""query($owner: String!, $name: String!) {{
+          repository(owner: $owner, name: $name) {{
+            {selections}
+          }}
+        }}"""
+        data = self._json(
+            "api",
+            "graphql",
+            "-f",
+            f"query={query}",
+            "-F",
+            f"owner={self.owner}",
+            "-F",
+            f"name={self.name}",
+        )
+        try:
+            repository = data["data"]["repository"]
+        except (KeyError, TypeError) as error:
+            raise QueueError("could not read pull-request comments") from error
+        result: dict[int, list[dict[str, Any]]] = {}
+        for number in selected:
+            connection = repository.get(f"pr_{number}") or {}
+            comments = connection.get("comments") or {}
+            if (comments.get("pageInfo") or {}).get("hasPreviousPage"):
+                result[number] = self.comments(number)
+                continue
+            result[number] = [
+                {
+                    "id": value.get("databaseId"),
+                    "body": value.get("body"),
+                    "created_at": value.get("createdAt"),
+                    "user": {"login": (value.get("author") or {}).get("login")},
+                }
+                for value in comments.get("nodes") or []
+                if isinstance(value, dict)
+            ]
+        return result
 
     def reviews(self, number: int) -> list[dict[str, Any]]:
         return self._paged_api(
@@ -1784,6 +2013,37 @@ def command_inspect(
 def pipeline_status(client: GitHub) -> dict[str, Any]:
     queued = client.queue()
     queued_by_number = {entry.number: entry for entry in queued}
+    open_numbers = client.open_pull_request_numbers()
+    inspect_numbers = [
+        number for number in open_numbers if number not in queued_by_number
+    ]
+
+    def inspect(
+        number: int,
+    ) -> tuple[int, list[dict[str, Any]], QueueEntry]:
+        comments = client.comments(number)
+        return (
+            number,
+            comments,
+            client.snapshot(
+                number,
+                require_marker=False,
+                allow_blocked_label=True,
+                known_comments=comments,
+            ),
+        )
+
+    inspected: dict[int, tuple[list[dict[str, Any]], QueueEntry]] = {}
+    if inspect_numbers:
+        with ThreadPoolExecutor(
+            max_workers=min(
+                max(client.config.pipeline.promotion_workers, 8),
+                len(inspect_numbers),
+            )
+        ) as executor:
+            for number, comments, entry in executor.map(inspect, inspect_numbers):
+                inspected[number] = (comments, entry)
+    active_intents: list[tuple[QueueEntry, dict[str, Any], dict[str, Any]]] = []
     stages: dict[str, list[dict[str, Any]]] = {
         "draft": [],
         "reviewing": [],
@@ -1792,19 +2052,29 @@ def pipeline_status(client: GitHub) -> dict[str, Any]:
         "queued": [],
         "blocked": [],
     }
-    for number in client.open_pull_request_numbers():
+    for number in open_numbers:
         if number in queued_by_number:
             value = entry_dict(queued_by_number[number])
             value["pipeline_stage"] = "queued"
             stages["queued"].append(value)
             continue
-        entry = client.snapshot(
-            number,
-            require_marker=False,
-            allow_blocked_label=True,
-        )
+        comments, entry = inspected[number]
         labels = set(entry.labels)
-        if client.config.pipeline.intent_label in labels:
+        intent = latest_intent(comments, client.trusted_logins)
+        active_intent = bool(intent and intent.get("state") == "requested")
+        stale_intent = bool(
+            active_intent
+            and client.config.pipeline.intent_scope == "head"
+            and intent.get("requested_head") != entry.head_sha
+        )
+        if client.config.pipeline.intent_label in labels and (
+            not active_intent
+            or stale_intent
+            or client.config.blocked_label in labels
+            or deployment_repair_required(entry)
+        ):
+            stage = "blocked"
+        elif client.config.pipeline.intent_label in labels:
             stage = "deploy_requested"
         elif entry.is_draft:
             stage = "draft"
@@ -1816,16 +2086,64 @@ def pipeline_status(client: GitHub) -> dict[str, Any]:
             stage = "blocked"
         value = entry_dict(entry)
         value["pipeline_stage"] = stage
+        if client.config.pipeline.intent_label in labels:
+            value["deploy_intent"] = (
+                {
+                    "intent_id": intent.get("intent_id"),
+                    "requested_at": intent.get("requested_at"),
+                    "requested_head": intent.get("requested_head"),
+                    "head_matches": not stale_intent,
+                    "state": intent.get("state"),
+                }
+                if intent
+                else None
+            )
+        if (
+            client.config.pipeline.intent_label in labels
+            and active_intent
+            and intent is not None
+        ):
+            active_intents.append((entry, intent, value))
         stages[stage].append(value)
     main_sha = client.base_sha()
     delivery = release_state(
         main_sha=main_sha,
-        runs=client.workflow_runs(),
+        runs=client.workflow_runs_for_workflows(
+            (
+                *client.config.pipeline.ci_workflows,
+                *client.config.pipeline.deploy_workflows,
+            ),
+            limit=100,
+        ),
         config=client.config.pipeline,
     )
     now = datetime.now(timezone.utc)
     alerts: list[dict[str, Any]] = []
     queue_target = client.config.pipeline.ready_to_merge_target_minutes * 60
+    for entry, intent, value in active_intents:
+        timestamp = parse_time(str(intent.get("requested_at") or ""))
+        elapsed = (now - timestamp).total_seconds() if timestamp else None
+        if elapsed is None or elapsed <= queue_target:
+            continue
+        requested_head = str(intent.get("requested_head") or "")
+        if requested_head and requested_head != entry.head_sha:
+            active_gate = "deploy intent is bound to an older head"
+        elif client.config.blocked_label in entry.labels:
+            active_gate = "repair is blocked; source thread must resume"
+        else:
+            active_gate = "; ".join(entry.reasons or []) or "promotion worker"
+        alerts.append(
+            {
+                "stage": "request-to-ready",
+                "pull_request": entry.number,
+                "elapsed_seconds": elapsed,
+                "target_seconds": queue_target,
+                "active_gate": active_gate,
+                "requested_head": requested_head or None,
+                "current_head": entry.head_sha,
+                "pipeline_stage": value["pipeline_stage"],
+            }
+        )
     for entry in queued:
         timestamp = parse_time(entry.queued_at)
         elapsed = (now - timestamp).total_seconds() if timestamp else None
@@ -1862,6 +2180,9 @@ def pipeline_status(client: GitHub) -> dict[str, Any]:
         "pull_requests": stages,
         "queue": [entry_dict(entry) for entry in queued],
         "overlap_groups": overlap_groups(queued),
+        "active_intent_overlap_groups": overlap_groups(
+            [entry for entry, _, _ in active_intents]
+        ),
         "release": delivery,
         "alerts": alerts,
     }
@@ -1876,7 +2197,8 @@ def print_pipeline_status(value: dict[str, Any], *, json_output: bool) -> None:
         "threads: "
         f"{len(value['threads'])} active; "
         f"notifications: {len(value.get('notifications') or [])} pending; "
-        f"deploy requests: {len(stages['deploy_requested'])}; "
+        "deploy requests: "
+        f"{sum(1 for entries in stages.values() for entry in entries if entry.get('deploy_intent'))}; "
         f"queue: {len(value['queue'])}; "
         f"release: {value['release']['state']}"
     )
@@ -2275,6 +2597,32 @@ def reconcile_externally_merged_threads(client: GitHub) -> list[dict[str, Any]]:
         except QueueError:
             continue
         if not merge_sha:
+            try:
+                pull = client.pull_head(number)
+            except QueueError:
+                continue
+            if pull.get("state") != "CLOSED":
+                continue
+            updated_at = utc_now()
+            client.record_thread(
+                ThreadRecord(
+                    provider=str(record["provider"]),
+                    thread_id=str(record["thread_id"]),
+                    phase="abandoned",
+                    updated_at=updated_at,
+                    title=str(record.get("title") or "") or None,
+                    branch=str(record.get("branch") or "") or None,
+                    pull_request=number,
+                    url=str(record.get("url") or "") or None,
+                )
+            )
+            value = {"pull_request": number, "state": "abandoned"}
+            reconciled.append(value)
+            notify(
+                client.config.pipeline,
+                "deploy-abandoned",
+                {"repository": client.repository, **value},
+            )
             continue
         updated_at = utc_now()
         record_deployment_notification_obligation(
@@ -2348,29 +2696,41 @@ def command_promote(
             client.config.pipeline.intent_scope == "head"
             and intent.get("requested_head") != entry.head_sha
         ):
-            return (
-                "waiting",
-                {
-                    "number": number,
-                    "reasons": [
-                        "deploy intent is bound to an older head; the trusted source "
-                        "agent must run deploybot refresh-request"
-                    ],
-                },
-                entry,
+            reason = (
+                "deploy intent is bound to an older head; the trusted source agent "
+                "must run deploybot refresh-request after fresh gates pass"
             )
+            record_repair(client, entry, intent, reason)
+            return "blocked", {"number": number, "reason": reason}, entry
         if client.config.blocked_label in entry.labels:
-            return (
-                "waiting",
-                {
-                    "number": number,
-                    "reasons": [
-                        "repair is blocked; the trusted source agent must run "
-                        "deploybot resume after fresh gates pass"
-                    ],
-                },
-                entry,
+            repair = latest_payload(
+                comments,
+                REPAIR_MARKER,
+                coordinator_logins(client),
             )
+            if repair_marker_is_transitional(repair):
+                if deployment_repair_required(entry):
+                    reason = "; ".join(entry.reasons or ["blocked"])
+                    record_repair(client, entry, intent, reason)
+                    return "blocked", {"number": number, "reason": reason}, entry
+                client.remove_label(number, client.config.blocked_label)
+                entry.labels = [
+                    label
+                    for label in entry.labels
+                    if label != client.config.blocked_label
+                ]
+            else:
+                return (
+                    "waiting",
+                    {
+                        "number": number,
+                        "reasons": [
+                            "repair is blocked; the trusted source agent must run "
+                            "deploybot resume after fresh gates pass"
+                        ],
+                    },
+                    entry,
+                )
         if entry.state == "ready":
             changed = queue_from_intent(
                 client,
@@ -2382,7 +2742,7 @@ def command_promote(
             if changed:
                 return "promoted", {"number": number}, entry
             return "ready", None, entry
-        if entry.state == "blocked":
+        if deployment_repair_required(entry):
             reason = "; ".join(entry.reasons or ["blocked"])
             record_repair(client, entry, intent, reason)
             return "blocked", {"number": number, "reason": reason}, entry
@@ -4218,44 +4578,65 @@ def command_control(client: GitHub, *, state: str, reason: str | None) -> None:
 
 
 def delivery_metrics(client: GitHub, *, limit: int) -> dict[str, Any]:
-    deploy_runs = [
-        run
-        for run in client.workflow_runs()
-        if str(run.get("name") or "") in set(client.config.pipeline.deploy_workflows)
-        and run.get("conclusion") == "success"
+    pulls = client.recent_merged_pull_requests(limit)
+    merged_times = [
+        value
+        for value in (parse_time(str(pull.get("merged_at") or "")) for pull in pulls)
+        if value is not None
     ]
-    samples: list[dict[str, Any]] = []
-    for pull in client.recent_merged_pull_requests(limit):
+    earliest_merge = min(merged_times, default=None)
+    deploy_runs = sorted(
+        client.successful_workflow_runs(
+            client.config.pipeline.deploy_workflows,
+            limit=max(100, limit),
+            since=earliest_merge,
+        ),
+        key=lambda item: str(item.get("updated_at") or ""),
+    )
+    comments_by_number = client.comments_for_pull_requests(
+        int(pull["number"]) for pull in pulls
+    )
+
+    def sample(pull: dict[str, Any]) -> dict[str, Any]:
         number = int(pull["number"])
-        comments = client.comments(number)
+        comments = comments_by_number.get(number, [])
         intent = latest_intent(comments, client.trusted_logins)
         marker = queue_marker_for_client(client, comments)
         merged_at = str(pull.get("merged_at") or "") or None
         merge_sha = str(pull.get("merge_commit_sha") or "")
         live_at: str | None = None
         if merge_sha:
-            for run in sorted(
-                deploy_runs, key=lambda item: str(item.get("updated_at") or "")
-            ):
+            merged_time = parse_time(merged_at)
+            for run in deploy_runs:
+                created_time = parse_time(str(run.get("created_at") or ""))
                 deployed_sha = str(run.get("head_sha") or "")
+                if merged_time and created_time:
+                    if created_time < merged_time:
+                        continue
                 if deployed_sha and client.is_ancestor(merge_sha, deployed_sha):
                     live_at = str(run.get("updated_at") or "") or None
                     break
         requested_at = str((intent or {}).get("requested_at") or "") or None
         queued_at = str((marker or {}).get("queued_at") or "") or None
-        samples.append(
-            {
-                "pull_request": number,
-                "requested_at": requested_at,
-                "queued_at": queued_at,
-                "merged_at": merged_at,
-                "live_at": live_at,
-                "request_to_queue_seconds": seconds_between(requested_at, queued_at),
-                "queue_to_merge_seconds": seconds_between(queued_at, merged_at),
-                "merge_to_live_seconds": seconds_between(merged_at, live_at),
-                "request_to_live_seconds": seconds_between(requested_at, live_at),
-            }
-        )
+        return {
+            "pull_request": number,
+            "requested_at": requested_at,
+            "queued_at": queued_at,
+            "merged_at": merged_at,
+            "live_at": live_at,
+            "request_to_queue_seconds": seconds_between(requested_at, queued_at),
+            "queue_to_merge_seconds": seconds_between(queued_at, merged_at),
+            "merge_to_live_seconds": seconds_between(merged_at, live_at),
+            "request_to_live_seconds": seconds_between(requested_at, live_at),
+        }
+
+    if not pulls:
+        samples: list[dict[str, Any]] = []
+    else:
+        with ThreadPoolExecutor(
+            max_workers=min(client.config.pipeline.promotion_workers, len(pulls))
+        ) as executor:
+            samples = list(executor.map(sample, pulls))
     return summarize_metrics(samples)
 
 

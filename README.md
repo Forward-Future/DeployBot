@@ -87,11 +87,12 @@ the user does not repeat `deploy`. No polling timer is involved.
 Install `examples/github-workflow.yml` on the default branch. It reacts to
 deploy labels, ready/synchronize events, reviews, named CI `workflow_run`
 completions, and completed external check suites. Keep its `workflows` list
-aligned with `pipeline.ci_workflows`. The privileged worker never checks out or
-executes pull-request code. The Action follows releases by default so the same
-serialized worker can dispatch deployment when GitHub suppresses the
-`workflow_run` event for token-dispatched CI. Pin the Action to the full
-reviewed release commit:
+aligned with `pipeline.ci_workflows`. A five-minute scheduled reconciliation
+rereads all durable state in case GitHub concurrency coalesces the last pending
+event in a burst. The privileged worker never checks out or executes
+pull-request code. The Action follows releases by default so the same serialized
+worker can dispatch deployment when GitHub suppresses the `workflow_run` event
+for token-dispatched CI. Pin the Action to the full reviewed release commit:
 
 ```yaml
 - uses: Forward-Future/DeployBot@b06346119a29d0be1c25d1643fdc06a03f7b94a9
@@ -150,14 +151,19 @@ they cannot create the original per-pull-request deploy intent.
 ## Delivery controller
 
 `deploybot status` reports active metadata-only agent threads, pending native
-notifications, every PR stage, deploy requests, queue order, overlaps,
-exact-`main` CI, deployment, and pipeline pause state. It never stores prompts,
+notifications, every PR stage, deploy requests and their exact authorized heads,
+queue order, queued and pre-queue intent overlaps, exact-`main` CI, deployment,
+and pipeline pause state. It alerts when a deploy request exceeds the configured
+ready-to-merge target and names the current gate. It never stores prompts,
 transcripts, source, or credentials.
 
 `deploybot react` promotes ready intent, skips blockers, drains independent
-work, and creates integration PRs when configured. A conflict produces a repair
-handoff containing the source thread, base/head SHAs, source paths, and one
-return command:
+work, and creates integration PRs when configured. Draft status and incomplete
+checks or reviews remain waiting states; they do not create a repair latch. A
+conflict, failed gate, unresolved review, manual block, or stale authorized head
+produces a repair handoff containing the source thread, base/head SHAs, source
+paths, and one return command. Old draft-only repair latches self-clear once the
+controller recognizes them:
 
 In `overlap` mode, a ready source waits when another active, near-ready intent
 belongs to the same source-overlap component. Unrelated ready work still drains,
