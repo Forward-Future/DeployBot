@@ -63,6 +63,8 @@ class DeployBotSkillTest(unittest.TestCase):
             encoding="utf-8"
         )
         self.assertIn("workflow_run:", workflow)
+        self.assertIn("schedule:", workflow)
+        self.assertIn('cron: "*/5 * * * *"', workflow)
         self.assertIn("workflows: [CI]", workflow)
         self.assertIn("github.event.repository.default_branch", workflow)
         self.assertIn(

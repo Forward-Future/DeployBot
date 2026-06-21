@@ -27,6 +27,10 @@ exact heads, pending checks/reviews, blockers, dependencies, overlaps, exact
 is still waiting outside it. Never publish prompts, transcripts, source, or
 credentials to the thread registry.
 
+Treat `active_intent_overlap_groups` as the pre-queue collision view. Treat a
+`request-to-ready` alert as an ownership signal: report its exact active gate and
+the source-thread action, rather than describing the empty queue as idle.
+
 Use these state meanings:
 
 - `ready`: every configured merge gate passes.

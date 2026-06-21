@@ -11,6 +11,10 @@ on:
     types: [completed]
   check_suite:
     types: [completed]
+  # GitHub concurrency coalesces pending event bursts. Reconcile the complete
+  # durable state periodically so the last cancelled event cannot strand work.
+  schedule:
+    - cron: "*/5 * * * *"
   workflow_dispatch:
 
 permissions:

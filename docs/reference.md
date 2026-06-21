@@ -23,7 +23,7 @@ DeployBot resolves the pull request for the current branch.
 | `deploybot init [--force]` | Write a safe starter policy. Existing files are preserved unless `--force` is supplied. |
 | `deploybot ensure-labels` | Create or refresh the configured queue, blocked, intent, pause, and registry labels. |
 | `deploybot doctor [--json]` | Check authentication, policy, labels, actors, checks, workflows, and branch protection without changing repository state. |
-| `deploybot status [--json]` | Read active thread metadata, pending native notifications, PR stages, deploy intent, queue state, exact-main CI, deployment, and pipeline control state. |
+| `deploybot status [--json]` | Read active thread metadata, pending native notifications, PR stages, exact-head deploy intent, pre-queue intent overlaps, request-stage timing alerts, queue state, exact-main CI, deployment, and pipeline control state. |
 | `deploybot plan [--json]` | Read the ordered queue, dependencies, blockers, and source-overlap groups. |
 | `deploybot inspect [PR] [--json]` | Evaluate one exact PR head without granting merge authority. |
 | `deploybot metrics [--limit N] [--json]` | Summarize p50, p95, and maximum delivery timings for recent merged PRs. The default limit is 25. |
@@ -164,7 +164,7 @@ Provider fields are:
 | `batch_settle_seconds` | Non-negative window for coalescing near-ready deploy requests before freezing a batch. Default: 15. |
 | `ci_failure_grace_seconds` | Non-negative window for an exact-main CI retry to replace a failed attempt before the release fails. Default: 90. |
 | `promotion_workers` | Positive maximum number of deploy requests promoted concurrently. Default: 4. |
-| `ready_to_merge_target_minutes` | Positive timing target; default 15. |
+| `ready_to_merge_target_minutes` | Positive request-to-ready and queued-to-merge timing target; default 15. |
 | `merge_to_live_target_minutes` | Positive timing target; default 10. |
 | `auto_promote` | Default `true`. |
 | `intent_scope` | Currently must be `"head"`. |
@@ -195,10 +195,11 @@ The composite Action runs `deploybot react` from the checked-out default branch.
 | `timeout` | `"1800"` | Release-follow timeout in seconds. |
 
 The workflow needs `contents: write`, `pull-requests: write`, `checks: read`,
-`issues: write`, and `actions: write`. Use the event filters and concurrency
-group in [`examples/github-workflow.yml`](../examples/github-workflow.yml), pin
-the Action to a reviewed full commit SHA, and keep its `workflow_run.workflows`
-list aligned with `pipeline.ci_workflows`.
+`issues: write`, and `actions: write`. Use the event filters, concurrency group,
+and scheduled full-state reconciliation in
+[`examples/github-workflow.yml`](../examples/github-workflow.yml), pin the Action
+to a reviewed full commit SHA, and keep its `workflow_run.workflows` list aligned
+with `pipeline.ci_workflows`.
 
 ## Authentication and environment
 
