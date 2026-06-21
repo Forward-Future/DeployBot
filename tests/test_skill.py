@@ -6,7 +6,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 CANONICAL = ROOT / "skills" / "deploybot" / "SKILL.md"
-RELEASE_COMMIT = "6ed5569ffbcbb4dea1dece6f889726b67d9411f2"
+RELEASE_COMMIT = "2a502a74251e2fbb07e5b4769ce99687235df5ae"
 CHECKOUT_COMMIT = "9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0"
 
 
@@ -65,6 +65,19 @@ class DeployBotSkillTest(unittest.TestCase):
         for path in paths:
             with self.subTest(path=path):
                 self.assertIn(CHECKOUT_COMMIT, path.read_text(encoding="utf-8"))
+
+    def test_action_dispatches_ci_after_builtin_token_merge(self) -> None:
+        action = (ROOT / "action.yml").read_text(encoding="utf-8")
+        example = (ROOT / "examples" / "github-workflow.yml").read_text(
+            encoding="utf-8"
+        )
+        workflow = (ROOT / ".github" / "workflows" / "ci.yml").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn('default: "true"', action)
+        self.assertIn("args+=(--dispatch-ci)", action)
+        self.assertIn("actions: write", example)
+        self.assertIn("workflow_dispatch:", workflow)
 
     def test_clients_pin_the_immutable_status_release(self) -> None:
         paths = [

@@ -794,6 +794,47 @@ class GitHub:
             raise QueueError("GitHub returned invalid workflow-run data")
         return [run for run in runs if isinstance(run, dict)]
 
+    def dispatch_ci_workflows(self) -> list[dict[str, Any]]:
+        configured = self.config.pipeline.ci_workflows
+        if not configured:
+            raise QueueError("no CI workflow is configured for post-merge dispatch")
+        values = self._json(
+            "workflow",
+            "list",
+            "--repo",
+            self.repository,
+            "--all",
+            "--limit",
+            "1000",
+            "--json",
+            "id,name,state",
+        )
+        workflows = values if isinstance(values, list) else []
+        dispatched: list[dict[str, Any]] = []
+        for name in configured:
+            matches = [
+                value
+                for value in workflows
+                if str(value.get("name") or "") == name
+                and str(value.get("state") or "") == "active"
+            ]
+            if len(matches) != 1:
+                raise QueueError(
+                    f"configured CI workflow {name!r} did not resolve to one active workflow"
+                )
+            workflow_id = int(matches[0]["id"])
+            self._run(
+                "workflow",
+                "run",
+                str(workflow_id),
+                "--repo",
+                self.repository,
+                "--ref",
+                self.config.base_branch,
+            )
+            dispatched.append({"id": workflow_id, "name": name})
+        return dispatched
+
     def recent_merged_pull_requests(self, limit: int) -> list[dict[str, Any]]:
         values = self._paged_api(
             "repos/"
@@ -2578,6 +2619,7 @@ def command_react(
     *,
     follow: bool,
     timeout_seconds: int,
+    dispatch_ci: bool = False,
 ) -> dict[str, Any]:
     control = client.pipeline_control()
     if control.get("state") == "paused":
@@ -2627,6 +2669,16 @@ def command_react(
                     entries=overlap_entries,
                 )
             )
+    dispatched_ci: list[dict[str, Any]] = []
+    if dispatch_ci and drained.get("merged"):
+        try:
+            dispatched_ci = client.dispatch_ci_workflows()
+        except QueueError as error:
+            if client.config.pipeline.pause_on_failure:
+                client.set_pipeline_control(
+                    "paused", "post-merge CI dispatch failed: " + str(error)
+                )
+            raise
     release: dict[str, Any] | None = None
     if follow and drained.get("merged"):
         release = command_follow(
@@ -2641,6 +2693,7 @@ def command_react(
         "promoted": promoted,
         "promoted_integrations": promoted_integrations,
         "drain": drained,
+        "dispatched_ci": dispatched_ci,
         "integrations": integrations,
         "release": release,
     }
@@ -2772,6 +2825,11 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers.add_parser("promote", help="promote ready deploy requests into queue")
     react = subparsers.add_parser("react", help="event-driven promote and drain worker")
     react.add_argument("--follow", action="store_true")
+    react.add_argument(
+        "--dispatch-ci",
+        action="store_true",
+        help="dispatch configured CI once after this worker merges a batch",
+    )
     react.add_argument("--timeout", type=int, default=1800)
     integrate = subparsers.add_parser("integrate", help="scaffold a cumulative PR")
     integrate.add_argument("--all", action="store_true", dest="all_entries")
@@ -2879,6 +2937,7 @@ def main(argv: list[str] | None = None) -> int:
                 client,
                 follow=arguments.follow,
                 timeout_seconds=arguments.timeout,
+                dispatch_ci=arguments.dispatch_ci,
             )
         elif arguments.command == "integrate":
             command_integrate(client, all_entries=arguments.all_entries)

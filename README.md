@@ -11,11 +11,11 @@ integration PRs, follows `main` through production, and pauses after failures.
 
 ## Install
 
-Install the reviewed `v0.2.1` source commit directly from GitHub:
+Install the reviewed `v0.2.2` source commit directly from GitHub:
 
 ```bash
 python3 -m pip install \
-  'deploybot-merge-queue[mcp] @ git+https://github.com/Forward-Future/DeployBot.git@6ed5569ffbcbb4dea1dece6f889726b67d9411f2'
+  'deploybot-merge-queue[mcp] @ git+https://github.com/Forward-Future/DeployBot.git@2a502a74251e2fbb07e5b4769ce99687235df5ae'
 deploybot init
 ```
 
@@ -86,8 +86,16 @@ aligned with `pipeline.ci_workflows`. The privileged worker never checks out or
 executes pull-request code. Pin the Action to the full reviewed release commit:
 
 ```yaml
-- uses: Forward-Future/DeployBot@6ed5569ffbcbb4dea1dece6f889726b67d9411f2
+- uses: Forward-Future/DeployBot@2a502a74251e2fbb07e5b4769ce99687235df5ae
 ```
+
+The Action uses GitHub's built-in workflow token. GitHub intentionally does not
+turn merges made by that token into ordinary `push` workflow runs, so DeployBot
+dispatches each configured CI workflow once after it merges a batch. Those CI
+workflows must accept `workflow_dispatch`; the resulting completed CI run can
+trigger the repository's normal deployment workflow. Set Action input
+`dispatch_ci: "false"` only when a caller supplies a different merge identity
+that already triggers push CI.
 
 The workflow bot and each person allowed to request deployment must be
 explicitly listed:

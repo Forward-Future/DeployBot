@@ -1085,6 +1085,77 @@ class QueueCoreTest(unittest.TestCase):
         drain.assert_not_called()
         self.assertEqual(result["integrations"], [{"number": 99}])
 
+    def test_reactor_dispatches_ci_once_after_a_merged_batch(self) -> None:
+        client = Mock()
+        client.config = CONFIG
+        client.pipeline_control.return_value = {"state": "running"}
+        client.dispatch_ci_workflows.return_value = [{"id": 7, "name": "CI"}]
+        empty = FreezeResult(None, [], [], [], [])
+        with (
+            patch("agent_merge_queue.cli.promote_integrations", return_value=[]),
+            patch("agent_merge_queue.cli.command_promote", return_value={}),
+            patch("agent_merge_queue.cli.freeze_queue", return_value=empty),
+            patch(
+                "agent_merge_queue.cli.command_drain",
+                return_value={"merged": [{"number": 1, "merge_sha": "a" * 40}]},
+            ),
+            redirect_stdout(io.StringIO()),
+        ):
+            result = command_react(
+                client,
+                follow=False,
+                timeout_seconds=10,
+                dispatch_ci=True,
+            )
+        client.dispatch_ci_workflows.assert_called_once_with()
+        self.assertEqual(result["dispatched_ci"], [{"id": 7, "name": "CI"}])
+
+    def test_reactor_pauses_when_post_merge_ci_dispatch_fails(self) -> None:
+        client = Mock()
+        client.config = CONFIG
+        client.pipeline_control.return_value = {"state": "running"}
+        client.dispatch_ci_workflows.side_effect = QueueError("CI has no dispatch")
+        empty = FreezeResult(None, [], [], [], [])
+        with (
+            patch("agent_merge_queue.cli.promote_integrations", return_value=[]),
+            patch("agent_merge_queue.cli.command_promote", return_value={}),
+            patch("agent_merge_queue.cli.freeze_queue", return_value=empty),
+            patch(
+                "agent_merge_queue.cli.command_drain",
+                return_value={"merged": [{"number": 1, "merge_sha": "a" * 40}]},
+            ),
+            redirect_stdout(io.StringIO()),
+            self.assertRaisesRegex(QueueError, "CI has no dispatch"),
+        ):
+            command_react(
+                client,
+                follow=False,
+                timeout_seconds=10,
+                dispatch_ci=True,
+            )
+        client.set_pipeline_control.assert_called_once_with(
+            "paused", "post-merge CI dispatch failed: CI has no dispatch"
+        )
+
+    def test_github_dispatches_each_configured_active_ci_workflow(self) -> None:
+        client = object.__new__(GitHub)
+        client.config = CONFIG
+        client.repository = "example/repo"
+        client._json = Mock(
+            return_value=[
+                {"id": 7, "name": "CI", "state": "active"},
+                {"id": 8, "name": "Old CI", "state": "disabled_manually"},
+            ]
+        )
+        client._run = Mock(return_value="")
+
+        result = client.dispatch_ci_workflows()
+
+        self.assertEqual(result, [{"id": 7, "name": "CI"}])
+        client._run.assert_called_once_with(
+            "workflow", "run", "7", "--repo", "example/repo", "--ref", "main"
+        )
+
     def test_pipeline_pause_blocks_every_merge_path(self) -> None:
         client = Mock()
         client.pipeline_control.return_value = {
