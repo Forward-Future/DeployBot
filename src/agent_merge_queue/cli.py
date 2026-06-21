@@ -818,12 +818,15 @@ class QueueEntry:
             elif self.queue_state != "queued":
                 blocked.append("queue authorization was revoked")
 
+        required_checks_passed = bool(config.required_checks)
         for name in config.required_checks:
             status = self.checks.get(name)
             if status == "failed":
                 blocked.append(f"{name} failed")
+                required_checks_passed = False
             elif status != "passed":
                 waiting.append(f"{name} is not complete")
+                required_checks_passed = False
 
         for verdict in self.review_verdicts:
             if verdict.state == "blocked":
@@ -833,10 +836,14 @@ class QueueEntry:
 
         if self.mergeable == "CONFLICTING" or self.merge_state == "DIRTY":
             blocked.append("pull request conflicts with main")
+        elif self.merge_state == "BEHIND":
+            blocked.append("GitHub reports the pull request head ref is out of date")
         elif self.merge_state in {"BLOCKED", "DRAFT"}:
             blocked.append(
                 f"GitHub reports the pull request merge state as {self.merge_state}"
             )
+        elif self.merge_state == "UNSTABLE" and not required_checks_passed:
+            waiting.append("GitHub reports non-passing commit status")
         elif self.merge_state == "UNKNOWN" or self.mergeable != "MERGEABLE":
             waiting.append("GitHub is still computing mergeability")
 
