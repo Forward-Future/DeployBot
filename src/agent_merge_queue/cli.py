@@ -5144,6 +5144,12 @@ def command_unpause(
             f"DeployBot main advanced from {main_sha} to {refreshed_main} "
             "during unpause; pipeline remains paused"
         )
+    # This is the compare-and-set boundary. A main advance after this final
+    # read occurs after the matching pause was successfully resumed and may be
+    # the expected repair merge. The release-admission fence then blocks every
+    # later batch until that newer exact main passes CI, deploy, and health
+    # verification; binding `running` to the failed SHA forever would instead
+    # re-pause the repair merge and strand takeover workers.
     print(f"DeployBot pipeline is running for recovered main {main_sha}")
 
 
