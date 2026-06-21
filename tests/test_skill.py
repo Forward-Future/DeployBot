@@ -38,6 +38,9 @@ class DeployBotSkillTest(unittest.TestCase):
         self.assertIn("send_message_to_thread", skill)
         self.assertIn("acknowledge_thread_deployment", skill)
         self.assertIn("heartbeat automation", skill)
+        self.assertIn("human-facing release receipt", skill)
+        self.assertIn("acknowledge silently", skill)
+        self.assertIn("untrusted display-only", skill)
         self.assertIn("Never publish prompts, transcripts", skill)
         self.assertIn("Never call `freeze_queue` merely to view status", skill)
         self.assertIn("exact `deploy` instruction", skill)
@@ -51,6 +54,7 @@ class DeployBotSkillTest(unittest.TestCase):
         self.assertIn("request_deployment", rule)
         self.assertIn("thread_notifications", rule)
         self.assertIn("acknowledge_thread_deployment", rule)
+        self.assertIn("human-readable release", rule)
         self.assertIn("never freeze a", rule)
         self.assertIn("queue merely to inspect it", rule)
 

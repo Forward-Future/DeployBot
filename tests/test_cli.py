@@ -43,6 +43,7 @@ from agent_merge_queue.cli import (
     new_batch,
     overlap_groups,
     promote_integrations,
+    pull_request_feature_summary,
     queue_state_body,
     queue_from_intent,
     queue_timestamp,
@@ -51,6 +52,7 @@ from agent_merge_queue.cli import (
     settle_integration_checks,
     should_settle_batch,
     structured_dependencies,
+    thread_deployment_notification,
     thread_notification_id,
 )
 from agent_merge_queue.config import parse_config
@@ -123,6 +125,35 @@ def deployment_notification(
 
 
 class QueueCoreTest(unittest.TestCase):
+    def test_pull_release_details_reads_human_facing_metadata(self) -> None:
+        client = object.__new__(GitHub)
+        client.repository = "example/repo"
+        client._json = Mock(
+            return_value={
+                "body": "## What changed\n- Added receipts",
+                "title": "Readable deployment receipts",
+                "url": "https://example.test/pull/42",
+            }
+        )
+
+        self.assertEqual(
+            client.pull_release_details(42),
+            {
+                "body": "## What changed\n- Added receipts",
+                "title": "Readable deployment receipts",
+                "url": "https://example.test/pull/42",
+            },
+        )
+        client._json.assert_called_once_with(
+            "pr",
+            "view",
+            "42",
+            "--repo",
+            "example/repo",
+            "--json",
+            "body,title,url",
+        )
+
     def test_ensure_labels_exist_is_race_safe(self) -> None:
         client = object.__new__(GitHub)
         client.repository = "example/repo"
@@ -300,6 +331,19 @@ class QueueCoreTest(unittest.TestCase):
         client.repository = "example/repo"
         client.is_ancestor.return_value = True
         client.deployment_notifications.return_value = []
+        client.pull_release_details.return_value = {
+            "title": "Add human-readable deployment receipts",
+            "url": "https://example.test/pull/42",
+            "body": """## What changed
+- Names the deployed change.
+- Summarizes the user-facing features.
+- Keeps exact release evidence.
+- This fourth item is intentionally omitted.
+
+## Validation
+- 144 tests passed.
+""",
+        }
         client.thread_records.return_value = [
             {
                 "phase": "merged",
@@ -335,7 +379,21 @@ class QueueCoreTest(unittest.TestCase):
         self.assertEqual(
             notification["deployment_url"], "https://example.test/deploy/2"
         )
-        self.assertIn("PR #42 is live", notification["message"])
+        self.assertIn("Deployment complete", notification["message"])
+        self.assertIn(
+            "` Add human-readable deployment receipts ` "
+            "([PR #42](https://example.test/pull/42)) is now live.",
+            notification["message"],
+        )
+        self.assertIn("- ` Names the deployed change. `", notification["message"])
+        self.assertIn(
+            "- ` Summarizes the user-facing features. `", notification["message"]
+        )
+        self.assertIn("- ` Keeps exact release evidence. `", notification["message"])
+        self.assertNotIn("fourth item", notification["message"])
+        self.assertNotIn("144 tests", notification["message"])
+        self.assertIn(f"- Exact main: `{sha}`", notification["message"])
+        self.assertIn("[CI run](https://example.test/ci/1)", notification["message"])
         self.assertTrue(notification["notification_id"].startswith("thread-deployed:"))
         deployed = client.record_thread.call_args.args[0]
         outbox = client.record_deployment_notification.call_args.args[0]
@@ -347,7 +405,54 @@ class QueueCoreTest(unittest.TestCase):
         self.assertEqual(deployed.ci_url, "https://example.test/ci/1")
         self.assertEqual(deployed.deployment_url, "https://example.test/deploy/2")
         client.is_ancestor.assert_called_once_with("m" * 40, sha)
+        client.pull_release_details.assert_called_once_with(42)
         notify.assert_any_call(CONFIG.pipeline, "thread-deployed", notification)
+
+    def test_pull_request_feature_summary_prefers_release_notes(self) -> None:
+        body = """Introductory context.
+
+## Features
+1. First feature
+2. Second feature
+2. Second feature
+
+## Test plan
+- This should not appear.
+"""
+
+        self.assertEqual(
+            pull_request_feature_summary(body),
+            ["First feature", "Second feature"],
+        )
+
+    def test_deployment_receipt_neutralizes_untrusted_markdown(self) -> None:
+        notification = thread_deployment_notification(
+            repository="example/repo",
+            record={
+                "provider": "codex",
+                "thread_id": "thread-42",
+                "pull_request": 42,
+                "merge_sha": "m" * 40,
+            },
+            release={"main_sha": "a" * 40},
+            pull_request_details={
+                "title": (
+                    "[Reauthenticate](https://attacker.example) "
+                    "![](https://attacker.example/pixel)"
+                ),
+                "body": (
+                    "## What changed\n"
+                    "- Review [details](https://attacker.example/details) and "
+                    "![pixel](https://attacker.example/pixel)"
+                ),
+                "url": "https://example.test/pull/42",
+            },
+        )
+
+        self.assertNotIn("attacker.example", notification["message"])
+        self.assertIn("` Reauthenticate `", notification["message"])
+        self.assertIn("- ` Review details and pixel `", notification["message"])
+        self.assertIn("[PR #42](https://example.test/pull/42)", notification["message"])
 
     def test_verified_release_promotes_obligation_after_thread_moves_on(self) -> None:
         sha = "a" * 40
@@ -367,6 +472,7 @@ class QueueCoreTest(unittest.TestCase):
         client.repository = "example/repo"
         client.is_ancestor.return_value = True
         client.deployment_notifications.return_value = [obligation]
+        client.pull_release_details.side_effect = QueueError("metadata unavailable")
         client.thread_records.return_value = [
             {
                 "phase": "working",
@@ -397,6 +503,10 @@ class QueueCoreTest(unittest.TestCase):
         notification = result["thread_notifications"][0]
         self.assertEqual(notification["notification_id"], obligation["notification_id"])
         self.assertEqual(notification["main_sha"], sha)
+        self.assertIn(
+            "**[PR #42](https://github.com/example/repo/pull/42)** is now live.",
+            notification["message"],
+        )
         pending = client.record_deployment_notification.call_args.args[0]
         self.assertEqual(pending.state, "pending")
         self.assertEqual(pending.merge_sha, merge_sha)
@@ -594,6 +704,7 @@ class QueueCoreTest(unittest.TestCase):
         self.assertEqual(result["thread_notifications"], [])
         client.record_deployment_notification.assert_not_called()
         client.record_thread.assert_not_called()
+        client.pull_release_details.assert_not_called()
         self.assertEqual(notify.call_count, 1)
         self.assertEqual(notify.call_args.args[1], "verified")
 
