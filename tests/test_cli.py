@@ -56,6 +56,7 @@ from agent_merge_queue.cli import (
     queue_timestamp,
     reconcile_externally_merged_threads,
     record_repair,
+    release_follow_needed,
     repair_overlap_hold_active,
     reusable_batch,
     settle_integration_checks,
@@ -66,11 +67,13 @@ from agent_merge_queue.cli import (
 )
 from agent_merge_queue.config import parse_config
 from agent_merge_queue.records import (
+    ThreadRecord,
     control_body,
     integration_body,
     intent_body,
     release_repair_body,
     repair_body,
+    thread_record_body,
 )
 from agent_merge_queue.reviews import ReviewVerdict
 
@@ -3194,6 +3197,15 @@ class QueueCoreTest(unittest.TestCase):
                 thread_url=None,
             )
         self.assertEqual(result["state"], "deploy-requested")
+        self.assertEqual(
+            result["notification_handoff"],
+            {
+                "owner": "source-thread",
+                "required_action": (
+                    "attach-native-follow-up-monitor-before-returning"
+                ),
+            },
+        )
         self.assertIn("deploybot-intent:v1", client.comment.call_args.args[1])
         client.add_label.assert_called_with(1, "deploy-requested")
         client.record_thread.assert_called_once()
@@ -4530,6 +4542,103 @@ class QueueCoreTest(unittest.TestCase):
         self.assertEqual(control["control_id"], "legacy-comment:42")
         self.assertEqual(control["main_sha"], sha)
         self.assertTrue(control["legacy_control"])
+
+    def test_registry_comments_are_loaded_once_and_updated_after_writes(self) -> None:
+        original = {
+            "id": 1,
+            "created_at": "2026-06-21T17:17:13Z",
+            "user": {"login": "coordinator"},
+            "body": thread_record_body(
+                ThreadRecord(
+                    provider="codex",
+                    thread_id="thread-1",
+                    phase="working",
+                    updated_at="2026-06-21T17:17:13Z",
+                )
+            ),
+        }
+        created = {
+            "id": 2,
+            "created_at": "2026-06-21T17:17:14Z",
+            "user": {"login": "coordinator"},
+            "body": "new registry record",
+        }
+        client = object.__new__(GitHub)
+        client.repository = "example/repo"
+        client._registry_issue_cache = 42
+        client._registry_comments_cache = None
+        client.registry_issue_number = Mock(return_value=42)
+        client.comments = Mock(return_value=[original])
+        client._json = Mock(return_value=created)
+
+        first = client.registry_comments()
+        second = client.registry_comments()
+        client.issue_comment(42, created["body"])
+        third = client.registry_comments()
+
+        self.assertIs(first, second)
+        self.assertIs(second, third)
+        self.assertEqual(third, [original, created])
+        client.comments.assert_called_once_with(42)
+
+    def test_verified_release_does_not_spin_for_source_owned_receipt(self) -> None:
+        client = Mock()
+        client.config = CONFIG
+        client.base_sha.return_value = "a" * 40
+        client.workflow_runs.return_value = []
+        client.deployment_notifications.return_value = [{"state": "pending"}]
+        client.thread_records.return_value = []
+
+        with patch(
+            "agent_merge_queue.cli.release_state",
+            return_value={"state": "verified"},
+        ):
+            self.assertFalse(release_follow_needed(client))
+
+    def test_verified_release_retries_receipt_when_webhook_is_ready(self) -> None:
+        config = parse_config(
+            {
+                "queue": {
+                    "required_checks": ["CI"],
+                    "trusted_actors": ["trusted"],
+                },
+                "pipeline": {"webhook_url_env": "DEPLOYBOT_WEBHOOK_URL"},
+            }
+        )
+        client = Mock()
+        client.config = config
+        client.base_sha.return_value = "a" * 40
+        client.workflow_runs.return_value = []
+        client.deployment_notifications.return_value = [{"state": "pending"}]
+        client.thread_records.return_value = []
+
+        with (
+            patch(
+                "agent_merge_queue.cli.release_state",
+                return_value={"state": "verified"},
+            ),
+            patch.dict(
+                "agent_merge_queue.cli.os.environ",
+                {"DEPLOYBOT_WEBHOOK_URL": "https://example.test/hook"},
+            ),
+        ):
+            self.assertTrue(release_follow_needed(client))
+
+    def test_verified_release_follows_unverified_receipt(self) -> None:
+        client = Mock()
+        client.config = CONFIG
+        client.base_sha.return_value = "a" * 40
+        client.workflow_runs.return_value = []
+        client.deployment_notifications.return_value = [
+            {"state": "awaiting-verification"}
+        ]
+        client.thread_records.return_value = []
+
+        with patch(
+            "agent_merge_queue.cli.release_state",
+            return_value={"state": "verified"},
+        ):
+            self.assertTrue(release_follow_needed(client))
 
     def test_github_dispatches_each_configured_active_ci_workflow(self) -> None:
         client = object.__new__(GitHub)

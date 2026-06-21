@@ -89,7 +89,7 @@ def request_deployment(
     repository: str | None = None,
     config: str | None = None,
 ) -> str:
-    """Persist the user's deploy intent even while exact-head gates are pending."""
+    """Persist deploy intent and return the mandatory receipt handoff action."""
     arguments = [pull_request]
     for flag, value in (
         ("--provider", provider),
