@@ -163,6 +163,63 @@ trusted_actors = ["trusted"]
         self.assertEqual(registry["status"], "fail")
         self.assertIn("disabled", registry["detail"])
 
+    def test_overlap_mode_requires_actions_pull_request_creation(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / ".mergequeue.toml").write_text(
+                """
+[queue]
+required_checks = ["CI"]
+trusted_actors = ["trusted"]
+coordinator_actors = ["github-actions[bot]"]
+
+[integration]
+mode = "overlap"
+""",
+                encoding="utf-8",
+            )
+
+            def fake_json(*arguments: str, cwd: Path):
+                joined = " ".join(arguments)
+                if "repo view" in joined:
+                    return (
+                        0,
+                        {"nameWithOwner": "owner/repo", "hasIssuesEnabled": True},
+                        "",
+                    )
+                if "actions/permissions/workflow" in joined:
+                    return 0, {"can_approve_pull_request_reviews": False}, ""
+                if "users/trusted" in joined:
+                    return 0, {"login": "trusted"}, ""
+                if "workflow list" in joined or "label list" in joined:
+                    return 0, [], ""
+                if "pr list" in joined:
+                    return 0, [], ""
+                if "protection" in joined:
+                    return 1, None, "not available"
+                return 0, {"login": "owner"}, ""
+
+            with (
+                patch(
+                    "agent_merge_queue.doctor.shutil.which", return_value="/usr/bin/gh"
+                ),
+                patch(
+                    "agent_merge_queue.doctor._gh", return_value=(0, "authenticated")
+                ),
+                patch("agent_merge_queue.doctor._json", side_effect=fake_json),
+            ):
+                rows = diagnose(
+                    config_path=None,
+                    repository="owner/repo",
+                    cwd=root,
+                )
+
+        permission = next(
+            value for value in rows if value["check"] == "actions-integration-prs"
+        )
+        self.assertEqual(permission["status"], "fail")
+        self.assertIn("cannot create", permission["detail"])
+
 
 if __name__ == "__main__":
     unittest.main()

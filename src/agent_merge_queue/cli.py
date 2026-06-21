@@ -3118,12 +3118,6 @@ def command_react(
             "next_batch": [],
         }
     else:
-        drained = command_drain(
-            client,
-            json_output=False,
-            emit=False,
-            initial_frozen=frozen,
-        )
         if (
             frozen.batch is not None
             and client.config.integration.mode == "overlap"
@@ -3143,6 +3137,16 @@ def command_react(
                     entries=overlap_entries,
                 )
             )
+        # Establish durable ownership for every overlapping source before any
+        # independent member of the frozen batch is allowed to merge. A setup
+        # failure while creating the integration PR must leave the batch intact
+        # and must never strand an already-merged partial batch before CI.
+        drained = command_drain(
+            client,
+            json_output=False,
+            emit=False,
+            initial_frozen=frozen,
+        )
     dispatched_ci: list[dict[str, Any]] = []
     if dispatch_ci and drained.get("merged"):
         try:

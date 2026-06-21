@@ -194,6 +194,10 @@ expected_status = 200
 mode = "overlap"
 ```
 
+For `overlap` or `all` mode with the hosted coordinator, enable **Allow GitHub
+Actions to create and approve pull requests** under the repository's Actions
+workflow-permission settings. `deploybot doctor` reports this prerequisite.
+
 ## Review providers
 
 Required checks are always exact-head gates. Optional providers use normalized

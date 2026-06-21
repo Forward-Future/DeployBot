@@ -166,6 +166,44 @@ def diagnose(
             )
         )
 
+    if (
+        config.integration.mode in {"overlap", "all"}
+        and "github-actions[bot]" in config.coordinator_actors
+    ):
+        code, workflow_permissions, detail = _json(
+            "api", f"repos/{repo}/actions/permissions/workflow", cwd=root
+        )
+        if code:
+            rows.append(
+                row(
+                    "actions-integration-prs",
+                    "warn",
+                    detail or "Could not read GitHub Actions workflow permissions",
+                    "Confirm Actions may create integration pull requests.",
+                )
+            )
+        else:
+            allowed = bool(
+                (workflow_permissions or {}).get("can_approve_pull_request_reviews")
+            )
+            rows.append(
+                row(
+                    "actions-integration-prs",
+                    "ok" if allowed else "fail",
+                    (
+                        "GitHub Actions may create integration pull requests"
+                        if allowed
+                        else "GitHub Actions cannot create integration pull requests"
+                    ),
+                    (
+                        None
+                        if allowed
+                        else "Enable Settings > Actions > General > Allow GitHub "
+                        "Actions to create and approve pull requests."
+                    ),
+                )
+            )
+
     code, labels, detail = _json(
         "label", "list", "--repo", repo, "--limit", "1000", "--json", "name", cwd=root
     )

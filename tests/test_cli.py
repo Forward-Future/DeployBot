@@ -1453,6 +1453,96 @@ class QueueCoreTest(unittest.TestCase):
         drain.assert_not_called()
         self.assertEqual(result["integrations"], [{"number": 99}])
 
+    def test_reactor_establishes_overlap_integration_before_draining(self) -> None:
+        config = parse_config(
+            {
+                "queue": {
+                    "required_checks": ["CI"],
+                    "trusted_actors": ["trusted"],
+                    "coordinator_actors": ["coordinator"],
+                },
+                "integration": {"mode": "overlap"},
+            }
+        )
+        first = entry(1, "shared.py")
+        second = entry(2, "shared.py")
+        independent = entry(3, "other.py")
+        batch = new_batch(
+            [first, second, independent], frozen_at="2026-06-20T00:00:00Z"
+        )
+        frozen = FreezeResult(
+            batch,
+            [first, second, independent],
+            [],
+            [],
+            [{"pull_requests": [1, 2], "source_paths": ["shared.py"]}],
+        )
+        client = Mock()
+        client.config = config
+        client.coordinator_logins = {"coordinator"}
+        client.pipeline_control.return_value = {"state": "running"}
+        events: list[str] = []
+        client.create_integration_pull_request.side_effect = lambda **_kwargs: (
+            events.append("integration") or {"number": 99}
+        )
+
+        def drain(*_args, **_kwargs):
+            events.append("drain")
+            return {"merged": [{"number": 3, "merge_sha": "a" * 40}]}
+
+        with (
+            patch("agent_merge_queue.cli.promote_integrations", return_value=[]),
+            patch("agent_merge_queue.cli.command_promote", return_value={}),
+            patch("agent_merge_queue.cli.freeze_queue", return_value=frozen),
+            patch("agent_merge_queue.cli.command_drain", side_effect=drain),
+            redirect_stdout(io.StringIO()),
+        ):
+            command_react(client, follow=False, timeout_seconds=10)
+
+        self.assertEqual(events, ["integration", "drain"])
+
+    def test_reactor_does_not_drain_when_overlap_integration_creation_fails(
+        self,
+    ) -> None:
+        config = parse_config(
+            {
+                "queue": {
+                    "required_checks": ["CI"],
+                    "trusted_actors": ["trusted"],
+                    "coordinator_actors": ["coordinator"],
+                },
+                "integration": {"mode": "overlap"},
+            }
+        )
+        first = entry(1, "shared.py")
+        second = entry(2, "shared.py")
+        batch = new_batch([first, second], frozen_at="2026-06-20T00:00:00Z")
+        frozen = FreezeResult(
+            batch,
+            [first, second],
+            [],
+            [],
+            [{"pull_requests": [1, 2], "source_paths": ["shared.py"]}],
+        )
+        client = Mock()
+        client.config = config
+        client.coordinator_logins = {"coordinator"}
+        client.pipeline_control.return_value = {"state": "running"}
+        client.create_integration_pull_request.side_effect = QueueError(
+            "GitHub Actions may not create pull requests"
+        )
+        with (
+            patch("agent_merge_queue.cli.promote_integrations", return_value=[]),
+            patch("agent_merge_queue.cli.command_promote", return_value={}),
+            patch("agent_merge_queue.cli.freeze_queue", return_value=frozen),
+            patch("agent_merge_queue.cli.command_drain") as drain,
+            redirect_stdout(io.StringIO()),
+            self.assertRaisesRegex(QueueError, "may not create"),
+        ):
+            command_react(client, follow=False, timeout_seconds=10)
+
+        drain.assert_not_called()
+
     def test_reactor_holds_overlap_peer_but_drains_independent_work(self) -> None:
         config = parse_config(
             {
