@@ -140,6 +140,32 @@ def deployment_notification(
 
 
 class QueueCoreTest(unittest.TestCase):
+    def test_follow_binds_pause_to_observed_failed_main(self) -> None:
+        sha = "a" * 40
+        client = Mock()
+        client.config = CONFIG
+        release = {
+            "state": "ci-failed",
+            "main_sha": sha,
+            "latest_ci": {},
+            "latest_deploy": None,
+            "verifications": [],
+        }
+
+        with patch("agent_merge_queue.cli.follow_release", return_value=release):
+            result = command_follow(
+                client,
+                timeout_seconds=10,
+                poll_seconds=1,
+                json_output=True,
+                emit=False,
+            )
+
+        self.assertEqual(result, release)
+        client.set_pipeline_control.assert_called_once_with(
+            "paused", f"ci-failed on {sha}", main_sha=sha
+        )
+
     def test_pull_release_details_reads_human_facing_metadata(self) -> None:
         client = object.__new__(GitHub)
         client.repository = "example/repo"
@@ -4298,6 +4324,38 @@ class QueueCoreTest(unittest.TestCase):
 
         client.set_pipeline_control.assert_called_once_with(
             "running", None, resumes_control_id="pause-1"
+        )
+
+    def test_unpause_repauses_when_main_advances_during_transition(self) -> None:
+        sha = "a" * 40
+        newer = "b" * 40
+        client = Mock()
+        client.pipeline_control.side_effect = [
+            {
+                "state": "paused",
+                "control_id": "pause-1",
+                "main_sha": sha,
+            },
+            {
+                "state": "running",
+                "resumes_control_id": "pause-1",
+            },
+        ]
+        client.base_sha.side_effect = [sha, newer]
+
+        with self.assertRaisesRegex(QueueError, "pipeline remains paused"):
+            command_unpause(client, main_sha=sha, control_id="pause-1")
+
+        self.assertEqual(
+            client.set_pipeline_control.call_args_list,
+            [
+                call("running", None, resumes_control_id="pause-1"),
+                call(
+                    "paused",
+                    f"main advanced during unpause from {sha} to {newer}",
+                    main_sha=newer,
+                ),
+            ],
         )
 
     def test_pipeline_control_ignores_stale_resume_after_new_pause(self) -> None:

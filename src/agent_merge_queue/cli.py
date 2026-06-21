@@ -1411,6 +1411,7 @@ class GitHub:
         state: str,
         reason: str | None = None,
         *,
+        main_sha: str | None = None,
         resumes_control_id: str | None = None,
     ) -> str:
         number = self.registry_issue_number(create=True)
@@ -1423,7 +1424,7 @@ class GitHub:
                 state=state,
                 control_id=control_id,
                 reason=reason,
-                main_sha=self.base_sha() if state == "paused" else None,
+                main_sha=(main_sha or self.base_sha()) if state == "paused" else None,
                 resumes_control_id=resumes_control_id,
             ),
         )
@@ -4464,6 +4465,7 @@ def command_follow(
         client.set_pipeline_control(
             "paused",
             f"{result['state']} on {result['main_sha']}",
+            main_sha=str(result["main_sha"]),
         )
     if result["state"] == "verified":
         client.record_verified_main(str(result["main_sha"]))
@@ -5127,6 +5129,17 @@ def command_unpause(
         refreshed.get("resumes_control_id") != control_id
     ):
         raise QueueError("DeployBot pause changed during unpause; refresh status")
+    refreshed_main = client.base_sha()
+    if refreshed_main != main_sha:
+        client.set_pipeline_control(
+            "paused",
+            f"main advanced during unpause from {main_sha} to {refreshed_main}",
+            main_sha=refreshed_main,
+        )
+        raise QueueError(
+            f"DeployBot main advanced from {main_sha} to {refreshed_main} "
+            "during unpause; pipeline remains paused"
+        )
     print(f"DeployBot pipeline is running for recovered main {main_sha}")
 
 
