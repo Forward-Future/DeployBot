@@ -139,8 +139,11 @@ def check_states(checks: Iterable[dict[str, Any]]) -> dict[str, str]:
             continue
         timestamp = str(
             check.get("startedAt")
+            or check.get("started_at")
             or check.get("createdAt")
+            or check.get("created_at")
             or check.get("completedAt")
+            or check.get("completed_at")
             or ""
         )
         if timestamp.startswith("0001-01-01"):
@@ -864,6 +867,12 @@ class GitHub:
             "workflow_runs",
         )
 
+    def commit_check_runs(self, head_sha: str) -> list[dict[str, Any]]:
+        return self._paged_object_items(
+            f"repos/{self.repository}/commits/{head_sha}/check-runs?per_page=100",
+            "check_runs",
+        )
+
     def pull_head(self, number: int) -> dict[str, str]:
         value = self._json(
             "pr",
@@ -1347,6 +1356,7 @@ class GitHub:
         require_marker: bool = True,
         allow_blocked_label: bool = False,
         known_comments: list[dict[str, Any]] | None = None,
+        known_checks: dict[str, str] | None = None,
         known_source_paths: list[str] | None = None,
         known_generated_paths: list[str] | None = None,
         defer_paths_until_ready: bool = False,
@@ -1389,6 +1399,7 @@ class GitHub:
         marker = queue_marker_for_client(self, comments)
         head_sha = str(pull["headRefOid"])
         checks = check_states(pull.get("statusCheckRollup") or [])
+        checks.update(known_checks or {})
         source_paths = list(known_source_paths or [])
         generated_paths = list(known_generated_paths or [])
         paths_are_known = (
@@ -2239,10 +2250,12 @@ def settle_integration_checks(
                     and str(run.get("conclusion") or "") == "success"
                     for run in latest.values()
                 ):
+                    exact_checks = check_states(client.commit_check_runs(head_sha))
                     entry = client.snapshot(
                         number,
                         require_marker=False,
                         allow_blocked_label=True,
+                        known_checks=exact_checks,
                     )
                     if entry.state == "ready":
                         results.append(

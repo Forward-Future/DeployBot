@@ -406,6 +406,22 @@ class QueueCoreTest(unittest.TestCase):
         )
         self.assertEqual(states["CI"], "failed")
 
+        states = check_states(
+            [
+                {
+                    "name": "CI",
+                    "conclusion": "ACTION_REQUIRED",
+                    "started_at": "2026-06-20T00:00:00Z",
+                },
+                {
+                    "name": "CI",
+                    "conclusion": "SUCCESS",
+                    "started_at": "2026-06-20T00:01:00Z",
+                },
+            ]
+        )
+        self.assertEqual(states["CI"], "passed")
+
     def test_undated_queued_rerun_hides_older_success(self) -> None:
         states = check_states(
             [
@@ -1874,6 +1890,13 @@ class QueueCoreTest(unittest.TestCase):
         }
         client.workflow_runs_for_branch.side_effect = [[], [active], [successful]]
         client.dispatch_ci_workflows.return_value = [{"id": 7, "name": "CI"}]
+        client.commit_check_runs.return_value = [
+            {
+                "name": "CI",
+                "conclusion": "success",
+                "started_at": "2026-06-20T00:01:00Z",
+            }
+        ]
         ready = entry(8, "combined.py")
         ready.number = number
         ready.head_sha = head_sha
@@ -1893,6 +1916,12 @@ class QueueCoreTest(unittest.TestCase):
         client.dispatch_ci_workflows.assert_called_once_with(
             ref=branch,
             names=["CI"],
+        )
+        client.snapshot.assert_called_once_with(
+            number,
+            require_marker=False,
+            allow_blocked_label=True,
+            known_checks={"CI": "passed"},
         )
         self.assertEqual(result[0]["state"], "ready")
 
