@@ -232,6 +232,29 @@ def update_agent_thread(
 
 
 @mcp.tool()
+def acknowledge_thread_deployment(
+    provider: str,
+    thread_id: str,
+    notification_id: str,
+    repository: str | None = None,
+    config: str | None = None,
+) -> str:
+    """Acknowledge only after the deployed message reaches the native thread."""
+    return _run(
+        "thread",
+        "acknowledge",
+        "--provider",
+        provider,
+        "--thread-id",
+        thread_id,
+        "--notification-id",
+        notification_id,
+        repository=repository,
+        config=config,
+    )
+
+
+@mcp.tool()
 def block_pull_request(
     pull_request: str,
     reason: str,

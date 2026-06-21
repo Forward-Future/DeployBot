@@ -34,11 +34,14 @@ from .records import (
     INTEGRATION_MARKER,
     REPAIR_MARKER,
     THREAD_PHASES,
+    DeploymentNotificationRecord,
     ThreadRecord,
     control_body,
+    deployment_notification_body,
     integration_body,
     intent_body,
     latest_intent,
+    latest_deployment_notifications,
     latest_payload,
     latest_thread_records,
     parse_time,
@@ -1115,7 +1118,28 @@ class GitHub:
             raise QueueError("could not create DeployBot registry")
         self.issue_comment(number, thread_record_body(record))
 
-    def thread_records(self) -> list[dict[str, Any]]:
+    def record_deployment_notification(
+        self, record: DeploymentNotificationRecord
+    ) -> None:
+        number = self.registry_issue_number(create=True)
+        if number is None:  # pragma: no cover - create owns this invariant.
+            raise QueueError("could not create DeployBot registry")
+        self.issue_comment(number, deployment_notification_body(record))
+
+    def deployment_notifications(
+        self, *, include_delivered: bool = False
+    ) -> list[dict[str, Any]]:
+        trusted = self.trusted_logins | self.coordinator_logins
+        return [
+            record.as_dict()
+            for record in latest_deployment_notifications(
+                self.registry_comments(),
+                trusted,
+                include_delivered=include_delivered,
+            )
+        ]
+
+    def thread_records(self, *, include_terminal: bool = False) -> list[dict[str, Any]]:
         trusted = self.trusted_logins | self.coordinator_logins
         return [
             record.as_dict()
@@ -1123,6 +1147,7 @@ class GitHub:
                 self.registry_comments(),
                 trusted,
                 active_hours=self.config.pipeline.thread_active_hours,
+                include_terminal=include_terminal,
             )
         ]
 
@@ -1559,6 +1584,19 @@ class GitHub:
         )
         return comparison.get("status") in {"ahead", "identical"}
 
+    def pull_merge_sha(self, number: int) -> str | None:
+        value = self._json(
+            "pr",
+            "view",
+            str(number),
+            "--repo",
+            self.repository,
+            "--json",
+            "mergeCommit,state",
+        )
+        merge_sha = str((value.get("mergeCommit") or {}).get("oid") or "")
+        return merge_sha if value.get("state") == "MERGED" and merge_sha else None
+
     def externally_integrated_merge(
         self, number: int, expected_head: str
     ) -> str | None:
@@ -1804,6 +1842,7 @@ def pipeline_status(client: GitHub) -> dict[str, Any]:
         "repository": client.repository,
         "control": client.pipeline_control(),
         "threads": client.thread_records(),
+        "notifications": client.deployment_notifications(),
         "pull_requests": stages,
         "queue": [entry_dict(entry) for entry in queued],
         "overlap_groups": overlap_groups(queued),
@@ -1820,6 +1859,7 @@ def print_pipeline_status(value: dict[str, Any], *, json_output: bool) -> None:
     print(
         "threads: "
         f"{len(value['threads'])} active; "
+        f"notifications: {len(value.get('notifications') or [])} pending; "
         f"deploy requests: {len(stages['deploy_requested'])}; "
         f"queue: {len(value['queue'])}; "
         f"release: {value['release']['state']}"
@@ -1860,6 +1900,138 @@ def command_thread_update(
         )
     )
     print(f"recorded {provider} thread {thread_id} as {phase}")
+
+
+def thread_notification_id(
+    *,
+    repository: str,
+    provider: str,
+    thread_id: str,
+    merge_sha: str,
+    pull_request: int | None,
+) -> str:
+    identifier = hashlib.sha256(
+        f"{repository}:{provider.lower()}:{thread_id}:{merge_sha}:{pull_request}".encode()
+    ).hexdigest()[:24]
+    return f"thread-deployed:{identifier}"
+
+
+def record_deployment_notification_obligation(
+    client: GitHub,
+    *,
+    provider: str,
+    thread_id: str,
+    merge_sha: str,
+    pull_request: int | None,
+    thread_url: str | None,
+    updated_at: str | None = None,
+) -> DeploymentNotificationRecord:
+    record = DeploymentNotificationRecord(
+        notification_id=thread_notification_id(
+            repository=client.repository,
+            provider=provider,
+            thread_id=thread_id,
+            merge_sha=merge_sha,
+            pull_request=pull_request,
+        ),
+        provider=provider,
+        thread_id=thread_id,
+        state="awaiting-verification",
+        updated_at=updated_at or utc_now(),
+        repository=client.repository,
+        merge_sha=merge_sha,
+        pull_request=pull_request,
+        thread_url=thread_url,
+    )
+    client.record_deployment_notification(record)
+    return record
+
+
+def command_thread_acknowledge(
+    client: GitHub,
+    *,
+    provider: str,
+    thread_id: str,
+    notification_id: str,
+) -> dict[str, Any]:
+    notification = next(
+        (
+            value
+            for value in client.deployment_notifications(include_delivered=True)
+            if str(value.get("notification_id") or "") == notification_id
+        ),
+        None,
+    )
+    if notification is None:
+        raise QueueError(f"DeployBot notification {notification_id} was not found")
+    if (
+        str(notification.get("provider") or "").lower() != provider.lower()
+        or str(notification.get("thread_id") or "") != thread_id
+    ):
+        raise QueueError(
+            f"notification does not belong to DeployBot thread {provider}/{thread_id}"
+        )
+    if notification.get("state") == "awaiting-verification":
+        raise QueueError(f"DeployBot notification {notification_id} is not deployed")
+    already_delivered = notification.get("state") == "delivered"
+    delivered = DeploymentNotificationRecord(
+        notification_id=notification_id,
+        provider=str(notification["provider"]),
+        thread_id=str(notification["thread_id"]),
+        state="delivered",
+        updated_at=(
+            str(notification["updated_at"]) if already_delivered else utc_now()
+        ),
+        repository=str(notification["repository"]),
+        main_sha=str(notification["main_sha"]),
+        message=str(notification["message"]),
+        merge_sha=str(notification["merge_sha"]),
+        pull_request=notification.get("pull_request"),
+        thread_url=str(notification.get("thread_url") or "") or None,
+        ci_url=str(notification.get("ci_url") or "") or None,
+        deployment_url=str(notification.get("deployment_url") or "") or None,
+    )
+    if not already_delivered:
+        client.record_deployment_notification(delivered)
+    current_thread = next(
+        (
+            value
+            for value in client.thread_records(include_terminal=True)
+            if str(value.get("provider") or "").lower() == provider.lower()
+            and str(value.get("thread_id") or "") == thread_id
+        ),
+        None,
+    )
+    if (
+        current_thread
+        and current_thread.get("phase") in {"merged", "deployed"}
+        and (
+            current_thread.get("phase") == "merged"
+            or current_thread.get("deployed_sha") == notification.get("main_sha")
+        )
+        and current_thread.get("merge_sha") == notification.get("merge_sha")
+    ):
+        client.record_thread(
+            ThreadRecord(
+                provider=str(current_thread["provider"]),
+                thread_id=str(current_thread["thread_id"]),
+                phase="completed",
+                updated_at=delivered.updated_at,
+                title=str(current_thread.get("title") or "") or None,
+                branch=str(current_thread.get("branch") or "") or None,
+                pull_request=current_thread.get("pull_request"),
+                url=str(current_thread.get("url") or "") or None,
+                merge_sha=delivered.merge_sha,
+                deployed_sha=delivered.main_sha,
+                ci_url=delivered.ci_url,
+                deployment_url=delivered.deployment_url,
+            )
+        )
+    if already_delivered:
+        print(f"thread notification already acknowledged for {provider}/{thread_id}")
+    else:
+        print(f"acknowledged thread notification for {provider}/{thread_id}")
+    return delivered.as_dict()
 
 
 def command_request(
@@ -2089,6 +2261,15 @@ def reconcile_externally_merged_threads(client: GitHub) -> list[dict[str, Any]]:
         if not merge_sha:
             continue
         updated_at = utc_now()
+        record_deployment_notification_obligation(
+            client,
+            provider=str(record["provider"]),
+            thread_id=str(record["thread_id"]),
+            merge_sha=merge_sha,
+            pull_request=number,
+            thread_url=str(record.get("url") or "") or None,
+            updated_at=updated_at,
+        )
         client.record_thread(
             ThreadRecord(
                 provider=str(record["provider"]),
@@ -2099,6 +2280,7 @@ def reconcile_externally_merged_threads(client: GitHub) -> list[dict[str, Any]]:
                 branch=str(record.get("branch") or "") or None,
                 pull_request=number,
                 url=str(record.get("url") or "") or None,
+                merge_sha=merge_sha,
             )
         )
         value = {
@@ -2983,14 +3165,25 @@ def command_merge(
         coordinator_logins(client),
     )
     if intent and intent.get("provider") and intent.get("thread_id"):
+        updated_at = utc_now()
+        record_deployment_notification_obligation(
+            client,
+            provider=str(intent["provider"]),
+            thread_id=str(intent["thread_id"]),
+            merge_sha=merge_sha,
+            pull_request=number,
+            thread_url=str(intent.get("thread_url") or "") or None,
+            updated_at=updated_at,
+        )
         client.record_thread(
             ThreadRecord(
                 provider=str(intent["provider"]),
                 thread_id=str(intent["thread_id"]),
                 phase="merged",
-                updated_at=utc_now(),
+                updated_at=updated_at,
                 pull_request=number,
                 url=str(intent.get("thread_url") or "") or None,
+                merge_sha=merge_sha,
             )
         )
     notify(
@@ -3015,14 +3208,25 @@ def command_merge(
                 and source_intent.get("provider")
                 and source_intent.get("thread_id")
             ):
+                updated_at = utc_now()
+                record_deployment_notification_obligation(
+                    client,
+                    provider=str(source_intent["provider"]),
+                    thread_id=str(source_intent["thread_id"]),
+                    merge_sha=merge_sha,
+                    pull_request=int(source_number),
+                    thread_url=(str(source_intent.get("thread_url") or "") or None),
+                    updated_at=updated_at,
+                )
                 client.record_thread(
                     ThreadRecord(
                         provider=str(source_intent["provider"]),
                         thread_id=str(source_intent["thread_id"]),
                         phase="merged",
-                        updated_at=utc_now(),
+                        updated_at=updated_at,
                         pull_request=int(source_number),
                         url=str(source_intent.get("thread_url") or "") or None,
+                        merge_sha=merge_sha,
                     )
                 )
     if emit:
@@ -3219,6 +3423,83 @@ def command_integrate(client: GitHub, *, all_entries: bool) -> dict[str, Any]:
     return result
 
 
+def thread_deployment_notification(
+    *,
+    repository: str,
+    record: dict[str, Any],
+    release: dict[str, Any],
+) -> dict[str, Any]:
+    main_sha = str(record.get("deployed_sha") or release["main_sha"])
+    provider = str(record["provider"])
+    thread_id = str(record["thread_id"])
+    pull_request = record.get("pull_request")
+    subject = f"PR #{pull_request}" if pull_request is not None else "Your change"
+    same_release = str(release["main_sha"]) == main_sha
+    ci_url = str(record.get("ci_url") or "")
+    deployment_url = str(record.get("deployment_url") or "")
+    if same_release:
+        ci_url = ci_url or str((release.get("latest_ci") or {}).get("url") or "")
+        deployment_url = deployment_url or str(
+            (release.get("latest_deploy") or {}).get("url") or ""
+        )
+    message = (
+        f"Deployed: {subject} is live from exact main `{main_sha}`. "
+        "CI, deployment, and configured health checks passed."
+    )
+    if deployment_url:
+        message += f" [Deployment run]({deployment_url})"
+    notification: dict[str, Any] = {
+        "notification_id": thread_notification_id(
+            repository=repository,
+            provider=provider,
+            thread_id=thread_id,
+            merge_sha=str(record.get("merge_sha") or ""),
+            pull_request=pull_request,
+        ),
+        "repository": repository,
+        "provider": provider,
+        "thread_id": thread_id,
+        "main_sha": main_sha,
+        "message": message,
+    }
+    optional = {
+        "thread_url": record.get("url"),
+        "pull_request": pull_request,
+        "merge_sha": record.get("merge_sha"),
+        "ci_url": ci_url or None,
+        "deployment_url": deployment_url or None,
+    }
+    notification.update(
+        {key: value for key, value in optional.items() if value is not None}
+    )
+    return notification
+
+
+def record_pending_deployment_notification(
+    client: GitHub,
+    notification: dict[str, Any],
+    *,
+    updated_at: str | None = None,
+) -> DeploymentNotificationRecord:
+    record = DeploymentNotificationRecord(
+        notification_id=str(notification["notification_id"]),
+        provider=str(notification["provider"]),
+        thread_id=str(notification["thread_id"]),
+        state="pending",
+        updated_at=updated_at or utc_now(),
+        repository=str(notification["repository"]),
+        merge_sha=str(notification["merge_sha"]),
+        main_sha=str(notification["main_sha"]),
+        message=str(notification["message"]),
+        pull_request=notification.get("pull_request"),
+        thread_url=str(notification.get("thread_url") or "") or None,
+        ci_url=str(notification.get("ci_url") or "") or None,
+        deployment_url=str(notification.get("deployment_url") or "") or None,
+    )
+    client.record_deployment_notification(record)
+    return record
+
+
 def command_follow(
     client: GitHub,
     *,
@@ -3248,21 +3529,124 @@ def command_follow(
             f"{result['state']} on {result['main_sha']}",
         )
     if result["state"] == "verified":
-        for record in client.thread_records():
-            if record.get("phase") != "merged":
+        existing_notifications = client.deployment_notifications(include_delivered=True)
+        if not isinstance(existing_notifications, list):
+            existing_notifications = []
+        notification_states = {
+            str(value["notification_id"]): str(value["state"])
+            for value in existing_notifications
+        }
+        pending_notifications = {
+            str(value["notification_id"]): {
+                key: item
+                for key, item in value.items()
+                if key not in {"state", "updated_at"} and item is not None
+            }
+            for value in existing_notifications
+            if value.get("state") == "pending"
+        }
+        for obligation in existing_notifications:
+            if obligation.get("state") != "awaiting-verification":
                 continue
-            client.record_thread(
-                ThreadRecord(
-                    provider=str(record["provider"]),
-                    thread_id=str(record["thread_id"]),
-                    phase="completed",
-                    updated_at=utc_now(),
-                    title=str(record.get("title") or "") or None,
-                    branch=str(record.get("branch") or "") or None,
-                    pull_request=record.get("pull_request"),
-                    url=str(record.get("url") or "") or None,
-                )
+            merge_sha = str(obligation.get("merge_sha") or "")
+            if not merge_sha or not client.is_ancestor(
+                merge_sha, str(result["main_sha"])
+            ):
+                continue
+            deployed_record = {
+                "provider": obligation["provider"],
+                "thread_id": obligation["thread_id"],
+                "pull_request": obligation.get("pull_request"),
+                "url": obligation.get("thread_url"),
+                "merge_sha": merge_sha,
+                "deployed_sha": result["main_sha"],
+                "ci_url": (result.get("latest_ci") or {}).get("url"),
+                "deployment_url": (result.get("latest_deploy") or {}).get("url"),
+            }
+            notification = thread_deployment_notification(
+                repository=client.repository,
+                record=deployed_record,
+                release=result,
             )
+            notification_id = str(notification["notification_id"])
+            record_pending_deployment_notification(client, notification)
+            pending_notifications[notification_id] = notification
+            notification_states[notification_id] = "pending"
+        for record in client.thread_records(include_terminal=True):
+            if record.get("phase") not in {"merged", "deployed"}:
+                continue
+            merge_sha = str(record.get("merge_sha") or "")
+            if record.get("phase") == "merged":
+                if not merge_sha and record.get("pull_request") is not None:
+                    merge_sha = str(
+                        client.pull_merge_sha(int(record["pull_request"])) or ""
+                    )
+                if not merge_sha or not client.is_ancestor(
+                    merge_sha, str(result["main_sha"])
+                ):
+                    # The record may have arrived after follow_release captured
+                    # its verified revision. Leave it merged for the next release.
+                    continue
+            else:
+                deployed_sha = str(record.get("deployed_sha") or "")
+                if (
+                    not merge_sha
+                    or not deployed_sha
+                    or not client.is_ancestor(merge_sha, deployed_sha)
+                ):
+                    continue
+            deployed_sha = str(record.get("deployed_sha") or result["main_sha"])
+            same_release = deployed_sha == str(result["main_sha"])
+            ci_url = str(record.get("ci_url") or "") or (
+                str((result.get("latest_ci") or {}).get("url") or "")
+                if same_release
+                else ""
+            )
+            deployment_url = str(record.get("deployment_url") or "") or (
+                str((result.get("latest_deploy") or {}).get("url") or "")
+                if same_release
+                else ""
+            )
+            deployed_record = {
+                **record,
+                "merge_sha": merge_sha,
+                "deployed_sha": deployed_sha,
+                "ci_url": ci_url or None,
+                "deployment_url": deployment_url or None,
+            }
+            notification = thread_deployment_notification(
+                repository=client.repository,
+                record=deployed_record,
+                release=result,
+            )
+            notification_id = str(notification["notification_id"])
+            if notification_id not in notification_states:
+                record_pending_deployment_notification(client, notification)
+                pending_notifications[notification_id] = notification
+                notification_states[notification_id] = "pending"
+            if notification_id in pending_notifications and (
+                record.get("phase") == "merged" or not record.get("deployed_sha")
+            ):
+                client.record_thread(
+                    ThreadRecord(
+                        provider=str(record["provider"]),
+                        thread_id=str(record["thread_id"]),
+                        phase="deployed",
+                        updated_at=utc_now(),
+                        title=str(record.get("title") or "") or None,
+                        branch=str(record.get("branch") or "") or None,
+                        pull_request=record.get("pull_request"),
+                        url=str(record.get("url") or "") or None,
+                        merge_sha=merge_sha,
+                        deployed_sha=deployed_sha,
+                        ci_url=ci_url or None,
+                        deployment_url=deployment_url or None,
+                    )
+                )
+        notifications = list(pending_notifications.values())
+        for notification in notifications:
+            notify(client.config.pipeline, "thread-deployed", notification)
+        result = {**result, "thread_notifications": notifications}
         notify(
             client.config.pipeline,
             "verified",
@@ -3290,9 +3674,16 @@ def release_follow_needed(client: GitHub) -> bool:
         return current.get("latest_ci") is not None
     if current["state"] == "verified":
         # Verification can finish just before the original worker is replaced.
-        # Only revisit it when merged thread records still need completion.
-        return any(
-            record.get("phase") == "merged" for record in client.thread_records()
+        # Revisit it while a merge needs an outbox entry or a native-thread
+        # notification is still awaiting acknowledgement.
+        notifications = client.deployment_notifications(include_delivered=True)
+        has_open_notification = isinstance(notifications, list) and any(
+            value.get("state") in {"awaiting-verification", "pending"}
+            for value in notifications
+        )
+        return has_open_notification or any(
+            record.get("phase") == "merged"
+            for record in client.thread_records(include_terminal=True)
         )
     return True
 
@@ -3713,11 +4104,21 @@ def build_parser() -> argparse.ArgumentParser:
     thread_update = thread_commands.add_parser("update")
     thread_update.add_argument("--provider", required=True)
     thread_update.add_argument("--thread-id", required=True)
-    thread_update.add_argument("--phase", required=True, choices=sorted(THREAD_PHASES))
+    thread_update.add_argument(
+        "--phase",
+        required=True,
+        choices=sorted(THREAD_PHASES - {"deployed"}),
+    )
     thread_update.add_argument("--title")
     thread_update.add_argument("--branch")
     thread_update.add_argument("--pr", type=int, dest="pull_request")
     thread_update.add_argument("--url")
+    thread_acknowledge = thread_commands.add_parser(
+        "acknowledge", help="mark a delivered native-thread notification complete"
+    )
+    thread_acknowledge.add_argument("--provider", required=True)
+    thread_acknowledge.add_argument("--thread-id", required=True)
+    thread_acknowledge.add_argument("--notification-id", required=True)
     freeze = subparsers.add_parser("freeze", help="persist one exact queue pass")
     freeze.add_argument("--json", action="store_true", dest="json_output")
     drain = subparsers.add_parser(
@@ -3812,16 +4213,24 @@ def main(argv: list[str] | None = None) -> int:
                 pipeline_status(client), json_output=arguments.json_output
             )
         elif arguments.command == "thread":
-            command_thread_update(
-                client,
-                provider=arguments.provider,
-                thread_id=arguments.thread_id,
-                phase=arguments.phase,
-                title=arguments.title,
-                branch=arguments.branch,
-                pull_request=arguments.pull_request,
-                url=arguments.url,
-            )
+            if arguments.thread_command == "acknowledge":
+                command_thread_acknowledge(
+                    client,
+                    provider=arguments.provider,
+                    thread_id=arguments.thread_id,
+                    notification_id=arguments.notification_id,
+                )
+            else:
+                command_thread_update(
+                    client,
+                    provider=arguments.provider,
+                    thread_id=arguments.thread_id,
+                    phase=arguments.phase,
+                    title=arguments.title,
+                    branch=arguments.branch,
+                    pull_request=arguments.pull_request,
+                    url=arguments.url,
+                )
         elif arguments.command == "freeze":
             command_freeze(client, json_output=arguments.json_output)
         elif arguments.command == "drain":

@@ -70,3 +70,29 @@ cumulative base heads until CI, deployment, and configured health checks verify.
 Use `diagnose`/`deploybot doctor` for setup drift and `delivery_metrics` for p50,
 p95, and slow-stage evidence. A failed cumulative CI or deployment pauses the
 controller; only a designated coordinator may unpause after recovery.
+
+## Notify Source Threads
+
+After exact-main verification, `follow_release` returns one
+`thread_notifications` entry per source thread and records that thread as
+`deployed`. Deliver every entry's `message` into the recorded native thread so
+the user can see completion by looking at that thread. In Codex, use the app's
+`send_message_to_thread` tool to wake that thread with the supplied message and
+instruct it to make the supplied message user-visible, then call
+`acknowledge_thread_deployment` without doing more code work. Pass that entry's
+`notification_id` to the acknowledgement. If already operating in the source
+thread, show the message first, acknowledge it, and finish with the same status.
+
+Treat `notification_id` as the idempotency key. Never acknowledge a thread
+before its native-thread delivery succeeds, and never substitute a registry
+comment for the native message. If native delivery is unavailable or fails,
+leave the notification `pending`; a later coordinator or the provider-neutral
+`thread-deployed` webhook can retry it.
+
+The source thread that calls `request_deployment` also owns a durable wake-up.
+If it will stop running before verification, attach the provider's native
+thread heartbeat or follow-up monitor before returning. In Codex, use a thread
+heartbeat automation. On wake, read `pipeline_status`; once this thread is
+listed under pending `notifications`, first show its supplied message to the
+user, then acknowledge it and remove the heartbeat. Do not use a tight polling
+loop.

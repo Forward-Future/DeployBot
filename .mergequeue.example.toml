@@ -49,6 +49,7 @@ merge_to_live_target_minutes = 10
 auto_promote = true
 intent_scope = "head" # safest: a trusted source agent refreshes replacement heads
 pause_on_failure = true
+# Receives best-effort events, including retryable thread-deployed messages.
 # webhook_url_env = "DEPLOYBOT_WEBHOOK_URL"
 
 # [[pipeline.verifications]]

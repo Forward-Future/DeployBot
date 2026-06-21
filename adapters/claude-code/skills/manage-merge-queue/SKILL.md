@@ -19,3 +19,13 @@ honor dependencies, route overlap or cumulative validation through
 `create_integration_pull_request`, return repair packets to the source thread,
 and use `resume_pull_request` after fresh review. Finish with `follow_release`;
 a failed CI or deployment pauses the pipeline until verified recovery.
+
+When `follow_release` returns `thread_notifications`, send each supplied
+message to its native source thread. The source thread calls
+`acknowledge_thread_deployment` with the matching `notification_id` and reports
+completion to the user. Leave failed notifications `pending` so they remain
+retryable.
+
+Before a requesting source thread stops running, attach a native follow-up
+monitor that checks `pipeline_status` and wakes it to report and acknowledge its
+matching pending notification.

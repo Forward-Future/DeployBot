@@ -3,7 +3,7 @@ from __future__ import annotations
 import io
 import json
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from unittest.mock import Mock, call, patch
 
 from agent_merge_queue.cli import (
@@ -20,12 +20,14 @@ from agent_merge_queue.cli import (
     command_drain,
     command_enqueue,
     command_integrate,
+    command_follow,
     command_merge,
     command_promote,
     command_react,
     command_refresh_request,
     command_request,
     command_resume,
+    command_thread_acknowledge,
     command_unblock,
     completed_batch_ids,
     entries_in_batch,
@@ -49,6 +51,7 @@ from agent_merge_queue.cli import (
     settle_integration_checks,
     should_settle_batch,
     structured_dependencies,
+    thread_notification_id,
 )
 from agent_merge_queue.config import parse_config
 from agent_merge_queue.records import integration_body, intent_body
@@ -89,6 +92,34 @@ def entry(number: int, *paths: str, state: str = "ready") -> QueueEntry:
         reasons=[] if state == "ready" else ["waiting gate"],
     )
     return value
+
+
+def deployment_notification(
+    *, main_sha: str, state: str = "pending", merge_sha: str = "m" * 40
+) -> dict[str, object]:
+    repository = "example/repo"
+    provider = "codex"
+    thread_id = "thread-42"
+    return {
+        "notification_id": thread_notification_id(
+            repository=repository,
+            provider=provider,
+            thread_id=thread_id,
+            merge_sha=merge_sha,
+            pull_request=42,
+        ),
+        "provider": provider,
+        "thread_id": thread_id,
+        "state": state,
+        "updated_at": "2026-06-20T00:05:00Z",
+        "repository": repository,
+        "main_sha": main_sha,
+        "message": f"Deployed on {main_sha}",
+        "merge_sha": merge_sha,
+        "pull_request": 42,
+        "ci_url": "https://example.test/ci/1",
+        "deployment_url": "https://example.test/deploy/2",
+    }
 
 
 class QueueCoreTest(unittest.TestCase):
@@ -250,6 +281,489 @@ class QueueCoreTest(unittest.TestCase):
         record = client.record_thread.call_args.args[0]
         self.assertEqual(record.phase, "merged")
         self.assertEqual(record.pull_request, 42)
+        self.assertEqual(record.merge_sha, merge_sha)
+        obligation = client.record_deployment_notification.call_args.args[0]
+        self.assertEqual(obligation.state, "awaiting-verification")
+        self.assertEqual(obligation.merge_sha, merge_sha)
+
+    def test_verified_release_creates_native_thread_notification(self) -> None:
+        sha = "a" * 40
+        release = {
+            "state": "verified",
+            "main_sha": sha,
+            "latest_ci": {"url": "https://example.test/ci/1"},
+            "latest_deploy": {"url": "https://example.test/deploy/2"},
+            "verifications": [],
+        }
+        client = Mock()
+        client.config = CONFIG
+        client.repository = "example/repo"
+        client.is_ancestor.return_value = True
+        client.deployment_notifications.return_value = []
+        client.thread_records.return_value = [
+            {
+                "phase": "merged",
+                "provider": "codex",
+                "thread_id": "thread-42",
+                "pull_request": 42,
+                "url": "codex://thread/thread-42",
+                "merge_sha": "m" * 40,
+            }
+        ]
+
+        with (
+            patch("agent_merge_queue.cli.follow_release", return_value=release),
+            patch("agent_merge_queue.cli.notify") as notify,
+            patch(
+                "agent_merge_queue.cli.utc_now",
+                return_value="2026-06-20T00:05:00Z",
+            ),
+        ):
+            result = command_follow(
+                client,
+                timeout_seconds=10,
+                poll_seconds=1,
+                json_output=True,
+                emit=False,
+            )
+
+        notification = result["thread_notifications"][0]
+        self.assertEqual(notification["provider"], "codex")
+        self.assertEqual(notification["thread_id"], "thread-42")
+        self.assertEqual(notification["pull_request"], 42)
+        self.assertEqual(notification["main_sha"], sha)
+        self.assertEqual(
+            notification["deployment_url"], "https://example.test/deploy/2"
+        )
+        self.assertIn("PR #42 is live", notification["message"])
+        self.assertTrue(notification["notification_id"].startswith("thread-deployed:"))
+        deployed = client.record_thread.call_args.args[0]
+        outbox = client.record_deployment_notification.call_args.args[0]
+        self.assertEqual(outbox.state, "pending")
+        self.assertEqual(outbox.notification_id, notification["notification_id"])
+        self.assertEqual(deployed.phase, "deployed")
+        self.assertEqual(deployed.merge_sha, "m" * 40)
+        self.assertEqual(deployed.deployed_sha, sha)
+        self.assertEqual(deployed.ci_url, "https://example.test/ci/1")
+        self.assertEqual(deployed.deployment_url, "https://example.test/deploy/2")
+        client.is_ancestor.assert_called_once_with("m" * 40, sha)
+        notify.assert_any_call(CONFIG.pipeline, "thread-deployed", notification)
+
+    def test_verified_release_promotes_obligation_after_thread_moves_on(self) -> None:
+        sha = "a" * 40
+        merge_sha = "m" * 40
+        obligation = deployment_notification(main_sha=sha, merge_sha=merge_sha)
+        obligation.update(
+            {
+                "state": "awaiting-verification",
+                "main_sha": None,
+                "message": None,
+                "ci_url": None,
+                "deployment_url": None,
+            }
+        )
+        client = Mock()
+        client.config = CONFIG
+        client.repository = "example/repo"
+        client.is_ancestor.return_value = True
+        client.deployment_notifications.return_value = [obligation]
+        client.thread_records.return_value = [
+            {
+                "phase": "working",
+                "provider": "codex",
+                "thread_id": "thread-42",
+            }
+        ]
+        release = {
+            "state": "verified",
+            "main_sha": sha,
+            "latest_ci": {"url": "https://example.test/ci/1"},
+            "latest_deploy": {"url": "https://example.test/deploy/2"},
+            "verifications": [],
+        }
+
+        with (
+            patch("agent_merge_queue.cli.follow_release", return_value=release),
+            patch("agent_merge_queue.cli.notify"),
+        ):
+            result = command_follow(
+                client,
+                timeout_seconds=10,
+                poll_seconds=1,
+                json_output=True,
+                emit=False,
+            )
+
+        notification = result["thread_notifications"][0]
+        self.assertEqual(notification["notification_id"], obligation["notification_id"])
+        self.assertEqual(notification["main_sha"], sha)
+        pending = client.record_deployment_notification.call_args.args[0]
+        self.assertEqual(pending.state, "pending")
+        self.assertEqual(pending.merge_sha, merge_sha)
+        client.record_thread.assert_not_called()
+
+    def test_verified_release_does_not_notify_uncontained_merge(self) -> None:
+        sha = "a" * 40
+        client = Mock()
+        client.config = CONFIG
+        client.repository = "example/repo"
+        client.is_ancestor.return_value = False
+        client.deployment_notifications.return_value = []
+        client.thread_records.return_value = [
+            {
+                "phase": "merged",
+                "provider": "codex",
+                "thread_id": "thread-42",
+                "pull_request": 42,
+                "merge_sha": "m" * 40,
+            }
+        ]
+        release = {
+            "state": "verified",
+            "main_sha": sha,
+            "latest_ci": None,
+            "latest_deploy": None,
+            "verifications": [],
+        }
+
+        with (
+            patch("agent_merge_queue.cli.follow_release", return_value=release),
+            patch("agent_merge_queue.cli.notify") as notify,
+        ):
+            result = command_follow(
+                client,
+                timeout_seconds=10,
+                poll_seconds=1,
+                json_output=True,
+                emit=False,
+            )
+
+        self.assertEqual(result["thread_notifications"], [])
+        client.record_thread.assert_not_called()
+        client.record_deployment_notification.assert_not_called()
+        client.is_ancestor.assert_called_once_with("m" * 40, sha)
+        self.assertEqual(notify.call_count, 1)
+        self.assertEqual(notify.call_args.args[1], "verified")
+
+    def test_verified_release_resolves_legacy_merged_record(self) -> None:
+        sha = "a" * 40
+        merge_sha = "m" * 40
+        client = Mock()
+        client.config = CONFIG
+        client.repository = "example/repo"
+        client.pull_merge_sha.return_value = merge_sha
+        client.is_ancestor.return_value = True
+        client.deployment_notifications.return_value = []
+        client.thread_records.return_value = [
+            {
+                "phase": "merged",
+                "provider": "codex",
+                "thread_id": "legacy-thread",
+                "pull_request": 42,
+            }
+        ]
+        release = {
+            "state": "verified",
+            "main_sha": sha,
+            "latest_ci": None,
+            "latest_deploy": None,
+            "verifications": [],
+        }
+
+        with (
+            patch("agent_merge_queue.cli.follow_release", return_value=release),
+            patch("agent_merge_queue.cli.notify"),
+        ):
+            result = command_follow(
+                client,
+                timeout_seconds=10,
+                poll_seconds=1,
+                json_output=True,
+                emit=False,
+            )
+
+        self.assertEqual(result["thread_notifications"][0]["merge_sha"], merge_sha)
+        self.assertEqual(client.record_thread.call_args.args[0].merge_sha, merge_sha)
+        client.pull_merge_sha.assert_called_once_with(42)
+        client.is_ancestor.assert_called_once_with(merge_sha, sha)
+
+    def test_pending_thread_notification_retries_with_stable_identity(self) -> None:
+        deployed_sha = "a" * 40
+        current_sha = "b" * 40
+        release = {
+            "state": "verified",
+            "main_sha": current_sha,
+            "latest_ci": {"url": "https://example.test/ci/new"},
+            "latest_deploy": {"url": "https://example.test/deploy/new"},
+            "verifications": [],
+        }
+        client = Mock()
+        client.config = CONFIG
+        client.repository = "example/repo"
+        pending = deployment_notification(main_sha=deployed_sha)
+        pending["ci_url"] = "https://example.test/ci/original"
+        pending["deployment_url"] = "https://example.test/deploy/original"
+        client.deployment_notifications.return_value = [pending]
+        client.thread_records.return_value = [
+            {
+                "phase": "working",
+                "provider": "codex",
+                "thread_id": "thread-42",
+            }
+        ]
+        with (
+            patch("agent_merge_queue.cli.follow_release", return_value=release),
+            patch("agent_merge_queue.cli.notify"),
+        ):
+            first = command_follow(
+                client,
+                timeout_seconds=10,
+                poll_seconds=1,
+                json_output=True,
+                emit=False,
+            )
+            second = command_follow(
+                client,
+                timeout_seconds=10,
+                poll_seconds=1,
+                json_output=True,
+                emit=False,
+            )
+
+        self.assertEqual(
+            first["thread_notifications"][0]["notification_id"],
+            second["thread_notifications"][0]["notification_id"],
+        )
+        self.assertEqual(first["thread_notifications"][0]["main_sha"], deployed_sha)
+        self.assertEqual(
+            first["thread_notifications"][0]["ci_url"],
+            "https://example.test/ci/original",
+        )
+        self.assertEqual(
+            first["thread_notifications"][0]["deployment_url"],
+            "https://example.test/deploy/original",
+        )
+        self.assertNotIn("/new", first["thread_notifications"][0]["message"])
+        client.record_thread.assert_not_called()
+        client.record_deployment_notification.assert_not_called()
+        client.is_ancestor.assert_not_called()
+
+    def test_delivered_notification_is_not_reopened_by_release_follow(self) -> None:
+        sha = "a" * 40
+        merge_sha = "m" * 40
+        client = Mock()
+        client.config = CONFIG
+        client.repository = "example/repo"
+        client.is_ancestor.return_value = True
+        client.deployment_notifications.return_value = [
+            deployment_notification(
+                main_sha=sha,
+                merge_sha=merge_sha,
+                state="delivered",
+            )
+        ]
+        client.thread_records.return_value = [
+            {
+                "phase": "merged",
+                "provider": "codex",
+                "thread_id": "thread-42",
+                "pull_request": 42,
+                "merge_sha": merge_sha,
+            }
+        ]
+        release = {
+            "state": "verified",
+            "main_sha": sha,
+            "latest_ci": None,
+            "latest_deploy": None,
+            "verifications": [],
+        }
+
+        with (
+            patch("agent_merge_queue.cli.follow_release", return_value=release),
+            patch("agent_merge_queue.cli.notify") as notify,
+        ):
+            result = command_follow(
+                client,
+                timeout_seconds=10,
+                poll_seconds=1,
+                json_output=True,
+                emit=False,
+            )
+
+        self.assertEqual(result["thread_notifications"], [])
+        client.record_deployment_notification.assert_not_called()
+        client.record_thread.assert_not_called()
+        self.assertEqual(notify.call_count, 1)
+        self.assertEqual(notify.call_args.args[1], "verified")
+
+    def test_clients_cannot_publish_controller_owned_deployed_phase(self) -> None:
+        with (
+            redirect_stderr(io.StringIO()),
+            self.assertRaises(SystemExit),
+        ):
+            main(
+                [
+                    "thread",
+                    "update",
+                    "--provider",
+                    "codex",
+                    "--thread-id",
+                    "thread-42",
+                    "--phase",
+                    "deployed",
+                ]
+            )
+
+    def test_unverified_notification_obligation_cannot_be_acknowledged(self) -> None:
+        notification = deployment_notification(main_sha="a" * 40)
+        notification.update(
+            {
+                "state": "awaiting-verification",
+                "main_sha": None,
+                "message": None,
+            }
+        )
+        client = Mock()
+        client.deployment_notifications.return_value = [notification]
+
+        with self.assertRaisesRegex(QueueError, "is not deployed"):
+            command_thread_acknowledge(
+                client,
+                provider="codex",
+                thread_id="thread-42",
+                notification_id=str(notification["notification_id"]),
+            )
+
+        client.record_deployment_notification.assert_not_called()
+
+    def test_acknowledging_native_thread_message_completes_record(self) -> None:
+        sha = "a" * 40
+        merge_sha = "m" * 40
+        client = Mock()
+        client.repository = "example/repo"
+        notification = deployment_notification(main_sha=sha, merge_sha=merge_sha)
+        client.deployment_notifications.return_value = [notification]
+        client.thread_records.return_value = [
+            {
+                "phase": "deployed",
+                "provider": "codex",
+                "thread_id": "thread-42",
+                "pull_request": 42,
+                "merge_sha": merge_sha,
+                "deployed_sha": sha,
+                "ci_url": "https://example.test/ci/1",
+                "deployment_url": "https://example.test/deploy/2",
+            }
+        ]
+        with patch(
+            "agent_merge_queue.cli.utc_now",
+            return_value="2026-06-20T00:06:00Z",
+        ):
+            result = command_thread_acknowledge(
+                client,
+                provider="codex",
+                thread_id="thread-42",
+                notification_id=str(notification["notification_id"]),
+            )
+
+        client.deployment_notifications.assert_called_once_with(include_delivered=True)
+        client.thread_records.assert_called_once_with(include_terminal=True)
+        delivered = client.record_deployment_notification.call_args.args[0]
+        self.assertEqual(delivered.state, "delivered")
+        self.assertEqual(delivered.notification_id, notification["notification_id"])
+        completed = client.record_thread.call_args.args[0]
+        self.assertEqual(completed.phase, "completed")
+        self.assertEqual(completed.deployed_sha, sha)
+        self.assertEqual(completed.ci_url, "https://example.test/ci/1")
+        self.assertEqual(completed.deployment_url, "https://example.test/deploy/2")
+        self.assertEqual(result["state"], "delivered")
+
+    def test_acknowledgement_completes_merge_when_phase_write_was_interrupted(
+        self,
+    ) -> None:
+        sha = "a" * 40
+        merge_sha = "m" * 40
+        client = Mock()
+        notification = deployment_notification(main_sha=sha, merge_sha=merge_sha)
+        client.deployment_notifications.return_value = [notification]
+        client.thread_records.return_value = [
+            {
+                "phase": "merged",
+                "provider": "codex",
+                "thread_id": "thread-42",
+                "pull_request": 42,
+                "merge_sha": merge_sha,
+            }
+        ]
+
+        command_thread_acknowledge(
+            client,
+            provider="codex",
+            thread_id="thread-42",
+            notification_id=str(notification["notification_id"]),
+        )
+
+        self.assertEqual(client.record_thread.call_args.args[0].phase, "completed")
+        self.assertEqual(
+            client.record_thread.call_args.args[0].deployed_sha,
+            sha,
+        )
+
+    def test_thread_acknowledgement_is_idempotent(self) -> None:
+        sha = "a" * 40
+        client = Mock()
+        client.repository = "example/repo"
+        notification = deployment_notification(main_sha=sha, state="delivered")
+        client.deployment_notifications.return_value = [notification]
+        client.thread_records.return_value = [
+            {
+                "phase": "completed",
+                "provider": "codex",
+                "thread_id": "thread-42",
+                "deployed_sha": sha,
+            }
+        ]
+
+        result = command_thread_acknowledge(
+            client,
+            provider="codex",
+            thread_id="thread-42",
+            notification_id=str(notification["notification_id"]),
+        )
+
+        self.assertEqual(result["notification_id"], notification["notification_id"])
+        self.assertEqual(result["state"], "delivered")
+        client.record_deployment_notification.assert_not_called()
+        client.record_thread.assert_not_called()
+
+    def test_old_acknowledgement_does_not_complete_newer_thread_state(self) -> None:
+        old_sha = "a" * 40
+        new_sha = "b" * 40
+        client = Mock()
+        client.repository = "example/repo"
+        notification = deployment_notification(main_sha=old_sha)
+        client.deployment_notifications.return_value = [notification]
+        client.thread_records.return_value = [
+            {
+                "phase": "deployed",
+                "provider": "codex",
+                "thread_id": "thread-42",
+                "merge_sha": "n" * 40,
+                "deployed_sha": new_sha,
+            }
+        ]
+
+        result = command_thread_acknowledge(
+            client,
+            provider="codex",
+            thread_id="thread-42",
+            notification_id=str(notification["notification_id"]),
+        )
+
+        self.assertEqual(result["state"], "delivered")
+        client.record_deployment_notification.assert_called_once()
+        client.record_thread.assert_not_called()
 
     def test_overlap_hold_includes_transitive_ready_members(self) -> None:
         config = parse_config(

@@ -149,9 +149,10 @@ they cannot create the original per-pull-request deploy intent.
 
 ## Delivery controller
 
-`deploybot status` reports active metadata-only agent threads, every PR stage,
-deploy requests, queue order, overlaps, exact-`main` CI, deployment, and pipeline
-pause state. It never stores prompts, transcripts, source, or credentials.
+`deploybot status` reports active metadata-only agent threads, pending native
+notifications, every PR stage, deploy requests, queue order, overlaps,
+exact-`main` CI, deployment, and pipeline pause state. It never stores prompts,
+transcripts, source, or credentials.
 
 `deploybot react` promotes ready intent, skips blockers, drains independent
 work, and creates integration PRs when configured. A conflict produces a repair
@@ -170,6 +171,28 @@ deploybot resume <pr-number>
 and emits a new wake-up event. `follow` tracks newer cumulative `main` revisions
 until exact CI, deployment, and optional HTTP checks pass. A CI or deploy failure
 can pause further merges until `deploybot unpause`.
+
+At merge time, DeployBot records a non-expiring notification obligation. At
+exact-main verification, it promotes every contained obligation to `pending`,
+moves the matching source thread to `deployed` when that thread has not moved
+on, and returns a stable `thread_notifications` payload for each one.
+The provider adapter posts the supplied message into that native thread; for
+Codex it wakes the thread with `send_message_to_thread`. The source thread then
+acknowledges delivery and becomes `completed`:
+
+```bash
+deploybot thread acknowledge --provider codex --thread-id "$CODEX_THREAD_ID" \
+  --notification-id "$DEPLOYBOT_NOTIFICATION_ID"
+```
+
+DeployBot does not treat a registry comment as user notification. If native
+delivery fails, an independent outbox entry stays visible under pending
+`notifications`, even if the source thread starts new work, and the same
+`notification_id` can be retried. When `pipeline.webhook_url_env` is configured,
+the provider-neutral webhook also receives the `thread-deployed` payload.
+Source adapters attach a native thread heartbeat before returning from an
+asynchronous deploy request, so the originating thread can retrieve, acknowledge,
+and display the final notification even when no interactive coordinator remains.
 
 ```toml
 [pipeline]
@@ -251,6 +274,7 @@ deploybot plan --json
 deploybot doctor --json
 deploybot inspect [PR] --json
 deploybot thread update --provider CLIENT --thread-id ID --phase PHASE [metadata]
+deploybot thread acknowledge --provider CLIENT --thread-id ID --notification-id ID
 deploybot request [PR] [--provider CLIENT] [--thread-id ID] [--thread-url URL]
 deploybot cancel-request [PR]
 deploybot refresh-request [PR]

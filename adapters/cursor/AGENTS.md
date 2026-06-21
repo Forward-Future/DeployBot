@@ -15,3 +15,11 @@ Never poll, merge an unlabeled PR, or absorb unrelated work. Let the event worke
 promote fresh exact heads, use one integration PR for overlaps or cumulative
 validation, return repair packets to the source thread, atomically resume after
 fresh review, and follow cumulative `main` through verified deployment.
+
+For each verified `thread_notifications` entry, post its message back to the
+native source thread and only then call `acknowledge_thread_deployment`. Leave
+failed notifications `pending` for a later retry, and pass the matching
+`notification_id` when acknowledging.
+
+Before a requesting source thread stops, attach a native follow-up monitor that
+wakes it when `pipeline_status` lists its pending notification.
