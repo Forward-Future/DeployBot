@@ -11,7 +11,7 @@ integration PRs, follows `main` through production, and pauses after failures.
 
 ## Install
 
-Install the reviewed `v0.2.5` source commit directly from GitHub:
+Install the reviewed `v0.2.6` source commit directly from GitHub:
 
 ```bash
 python3 -m pip install \
