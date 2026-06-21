@@ -5131,11 +5131,15 @@ def command_unpause(
         raise QueueError("DeployBot pause changed during unpause; refresh status")
     refreshed_main = client.base_sha()
     if refreshed_main != main_sha:
-        client.set_pipeline_control(
-            "paused",
-            f"main advanced during unpause from {main_sha} to {refreshed_main}",
-            main_sha=refreshed_main,
-        )
+        latest_control = client.pipeline_control()
+        if latest_control.get("state") == "running" and (
+            latest_control.get("resumes_control_id") == control_id
+        ):
+            client.set_pipeline_control(
+                "paused",
+                f"main advanced during unpause from {main_sha} to {refreshed_main}",
+                main_sha=refreshed_main,
+            )
         raise QueueError(
             f"DeployBot main advanced from {main_sha} to {refreshed_main} "
             "during unpause; pipeline remains paused"

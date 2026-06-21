@@ -4340,6 +4340,10 @@ class QueueCoreTest(unittest.TestCase):
                 "state": "running",
                 "resumes_control_id": "pause-1",
             },
+            {
+                "state": "running",
+                "resumes_control_id": "pause-1",
+            },
         ]
         client.base_sha.side_effect = [sha, newer]
 
@@ -4356,6 +4360,35 @@ class QueueCoreTest(unittest.TestCase):
                     main_sha=newer,
                 ),
             ],
+        )
+
+    def test_unpause_preserves_newer_pause_when_main_advances(self) -> None:
+        sha = "a" * 40
+        newer = "b" * 40
+        client = Mock()
+        client.pipeline_control.side_effect = [
+            {
+                "state": "paused",
+                "control_id": "pause-1",
+                "main_sha": sha,
+            },
+            {
+                "state": "running",
+                "resumes_control_id": "pause-1",
+            },
+            {
+                "state": "paused",
+                "control_id": "pause-2",
+                "main_sha": newer,
+            },
+        ]
+        client.base_sha.side_effect = [sha, newer]
+
+        with self.assertRaisesRegex(QueueError, "pipeline remains paused"):
+            command_unpause(client, main_sha=sha, control_id="pause-1")
+
+        client.set_pipeline_control.assert_called_once_with(
+            "running", None, resumes_control_id="pause-1"
         )
 
     def test_pipeline_control_ignores_stale_resume_after_new_pause(self) -> None:
