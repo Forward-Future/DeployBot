@@ -97,8 +97,10 @@ FAILED_CHECK_STATES = {
     "ERROR",
     "FAILURE",
     "STALE",
+    "STARTUP_FAILURE",
     "TIMED_OUT",
 }
+PASSED_CHECK_STATES = {"NEUTRAL", "SKIPPED", "SUCCESS"}
 MERGEABILITY_RETRIES = 6
 REVIEW_THREADS_QUERY = """
 query($owner: String!, $name: String!, $number: Int!) {
@@ -166,7 +168,7 @@ def check_states(checks: Iterable[dict[str, Any]]) -> dict[str, str]:
         state = normalize_check_state(check)
         # A newly queued run may not have a timestamp yet. Fail closed instead
         # of letting an older success hide that pending rerun.
-        order = "\uffff" if not timestamp and state != "SUCCESS" else timestamp
+        order = "\uffff" if not timestamp and state not in PASSED_CHECK_STATES else timestamp
         candidate = (order, index, state)
         if name not in grouped or candidate[:2] > grouped[name][:2]:
             grouped[name] = candidate
@@ -176,7 +178,7 @@ def check_states(checks: Iterable[dict[str, Any]]) -> dict[str, str]:
         state = value[2]
         if state in FAILED_CHECK_STATES:
             result[name] = "failed"
-        elif state == "SUCCESS":
+        elif state in PASSED_CHECK_STATES:
             result[name] = "passed"
         else:
             result[name] = "pending"

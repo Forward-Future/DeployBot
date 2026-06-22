@@ -1574,14 +1574,23 @@ class QueueCoreTest(unittest.TestCase):
         self.assertEqual(value.checks["CI"], "passed")
         client.commit_check_runs.assert_called_once_with(head_sha)
 
-    def test_required_checks_do_not_accept_skipped(self) -> None:
+    def test_required_checks_accept_passing_terminal_conclusions(self) -> None:
         states = check_states(
             [
                 {"name": "CI", "conclusion": "SUCCESS"},
                 {"name": "Review", "conclusion": "SKIPPED"},
+                {"name": "Lint", "conclusion": "NEUTRAL"},
             ]
         )
-        self.assertEqual(states, {"CI": "passed", "Review": "pending"})
+        self.assertEqual(
+            states,
+            {"CI": "passed", "Review": "passed", "Lint": "passed"},
+        )
+
+    def test_required_checks_treat_startup_failure_as_failed(self) -> None:
+        states = check_states([{"name": "CI", "conclusion": "STARTUP_FAILURE"}])
+
+        self.assertEqual(states, {"CI": "failed"})
 
     def test_latest_check_rerun_wins(self) -> None:
         states = check_states(
