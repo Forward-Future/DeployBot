@@ -1,6 +1,6 @@
 {
   "name": "deploybot",
-  "version": "0.2.20",
+  "version": "0.2.21",
   "description": "Coordinate exact-head pull requests through verified deployment and thread notification",
   "author": {
     "name": "DeployBot contributors"
