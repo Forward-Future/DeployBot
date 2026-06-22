@@ -160,9 +160,12 @@ they cannot create the original per-pull-request deploy intent.
 `deploybot status` reports active metadata-only agent threads, pending native
 notifications, every PR stage, deploy requests and their exact authorized heads,
 queue order, queued and pre-queue intent overlaps, exact-`main` CI, deployment,
-and pipeline pause state. It alerts when a deploy request exceeds the configured
+pipeline pause state, and every open PR that has not been bound to its native
+opening thread. It alerts when a deploy request exceeds the configured
 ready-to-merge target and names the current gate. It never stores prompts,
-transcripts, source, or credentials.
+transcripts, source, or credentials. A failed PR rollup is reconciled against
+the exact commit's check runs before DeployBot creates a repair block, so a
+cancelled superseded run cannot hide its replacement.
 
 `deploybot react` promotes ready intent, skips blockers, drains independent
 work, and creates integration PRs when configured. New batches contain at most

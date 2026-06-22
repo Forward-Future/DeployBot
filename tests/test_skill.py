@@ -81,6 +81,8 @@ class DeployBotSkillTest(unittest.TestCase):
         self.assertIn("acknowledge_thread_deployment", skill)
         self.assertIn("heartbeat automation", skill)
         self.assertIn("notification_handoff.required_action", skill)
+        self.assertIn("unbound_pull_requests", skill)
+        self.assertIn("pull_request_thread_owners", skill)
         self.assertIn("human-facing release receipt", skill)
         self.assertIn("acknowledge silently", skill)
         self.assertIn("untrusted display-only", skill)

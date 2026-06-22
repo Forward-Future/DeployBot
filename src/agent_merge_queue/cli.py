@@ -2344,9 +2344,22 @@ class GitHub:
             INTEGRATION_MARKER,
             coordinator_logins(self),
         )
-        if integration and any(
-            checks.get(name) != "passed" for name in self.config.required_checks
-        ):
+        # GitHub's PR rollup can briefly retain a cancelled or failed run after
+        # a replacement run for the same exact head has started. Reconcile a
+        # reported failure with the commit check-runs endpoint before creating
+        # a repair block. Integration PRs keep the broader fallback because
+        # their controller-dispatched checks may be absent from the rollup.
+        rollup_has_required_failure = any(
+            checks.get(name) == "failed" for name in self.config.required_checks
+        )
+        integration_needs_exact_checks = bool(
+            integration
+            and any(
+                checks.get(name) != "passed"
+                for name in self.config.required_checks
+            )
+        )
+        if rollup_has_required_failure or integration_needs_exact_checks:
             checks = merge_known_check_states(
                 check_states(check_rollup + self.commit_check_runs(head_sha)),
                 known_checks,
@@ -2910,6 +2923,18 @@ def pipeline_status(client: GitHub) -> dict[str, Any]:
             for _, value in sorted(thread_owners.items())
             if value.pull_request in open_number_set
         ],
+        "unbound_pull_requests": [
+            {
+                "pull_request": value["number"],
+                "pipeline_stage": stage,
+                "head_sha": value["head_sha"],
+                "title": value["title"],
+                "url": value["url"],
+            }
+            for stage, values in stages.items()
+            for value in values
+            if value["number"] not in thread_owners
+        ],
         "notifications": client.deployment_notifications(),
         "pull_requests": stages,
         "queue": [
@@ -2934,6 +2959,7 @@ def print_pipeline_status(value: dict[str, Any], *, json_output: bool) -> None:
         "threads: "
         f"{len(value['threads'])} active; "
         f"notifications: {len(value.get('notifications') or [])} pending; "
+        f"unbound PRs: {len(value.get('unbound_pull_requests') or [])}; "
         "deploy requests: "
         f"{sum(1 for entries in stages.values() for entry in entries if entry.get('deploy_intent'))}; "
         f"queue: {len(value['queue'])}; "

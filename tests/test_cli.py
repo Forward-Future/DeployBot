@@ -492,6 +492,13 @@ class QueueCoreTest(unittest.TestCase):
             result["pull_request_thread_owners"][0]["thread_id"],
             "opening-thread",
         )
+        self.assertEqual(
+            {
+                (value["pull_request"], value["pipeline_stage"])
+                for value in result["unbound_pull_requests"]
+            },
+            {(2, "blocked"), (3, "ready")},
+        )
 
     def test_overlap_mode_holds_only_ready_members_of_near_ready_components(
         self,
@@ -1595,6 +1602,64 @@ class QueueCoreTest(unittest.TestCase):
 
         self.assertEqual(value.state, "ready")
         self.assertEqual(value.checks["CI"], "passed")
+        client.commit_check_runs.assert_called_once_with(head_sha)
+
+    def test_failed_rollup_uses_exact_head_replacement_check(self) -> None:
+        head_sha = "a" * 40
+        client = object.__new__(GitHub)
+        client.config = CONFIG
+        client.repository = "example/repo"
+        client.trusted_logins = {"trusted"}
+        client.coordinator_logins = {"trusted"}
+        client.comments = Mock(return_value=[])
+        client.changed_paths = Mock(return_value=([], []))
+        client.commit_check_runs = Mock(
+            return_value=[
+                {
+                    "name": "CI",
+                    "conclusion": "cancelled",
+                    "started_at": "2026-06-20T00:00:00Z",
+                },
+                {
+                    "name": "CI",
+                    "status": "in_progress",
+                    "started_at": "2026-06-20T00:01:00Z",
+                },
+            ]
+        )
+        client._json = Mock(
+            return_value={
+                "baseRefName": "main",
+                "body": "",
+                "headRefOid": head_sha,
+                "isDraft": False,
+                "labels": [],
+                "mergeStateStatus": "UNSTABLE",
+                "mergeable": "MERGEABLE",
+                "number": 39,
+                "state": "OPEN",
+                "statusCheckRollup": [
+                    {
+                        "__typename": "CheckRun",
+                        "name": "CI",
+                        "conclusion": "CANCELLED",
+                        "startedAt": "2026-06-20T00:00:00Z",
+                    }
+                ],
+                "title": "Replacement check is running",
+                "url": "https://example.test/39",
+            }
+        )
+
+        value = client.snapshot(
+            39,
+            require_marker=False,
+            allow_blocked_label=True,
+        )
+
+        self.assertEqual(value.state, "waiting")
+        self.assertEqual(value.checks["CI"], "pending")
+        self.assertNotIn("CI failed", value.reasons)
         client.commit_check_runs.assert_called_once_with(head_sha)
 
     def test_required_checks_accept_passing_terminal_conclusions(self) -> None:

@@ -1,7 +1,7 @@
 # DeployBot reference
 
 This reference describes the CLI, MCP server, policy file, and GitHub Action in
-DeployBot v0.2.19. GitHub labels and authenticated comments are the durable state;
+DeployBot v0.2.20. GitHub labels and authenticated comments are the durable state;
 the CLI and MCP tools are two interfaces to the same operations.
 
 ## CLI
@@ -23,7 +23,7 @@ DeployBot resolves the pull request for the current branch.
 | `deploybot init [--force]` | Write a safe starter policy. Existing files are preserved unless `--force` is supplied. |
 | `deploybot ensure-labels` | Create or refresh the configured queue, blocked, intent, pause, and registry labels. |
 | `deploybot doctor [--json]` | Check authentication, policy, labels, actors, checks, workflows, and branch protection without changing repository state. |
-| `deploybot status [--json]` | Read active thread metadata, pending native notifications, PR stages, exact-head deploy intent, pre-queue intent overlaps, request-stage timing alerts, queue state, exact-main CI, deployment, and pipeline control state. |
+| `deploybot status [--json]` | Read active thread metadata, unbound open PRs, pending native notifications, PR stages, exact-head deploy intent, pre-queue intent overlaps, request-stage timing alerts, queue state, exact-main CI, deployment, and pipeline control state. |
 | `deploybot plan [--json]` | Read the ordered queue, dependencies, blockers, and source-overlap groups. |
 | `deploybot inspect [PR] [--json]` | Evaluate one exact PR head without granting merge authority. |
 | `deploybot metrics [--limit N] [--json]` | Summarize p50, p95, and maximum delivery timings for recent merged PRs. The default limit is 25. |

@@ -13,6 +13,10 @@ Immediately after opening the PR, call `update_agent_thread` in `pr-review`
 phase with its number. That first binding is immutable and owns repair handoffs
 and the final deployment receipt.
 
+Before the PR-opening response finishes, call `pipeline_status` and verify that
+the exact PR is in `pull_request_thread_owners`, not
+`unbound_pull_requests`. Bind it from this thread and recheck if missing.
+
 Only the user's exact `deploy` instruction authorizes `request_deployment` for
 this thread's PR. DeployBot uses the recorded opening thread; a coordinator
 must never substitute its own ID. If review fixes change
