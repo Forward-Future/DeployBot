@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import tempfile
 import unittest
 from pathlib import Path
@@ -9,6 +10,61 @@ from agent_merge_queue.doctor import diagnose
 
 
 class DoctorTest(unittest.TestCase):
+    def test_hosted_controller_version_drift_is_reported(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / ".mergequeue.toml").write_text(
+                '[queue]\nrequired_checks = ["CI"]\ntrusted_actors = ["trusted"]\n',
+                encoding="utf-8",
+            )
+
+            def encoded(value: str) -> dict[str, str]:
+                return {
+                    "content": base64.b64encode(value.encode("utf-8")).decode()
+                }
+
+            def fake_json(*arguments: str, cwd: Path):
+                joined = " ".join(arguments)
+                if "workflow list" in joined:
+                    return 0, [
+                        {
+                            "name": "DeployBot",
+                            "path": ".github/workflows/deploybot.yml",
+                            "state": "active",
+                        }
+                    ], ""
+                if "contents/.github/workflows/deploybot.yml" in joined:
+                    return 0, encoded(
+                        "uses: Forward-Future/DeployBot@" + "a" * 40
+                    ), ""
+                if "contents/pyproject.toml" in joined:
+                    return 0, encoded('[project]\nversion = "0.2.18"\n'), ""
+                if "users/trusted" in joined:
+                    return 0, {"login": "trusted"}, ""
+                if "label list" in joined or "pr list" in joined:
+                    return 0, [], ""
+                if "protection" in joined:
+                    return 1, None, "not available"
+                return 0, {
+                    "nameWithOwner": "owner/repo",
+                    "hasIssuesEnabled": True,
+                }, ""
+
+            with (
+                patch(
+                    "agent_merge_queue.doctor.shutil.which", return_value="/usr/bin/gh"
+                ),
+                patch("agent_merge_queue.doctor._gh", return_value=(0, "ok")),
+                patch("agent_merge_queue.doctor._json", side_effect=fake_json),
+            ):
+                rows = diagnose(config_path=None, repository="owner/repo", cwd=root)
+
+        version = next(
+            value for value in rows if value["check"] == "controller-version"
+        )
+        self.assertEqual(version["status"], "warn")
+        self.assertIn("v0.2.18", version["detail"])
+
     def test_missing_github_cli_is_one_clean_failure(self) -> None:
         with patch("agent_merge_queue.doctor.shutil.which", return_value=None):
             rows = diagnose(config_path=None, repository=None)

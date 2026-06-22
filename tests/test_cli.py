@@ -62,6 +62,7 @@ from agent_merge_queue.cli import (
     queue_timestamp,
     reconcile_externally_merged_threads,
     record_integration_conflict_repair,
+    record_integration_ci_repair,
     record_repair,
     release_follow_needed,
     repair_overlap_hold_active,
@@ -2109,6 +2110,91 @@ class QueueCoreTest(unittest.TestCase):
 
         self.assertEqual(result["state"], "release-held")
         promote.assert_not_called()
+
+    def test_reactor_auto_resumes_pause_superseded_by_verified_main(self) -> None:
+        paused = "a" * 40
+        current = "b" * 40
+        client = Mock()
+        client.config = CONFIG
+        client.pipeline_control.side_effect = [
+            {
+                "state": "paused",
+                "control_id": "pause-1",
+                "main_sha": paused,
+                "reason": "integration CI ownership failed: integration PR #983 CI failed",
+            },
+            {
+                "state": "running",
+                "control_id": "resume-1",
+                "resumes_control_id": "pause-1",
+                "recovered_main_sha": paused,
+            },
+        ]
+        client.base_sha.return_value = current
+        client.verified_main_sha.return_value = current
+        client.is_ancestor.return_value = True
+        frozen = FreezeResult(None, [], [], [], [])
+        with (
+            patch("agent_merge_queue.cli.settle_integration_checks", return_value=[]),
+            patch("agent_merge_queue.cli.promote_integrations", return_value=[]),
+            patch(
+                "agent_merge_queue.cli.command_promote",
+                return_value={"promoted": [], "waiting": [], "blocked": []},
+            ),
+            patch(
+                "agent_merge_queue.cli.command_drain",
+                return_value={"merged": []},
+            ),
+            patch("agent_merge_queue.cli.freeze_queue", return_value=frozen),
+            redirect_stdout(io.StringIO()),
+        ):
+            result = command_react(client, follow=False, timeout_seconds=10)
+
+        self.assertEqual(result["state"], "complete")
+        client.set_pipeline_control.assert_called_once_with(
+            "running",
+            f"newer verified main {current} supersedes paused {paused}",
+            resumes_control_id="pause-1",
+        )
+
+    def test_reactor_keeps_pause_when_newer_main_is_not_verified(self) -> None:
+        paused = "a" * 40
+        current = "b" * 40
+        client = Mock()
+        client.pipeline_control.return_value = {
+            "state": "paused",
+            "control_id": "pause-1",
+            "main_sha": paused,
+            "reason": "main CI failed",
+        }
+        client.base_sha.return_value = current
+        client.verified_main_sha.return_value = paused
+
+        with redirect_stdout(io.StringIO()):
+            result = command_react(client, follow=False, timeout_seconds=10)
+
+        self.assertEqual(result["state"], "paused")
+        client.set_pipeline_control.assert_not_called()
+
+    def test_reactor_never_auto_resumes_explicit_operator_pause(self) -> None:
+        paused = "a" * 40
+        current = "b" * 40
+        client = Mock()
+        client.pipeline_control.return_value = {
+            "state": "paused",
+            "control_id": "pause-1",
+            "main_sha": paused,
+            "reason": "hold releases for maintenance",
+        }
+        client.base_sha.return_value = current
+        client.verified_main_sha.return_value = current
+        client.is_ancestor.return_value = True
+
+        with redirect_stdout(io.StringIO()):
+            result = command_react(client, follow=False, timeout_seconds=10)
+
+        self.assertEqual(result["state"], "paused")
+        client.set_pipeline_control.assert_not_called()
 
     def test_reactor_holds_admission_even_without_follow(self) -> None:
         sha = "a" * 40
@@ -4770,6 +4856,92 @@ class QueueCoreTest(unittest.TestCase):
         self.assertEqual(result["repair_owner"]["pull_request"], 2)
         self.assertEqual(repair["thread_id"], "thread-2")
 
+    def test_failed_integration_ci_blocks_only_its_batch_and_elects_owner(
+        self,
+    ) -> None:
+        source = entry(1, "shared.py")
+        intent = {
+            "id": 1,
+            "created_at": "2026-06-20T00:00:00Z",
+            "user": {"login": "trusted"},
+            "body": intent_body(
+                intent_id="intent-1",
+                state="requested",
+                requested_at="2026-06-20T00:00:00Z",
+                requested_head=source.head_sha,
+                provider="codex",
+                thread_id="thread-1",
+            ),
+        }
+        integration = {
+            "batch_id": "batch-1",
+            "conflict": None,
+            "heads": {"1": source.head_sha},
+            "pull_requests": [1],
+        }
+        result = {
+            "pull_request": 99,
+            "integration": integration,
+            "reason": "integration PR #99 CI failed: CI",
+            "state": "blocked",
+        }
+        client = Mock()
+        client.config = CONFIG
+        client.trusted_logins = {"trusted"}
+        client.snapshot.return_value = source
+        client.comments.return_value = [intent]
+        client.labels.return_value = set()
+        client.base_sha.return_value = "b" * 40
+
+        repair = record_integration_ci_repair(client, result)
+
+        self.assertEqual(repair["repair_pull_request"], 99)
+        self.assertEqual(result["repair_owner"]["pull_request"], 1)
+        self.assertEqual(
+            [value.args for value in client.add_label.call_args_list],
+            [(1, CONFIG.blocked_label), (99, CONFIG.blocked_label)],
+        )
+        integration_comment = client.comment.call_args_list[-1].args[1]
+        failed = latest_payload(
+            [
+                {
+                    "id": 2,
+                    "created_at": "2026-06-20T00:01:00Z",
+                    "user": {"login": "coordinator"},
+                    "body": integration_comment,
+                }
+            ],
+            INTEGRATION_MARKER,
+            {"coordinator"},
+        )
+        self.assertEqual(failed["conflict"]["number"], 99)
+        client.set_pipeline_control.assert_not_called()
+
+    def test_failed_integration_stays_retryable_until_repair_owner_exists(
+        self,
+    ) -> None:
+        source_head = "1" * 40
+        result = {
+            "pull_request": 99,
+            "integration": {
+                "batch_id": "batch-1",
+                "conflict": None,
+                "heads": {"1": source_head},
+                "pull_requests": [1],
+            },
+            "reason": "integration PR #99 CI failed: CI",
+            "state": "blocked",
+        }
+        client = Mock()
+        client.config = CONFIG
+        client.snapshot.side_effect = QueueError("transient source read failure")
+
+        repair = record_integration_ci_repair(client, result)
+
+        self.assertIsNone(repair)
+        client.comment.assert_not_called()
+        client.add_label.assert_not_called()
+
     def test_resumed_integration_finishes_source_label_delegation(self) -> None:
         integration_head = "9" * 40
         marker = {
@@ -5960,6 +6132,171 @@ class QueueCoreTest(unittest.TestCase):
             known_checks={"CI": "passed"},
         )
         self.assertEqual(result[0]["state"], "ready")
+
+    def test_failed_integration_ci_returns_batch_local_block(self) -> None:
+        number = 38
+        head_sha = "a" * 40
+        branch = "deploybot/integration/batch"
+        marker = {
+            "batch_id": "batch",
+            "conflict": None,
+            "heads": {"1": "1" * 40, "2": "2" * 40},
+            "pull_requests": [1, 2],
+        }
+        client = Mock()
+        client.config = CONFIG
+        client.coordinator_logins = {"coordinator"}
+        client.comments.return_value = [
+            {
+                "created_at": "2026-06-20T00:00:00Z",
+                "user": {"login": "coordinator"},
+                "body": integration_body(marker),
+            }
+        ]
+        client.pull_head.return_value = {
+            "branch": branch,
+            "head_sha": head_sha,
+            "state": "OPEN",
+        }
+        client.workflow_runs_for_branch.return_value = [
+            {
+                "id": 7,
+                "name": "CI",
+                "head_sha": head_sha,
+                "event": "workflow_dispatch",
+                "status": "completed",
+                "conclusion": "failure",
+                "created_at": "2026-06-20T00:01:00Z",
+            }
+        ]
+
+        result = settle_integration_checks(
+            client,
+            timeout_seconds=10,
+            poll_seconds=0,
+            numbers=[number],
+        )
+
+        self.assertEqual(result[0]["state"], "blocked")
+        self.assertEqual(result[0]["integration"]["pull_requests"], [1, 2])
+        self.assertIn("CI failed", result[0]["reason"])
+        client.set_pipeline_control.assert_not_called()
+
+    def test_closed_integration_before_ci_returns_batch_local_block(self) -> None:
+        number = 38
+        marker = {
+            "batch_id": "batch",
+            "conflict": None,
+            "heads": {"1": "1" * 40},
+            "pull_requests": [1],
+        }
+        client = Mock()
+        client.config = CONFIG
+        client.coordinator_logins = {"coordinator"}
+        client.comments.return_value = [
+            {
+                "created_at": "2026-06-20T00:00:00Z",
+                "user": {"login": "coordinator"},
+                "body": integration_body(marker),
+            }
+        ]
+        client.pull_head.return_value = {
+            "branch": "deploybot/integration/batch",
+            "head_sha": "a" * 40,
+            "state": "CLOSED",
+        }
+
+        result = settle_integration_checks(
+            client,
+            timeout_seconds=10,
+            poll_seconds=0,
+            numbers=[number],
+        )
+
+        self.assertEqual(result[0]["state"], "blocked")
+        self.assertIn("no longer open", result[0]["reason"])
+
+    def test_merged_integration_before_ci_is_not_blocked(self) -> None:
+        number = 38
+        marker = {
+            "batch_id": "batch",
+            "conflict": None,
+            "heads": {"1": "1" * 40},
+            "pull_requests": [1],
+        }
+        client = Mock()
+        client.config = CONFIG
+        client.coordinator_logins = {"coordinator"}
+        client.comments.return_value = [
+            {
+                "created_at": "2026-06-20T00:00:00Z",
+                "user": {"login": "coordinator"},
+                "body": integration_body(marker),
+            }
+        ]
+        client.pull_head.return_value = {
+            "branch": "deploybot/integration/batch",
+            "head_sha": "a" * 40,
+            "state": "MERGED",
+        }
+
+        result = settle_integration_checks(
+            client,
+            timeout_seconds=10,
+            poll_seconds=0,
+            numbers=[number],
+        )
+
+        self.assertEqual(result[0]["state"], "merged")
+        client.add_label.assert_not_called()
+
+    def test_integration_ci_poll_timeout_remains_retryable(self) -> None:
+        number = 38
+        head_sha = "a" * 40
+        marker = {
+            "batch_id": "batch",
+            "conflict": None,
+            "heads": {"1": "1" * 40},
+            "pull_requests": [1],
+        }
+        client = Mock()
+        client.config = CONFIG
+        client.coordinator_logins = {"coordinator"}
+        client.comments.return_value = [
+            {
+                "created_at": "2026-06-20T00:00:00Z",
+                "user": {"login": "coordinator"},
+                "body": integration_body(marker),
+            }
+        ]
+        client.pull_head.return_value = {
+            "branch": "deploybot/integration/batch",
+            "head_sha": head_sha,
+            "state": "OPEN",
+        }
+        client.workflow_runs_for_branch.return_value = [
+            {
+                "id": 7,
+                "name": "CI",
+                "head_sha": head_sha,
+                "event": "workflow_dispatch",
+                "status": "in_progress",
+                "conclusion": None,
+                "created_at": "2026-06-20T00:01:00Z",
+            }
+        ]
+
+        with patch("agent_merge_queue.cli.time.monotonic", side_effect=[0, 2]):
+            result = settle_integration_checks(
+                client,
+                timeout_seconds=1,
+                poll_seconds=0,
+                numbers=[number],
+            )
+
+        self.assertEqual(result[0]["state"], "pending")
+        self.assertIn("timed out", result[0]["reason"])
+        client.add_label.assert_not_called()
 
     def test_integration_ci_dispatches_when_token_authored_pr_run_is_suppressed(
         self,
