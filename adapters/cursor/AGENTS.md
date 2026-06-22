@@ -3,6 +3,8 @@
 Read `.mergequeue.toml` and use the `deploybot` MCP tools. Keep changing
 pull requests draft and make the final ready head immutable. Address valid
 feedback from the configured review providers.
+If a task worktree lacks the policy, pass the repository's configured policy
+path explicitly; never initialize a second policy just to read status.
 
 For read-only status, use `pipeline_status` for the full delivery path,
 `queue_plan` for the merge queue, and `inspect_pull_request` for one PR. Report

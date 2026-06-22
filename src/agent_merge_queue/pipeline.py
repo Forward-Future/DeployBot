@@ -57,25 +57,30 @@ def release_state(
     ci_fence = parse_time(
         str((ci or {}).get("updated_at") or (ci or {}).get("created_at") or "")
     )
-    deploy = latest_run(
-        [
-            run
-            for run in runs
-            if not (
-                str(run.get("status") or "") == "completed"
-                and str(run.get("conclusion") or "") == "skipped"
+    eligible_deploys = [
+        run
+        for run in runs
+        if not (
+            str(run.get("status") or "") == "completed"
+            and str(run.get("conclusion") or "") == "skipped"
+        )
+        and (
+            ci_fence is None
+            or (
+                (created_at := parse_time(str(run.get("created_at") or "")))
+                is not None
+                and created_at >= ci_fence
             )
-            and (
-                ci_fence is None
-                or (
-                    (created_at := parse_time(str(run.get("created_at") or "")))
-                    is not None
-                    and created_at >= ci_fence
-                )
-            )
-        ],
-        config.deploy_workflows,
-        main_sha,
+        )
+    ]
+    deploys = {
+        name: latest_run(eligible_deploys, (name,), main_sha)
+        for name in config.deploy_workflows
+    }
+    deploy = max(
+        (run for run in deploys.values() if run is not None),
+        key=lambda run: (str(run.get("created_at") or ""), int(run.get("id") or 0)),
+        default=None,
     )
     active_ci = [
         workflow_run(run)
@@ -91,18 +96,31 @@ def release_state(
     ]
     ci_status = str((ci or {}).get("status") or "")
     ci_conclusion = str((ci or {}).get("conclusion") or "")
-    deploy_status = str((deploy or {}).get("status") or "")
-    deploy_conclusion = str((deploy or {}).get("conclusion") or "")
+    deploy_statuses = {
+        name: str((run or {}).get("status") or "")
+        for name, run in deploys.items()
+    }
+    deploy_conclusions = {
+        name: str((run or {}).get("conclusion") or "")
+        for name, run in deploys.items()
+    }
     if ci is None or ci_status != "completed":
         state = "testing"
     elif ci_conclusion != "success":
         state = "ci-failed"
-    elif deploy is None:
-        state = "awaiting-deploy"
-    elif deploy_status != "completed":
-        state = "deploying"
-    elif deploy_conclusion != "success":
+    elif any(
+        deploy_statuses[name] == "completed"
+        and deploy_conclusions[name] != "success"
+        for name in config.deploy_workflows
+        if deploys[name] is not None
+    ):
         state = "deploy-failed"
+    elif any(deploys[name] is None for name in config.deploy_workflows):
+        state = "awaiting-deploy"
+    elif any(
+        deploy_statuses[name] != "completed" for name in config.deploy_workflows
+    ):
+        state = "deploying"
     else:
         state = "verified"
     return {
@@ -110,6 +128,9 @@ def release_state(
         "main_sha": main_sha,
         "latest_ci": workflow_run(ci) if ci else None,
         "latest_deploy": workflow_run(deploy) if deploy else None,
+        "deployments": {
+            name: workflow_run(run) if run else None for name, run in deploys.items()
+        },
         "active_ci": active_ci,
         "active_deployments": active_deploys,
     }

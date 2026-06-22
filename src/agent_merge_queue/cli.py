@@ -87,6 +87,8 @@ BATCH_COMPLETE_MARKER = re.compile(
 )
 PULL_REQUEST_NUMBER = re.compile(r"#(\d+)\b")
 RELEASE_REPAIR_LEASE_PREFIX = "DeployBot release repair lease v1 "
+DEPLOY_DISPATCH_LEASE_PREFIX = "DeployBot deployment dispatch lease v1 "
+DEPLOY_DISPATCH_LEASE_BRANCH = "deploybot/deploy-dispatch"
 FAILED_CHECK_STATES = {
     "ACTION_REQUIRED",
     "CANCELLED",
@@ -1289,6 +1291,13 @@ class GitHub:
                     "to one active workflow"
                 )
             workflow_id = int(matches[0]["id"])
+            claim_id = self.claim_deploy_dispatch(
+                ci_run=ci_run,
+                workflow_id=workflow_id,
+                workflow_name=name,
+            )
+            if claim_id is None:
+                continue
             self._run(
                 "workflow",
                 "run",
@@ -1302,6 +1311,12 @@ class GitHub:
                 "-f",
                 f"ci_run_id={ci_run_id}",
             )
+            self.complete_deploy_dispatch(
+                ci_run=ci_run,
+                workflow_id=workflow_id,
+                workflow_name=name,
+                claim_id=claim_id,
+            )
             dispatched.append(
                 {
                     "id": workflow_id,
@@ -1311,6 +1326,196 @@ class GitHub:
                 }
             )
         return dispatched
+
+    def deploy_dispatch_lease_branch(
+        self, *, ci_run: dict[str, Any], workflow_id: int
+    ) -> str:
+        ci_sha = str(ci_run.get("head_sha") or "")
+        ci_run_id = int(ci_run.get("id") or 0)
+        if not re.fullmatch(r"[0-9a-f]{40}", ci_sha) or not ci_run_id or not workflow_id:
+            raise QueueError("successful CI or deployment workflow identity is incomplete")
+        return (
+            f"{DEPLOY_DISPATCH_LEASE_BRANCH}/{ci_sha[:12]}-"
+            f"{ci_run_id}-{workflow_id}"
+        )
+
+    def claim_deploy_dispatch(
+        self,
+        *,
+        ci_run: dict[str, Any],
+        workflow_id: int,
+        workflow_name: str,
+    ) -> str | None:
+        """Atomically reserve one exact deployment workflow dispatch."""
+        self.require_actor(self.coordinator_logins, "dispatch a deployment")
+        ci_sha = str(ci_run.get("head_sha") or "")
+        ci_run_id = int(ci_run.get("id") or 0)
+        branch = self.deploy_dispatch_lease_branch(
+            ci_run=ci_run, workflow_id=workflow_id
+        )
+        claimed_at = utc_now()
+        claimed_time = parse_time(claimed_at)
+        if claimed_time is None:  # pragma: no cover - utc_now owns this invariant.
+            raise QueueError("deployment dispatch lease timestamp is invalid")
+
+        base_commit = self._json(
+            "api", f"repos/{self.repository}/git/commits/{ci_sha}"
+        )
+        base_tree = str((base_commit.get("tree") or {}).get("sha") or "")
+        if not base_tree:
+            raise QueueError("GitHub did not return the successful CI commit tree")
+
+        claim_id = secrets.token_hex(16)
+        payload = {
+            "claimed_at": claimed_at,
+            "claim_id": claim_id,
+            "ci_run_id": ci_run_id,
+            "main_sha": ci_sha,
+            "schema": 1,
+            "state": "claimed",
+            "workflow_id": workflow_id,
+            "workflow_name": workflow_name,
+        }
+        for _attempt in range(3):
+            try:
+                ref = self._json(
+                    "api", f"repos/{self.repository}/git/ref/heads/{branch}"
+                )
+            except QueueError as error:
+                if "404" not in str(error) and "Not Found" not in str(error):
+                    raise
+                lease_commit = self._json(
+                    "api",
+                    "--method",
+                    "POST",
+                    f"repos/{self.repository}/git/commits",
+                    "-f",
+                    f"message={DEPLOY_DISPATCH_LEASE_PREFIX}"
+                    f"{json.dumps(payload, sort_keys=True)}",
+                    "-f",
+                    f"tree={base_tree}",
+                    "-f",
+                    f"parents[]={ci_sha}",
+                )
+                lease_sha = str(lease_commit.get("sha") or "")
+                if not lease_sha:
+                    raise QueueError("GitHub did not create the deployment dispatch lease")
+                try:
+                    self._json(
+                        "api",
+                        "--method",
+                        "POST",
+                        f"repos/{self.repository}/git/refs",
+                        "-f",
+                        f"ref=refs/heads/{branch}",
+                        "-f",
+                        f"sha={lease_sha}",
+                    )
+                    return claim_id
+                except QueueError as create_error:
+                    if "Reference already exists" not in str(create_error):
+                        raise
+                    continue
+
+            current_sha = str((ref.get("object") or {}).get("sha") or "")
+            if not current_sha:
+                raise QueueError("deployment dispatch lease has no readable head")
+            current_commit = self._json(
+                "api", f"repos/{self.repository}/git/commits/{current_sha}"
+            )
+            current = self._deploy_dispatch_payload(current_commit)
+            identity = (
+                current.get("schema") == 1
+                and current.get("main_sha") == ci_sha
+                and int(current.get("ci_run_id") or 0) == ci_run_id
+                and int(current.get("workflow_id") or 0) == workflow_id
+                and current.get("workflow_name") == workflow_name
+            )
+            if not identity:
+                raise QueueError("deployment dispatch lease has invalid ownership")
+            if current.get("state") == "dispatched":
+                return None
+            # A claimed reservation is deliberately permanent. GitHub's
+            # dispatch API returns no run ID, so after a process crash there
+            # is no exact evidence that distinguishes "accepted but not
+            # recorded" from "never sent". Automatic expiry could duplicate
+            # production work; recovery must use a new CI identity or explicit
+            # operator repair of this per-release ref.
+            return None
+        raise QueueError("deployment dispatch lease changed repeatedly; retry later")
+
+    def _deploy_dispatch_payload(self, commit: dict[str, Any]) -> dict[str, Any]:
+        message = str(commit.get("message") or "")
+        if not message.startswith(DEPLOY_DISPATCH_LEASE_PREFIX):
+            raise QueueError("deployment dispatch lease has invalid ownership")
+        try:
+            payload = json.loads(message[len(DEPLOY_DISPATCH_LEASE_PREFIX) :])
+        except json.JSONDecodeError as error:
+            raise QueueError("deployment dispatch lease has invalid ownership") from error
+        if not isinstance(payload, dict):
+            raise QueueError("deployment dispatch lease has invalid ownership")
+        return payload
+
+    def complete_deploy_dispatch(
+        self,
+        *,
+        ci_run: dict[str, Any],
+        workflow_id: int,
+        workflow_name: str,
+        claim_id: str,
+    ) -> None:
+        branch = self.deploy_dispatch_lease_branch(
+            ci_run=ci_run, workflow_id=workflow_id
+        )
+        ref = self._json("api", f"repos/{self.repository}/git/ref/heads/{branch}")
+        current_sha = str((ref.get("object") or {}).get("sha") or "")
+        if not current_sha:
+            raise QueueError("deployment dispatch lease has no readable head")
+        current_commit = self._json(
+            "api", f"repos/{self.repository}/git/commits/{current_sha}"
+        )
+        current = self._deploy_dispatch_payload(current_commit)
+        if current.get("state") == "dispatched":
+            return
+        if current.get("claim_id") != claim_id:
+            raise QueueError("deployment dispatch lease ownership changed")
+        if (
+            current.get("main_sha") != str(ci_run.get("head_sha") or "")
+            or int(current.get("ci_run_id") or 0) != int(ci_run.get("id") or 0)
+            or int(current.get("workflow_id") or 0) != workflow_id
+            or current.get("workflow_name") != workflow_name
+        ):
+            raise QueueError("deployment dispatch lease has invalid ownership")
+        completed = {**current, "completed_at": utc_now(), "state": "dispatched"}
+        current_tree = str((current_commit.get("tree") or {}).get("sha") or "")
+        if not current_tree:
+            raise QueueError("deployment dispatch lease has no readable tree")
+        lease_commit = self._json(
+            "api",
+            "--method",
+            "POST",
+            f"repos/{self.repository}/git/commits",
+            "-f",
+            f"message={DEPLOY_DISPATCH_LEASE_PREFIX}"
+            f"{json.dumps(completed, sort_keys=True)}",
+            "-f",
+            f"tree={current_tree}",
+            "-f",
+            f"parents[]={current_sha}",
+        )
+        lease_sha = str(lease_commit.get("sha") or "")
+        if not lease_sha:
+            raise QueueError("GitHub did not complete the deployment dispatch lease")
+        self._json(
+            "api",
+            "--method",
+            "PATCH",
+            f"repos/{self.repository}/git/refs/heads/{branch}",
+            "-f",
+            f"sha={lease_sha}",
+            "-F",
+            "force=false",
+        )
 
     def recent_merged_pull_requests(self, limit: int) -> list[dict[str, Any]]:
         merged: list[dict[str, Any]] = []
@@ -1684,12 +1889,21 @@ class GitHub:
         except QueueError as error:
             if "Reference already exists" not in str(error):
                 raise
+            ref = self._json("api", f"repos/{self.repository}/git/ref/heads/{branch}")
+            branch_head = str((ref.get("object") or {}).get("sha") or "")
+            if not branch_head:
+                raise QueueError(f"integration branch {branch} has no readable head")
+        else:
+            branch_head = base_sha
 
         merged_heads: list[str] = []
         conflict: dict[str, Any] | None = None
         for entry in entries:
+            if self.is_ancestor(entry.head_sha, branch_head):
+                merged_heads.append(entry.head_sha)
+                continue
             try:
-                self._json(
+                merged = self._json(
                     "api",
                     "--method",
                     "POST",
@@ -1701,8 +1915,18 @@ class GitHub:
                     "-f",
                     f"commit_message=DeployBot batch {batch_id}: PR #{entry.number}",
                 )
+                branch_head = str((merged or {}).get("sha") or branch_head)
                 merged_heads.append(entry.head_sha)
             except QueueError as error:
+                if str(error) == "GitHub returned invalid JSON":
+                    ref = self._json(
+                        "api", f"repos/{self.repository}/git/ref/heads/{branch}"
+                    )
+                    current_head = str((ref.get("object") or {}).get("sha") or "")
+                    if current_head and self.is_ancestor(entry.head_sha, current_head):
+                        branch_head = current_head
+                        merged_heads.append(entry.head_sha)
+                        continue
                 conflict = {
                     "number": entry.number,
                     "head_sha": entry.head_sha,
@@ -1970,6 +2194,8 @@ class GitHub:
         known_source_paths: list[str] | None = None,
         known_generated_paths: list[str] | None = None,
         defer_paths_until_ready: bool = False,
+        include_intent_paths: bool = False,
+        defer_review_details_for_irrelevant_drafts: bool = False,
     ) -> QueueEntry:
         fields = ",".join(
             (
@@ -2002,13 +2228,27 @@ class GitHub:
         comments = (
             known_comments if known_comments is not None else self.comments(number)
         )
-        reviews = self.reviews(number) if self.config.review_providers else []
+        labels = sorted(str(label["name"]) for label in pull.get("labels") or [])
+        marker = queue_marker_for_client(self, comments)
+        intent = latest_intent(comments, self.trusted_logins)
+        defer_review_details = (
+            defer_review_details_for_irrelevant_drafts
+            and bool(pull["isDraft"])
+            and self.config.pipeline.intent_label not in labels
+            and self.config.queue_label not in labels
+            and not (intent and intent.get("state") == "requested")
+            and marker is None
+        )
+        needs_reviews = any(
+            provider.kind == "github-approvals"
+            or (provider.kind == "bot" and provider.require_formal_review)
+            for provider in self.config.review_providers
+        )
+        reviews = self.reviews(number) if needs_reviews and not defer_review_details else []
         needs_threads = any(
             provider.kind == "bot" and provider.require_resolved_threads
             for provider in self.config.review_providers
         )
-        threads = self.review_threads(number) if needs_threads else []
-        marker = queue_marker_for_client(self, comments)
         head_sha = str(pull["headRefOid"])
         check_rollup = list(pull.get("statusCheckRollup") or [])
         checks = merge_known_check_states(check_states(check_rollup), known_checks)
@@ -2033,6 +2273,20 @@ class GitHub:
             source_paths, generated_paths = self.changed_paths(number)
 
         body = str(pull.get("body") or "")
+        threads = (
+            self.review_threads(number)
+            if needs_threads and not defer_review_details
+            else []
+        )
+        review_verdicts = evaluate_reviews(
+            self.config.review_providers,
+            head_sha=head_sha,
+            checks=checks,
+            comments=comments,
+            reviews=reviews,
+            threads=threads,
+        )
+
         entry = QueueEntry(
             number=int(pull["number"]),
             title=str(pull["title"]),
@@ -2045,16 +2299,9 @@ class GitHub:
             base_branch=str(pull["baseRefName"]),
             mergeable=str(pull.get("mergeable") or "UNKNOWN").upper(),
             merge_state=str(pull.get("mergeStateStatus") or "UNKNOWN").upper(),
-            labels=sorted(str(label["name"]) for label in pull.get("labels") or []),
+            labels=labels,
             checks=checks,
-            review_verdicts=evaluate_reviews(
-                self.config.review_providers,
-                head_sha=head_sha,
-                checks=checks,
-                comments=comments,
-                reviews=reviews,
-                threads=threads,
-            ),
+            review_verdicts=review_verdicts,
             source_paths=sorted(set(source_paths)),
             generated_paths=sorted(set(generated_paths)),
             dependencies=structured_dependencies(
@@ -2072,7 +2319,17 @@ class GitHub:
             require_marker=require_marker,
             allow_blocked_label=allow_blocked_label,
         )
-        if not paths_are_known and defer_paths_until_ready and entry.state == "ready":
+        if (
+            not paths_are_known
+            and defer_paths_until_ready
+            and (
+                entry.state == "ready"
+                or (
+                    include_intent_paths
+                    and self.config.pipeline.intent_label in entry.labels
+                )
+            )
+        ):
             entry.source_paths, entry.generated_paths = self.changed_paths(number)
         return entry
 
@@ -2401,6 +2658,9 @@ def pipeline_status(client: GitHub) -> dict[str, Any]:
                 require_marker=False,
                 allow_blocked_label=True,
                 known_comments=comments,
+                defer_paths_until_ready=True,
+                include_intent_paths=True,
+                defer_review_details_for_irrelevant_drafts=True,
             ),
         )
 
