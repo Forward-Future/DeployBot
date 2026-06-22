@@ -2426,6 +2426,7 @@ class QueueCoreTest(unittest.TestCase):
         client.owner = "example"
         client.coordinator_logins = {"trusted"}
         client.base_sha = Mock(return_value="b" * 40)
+        client.is_ancestor = Mock(return_value=False)
         client._json = Mock(
             side_effect=[
                 {},
@@ -2460,6 +2461,7 @@ class QueueCoreTest(unittest.TestCase):
         client.owner = "example"
         client.coordinator_logins = {"trusted"}
         client.base_sha = Mock(return_value="b" * 40)
+        client.is_ancestor = Mock(return_value=False)
         client._json = Mock(
             side_effect=[
                 {},
@@ -3619,6 +3621,7 @@ class QueueCoreTest(unittest.TestCase):
         client.owner = "example"
         client.name = "repo"
         client.base_sha = Mock(return_value="b" * 40)
+        client.is_ancestor = Mock(return_value=False)
         client._json = Mock(
             side_effect=[
                 {},
@@ -3645,6 +3648,13 @@ class QueueCoreTest(unittest.TestCase):
         ]
         self.assertEqual(len(merge_calls), 2)
         self.assertEqual(
+            [call.args for call in client.is_ancestor.call_args_list],
+            [
+                (first.head_sha, "b" * 40),
+                (second.head_sha, "1" * 40),
+            ],
+        )
+        self.assertEqual(
             [call.args for call in client.remove_label.call_args_list],
             [
                 (1, "merge-queue"),
@@ -3670,6 +3680,7 @@ class QueueCoreTest(unittest.TestCase):
         client.owner = "example"
         client.name = "repo"
         client.base_sha = Mock(return_value="b" * 40)
+        client.is_ancestor = Mock(return_value=False)
         client._json = Mock(
             side_effect=[
                 {},
@@ -3830,6 +3841,89 @@ class QueueCoreTest(unittest.TestCase):
             ],
         )
 
+    def test_integration_skips_source_already_contained_transitively(self) -> None:
+        cumulative = entry(1, "shared.py")
+        contained = entry(2, "shared.py")
+        batch = new_batch([cumulative, contained], frozen_at="2026-06-20T00:00:00Z")
+        client = object.__new__(GitHub)
+        client.config = parse_config(
+            {
+                "queue": {
+                    "required_checks": ["CI"],
+                    "trusted_actors": ["trusted"],
+                },
+                "integration": {"mode": "all"},
+            }
+        )
+        client.repository = "example/repo"
+        client.owner = "example"
+        client.name = "repo"
+        client.base_sha = Mock(return_value="b" * 40)
+        client.is_ancestor = Mock(side_effect=[False, True])
+        client._json = Mock(
+            side_effect=[
+                {},
+                {"sha": "m" * 40},
+                [],
+                {"number": 99, "html_url": "https://example.test/99"},
+            ]
+        )
+        client.comment = Mock()
+        client.labels = Mock(return_value={"merge-queue", "deploy-requested"})
+        client.remove_label = Mock()
+
+        result = client.create_integration_pull_request(
+            batch=batch, entries=[cumulative, contained]
+        )
+
+        self.assertIsNone(result["conflict"])
+        merge_calls = [
+            call
+            for call in client._json.call_args_list
+            if "repos/example/repo/merges" in call.args
+        ]
+        self.assertEqual(len(merge_calls), 1)
+        marker = client.comment.call_args.args[1]
+        self.assertIn(cumulative.head_sha, marker)
+        self.assertIn(contained.head_sha, marker)
+
+    def test_integration_recovers_empty_merge_response_after_race(self) -> None:
+        source = entry(1, "shared.py")
+        batch = new_batch([source], frozen_at="2026-06-20T00:00:00Z")
+        client = object.__new__(GitHub)
+        client.config = parse_config(
+            {
+                "queue": {
+                    "required_checks": ["CI"],
+                    "trusted_actors": ["trusted"],
+                },
+                "integration": {"mode": "all"},
+            }
+        )
+        client.repository = "example/repo"
+        client.owner = "example"
+        client.name = "repo"
+        client.base_sha = Mock(return_value="b" * 40)
+        client.is_ancestor = Mock(side_effect=[False, True])
+        client._json = Mock(
+            side_effect=[
+                {},
+                QueueError("GitHub returned invalid JSON"),
+                {"object": {"sha": "m" * 40}},
+                [],
+                {"number": 99, "html_url": "https://example.test/99"},
+            ]
+        )
+        client.comment = Mock()
+        client.labels = Mock(return_value={"merge-queue", "deploy-requested"})
+        client.remove_label = Mock()
+
+        result = client.create_integration_pull_request(batch=batch, entries=[source])
+
+        self.assertIsNone(result["conflict"])
+        marker = client.comment.call_args.args[1]
+        self.assertIn(source.head_sha, marker)
+
     def test_failed_integration_pr_creation_removes_its_orphan_branch(self) -> None:
         first = entry(1, "shared.py")
         second = entry(2, "shared.py")
@@ -3848,6 +3942,7 @@ class QueueCoreTest(unittest.TestCase):
         client.owner = "example"
         client.name = "repo"
         client.base_sha = Mock(return_value="b" * 40)
+        client.is_ancestor = Mock(return_value=False)
         client._json = Mock(
             side_effect=[
                 {},

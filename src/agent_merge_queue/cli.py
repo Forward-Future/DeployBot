@@ -1672,12 +1672,21 @@ class GitHub:
         except QueueError as error:
             if "Reference already exists" not in str(error):
                 raise
+            ref = self._json("api", f"repos/{self.repository}/git/ref/heads/{branch}")
+            branch_head = str((ref.get("object") or {}).get("sha") or "")
+            if not branch_head:
+                raise QueueError(f"integration branch {branch} has no readable head")
+        else:
+            branch_head = base_sha
 
         merged_heads: list[str] = []
         conflict: dict[str, Any] | None = None
         for entry in entries:
+            if self.is_ancestor(entry.head_sha, branch_head):
+                merged_heads.append(entry.head_sha)
+                continue
             try:
-                self._json(
+                merged = self._json(
                     "api",
                     "--method",
                     "POST",
@@ -1689,8 +1698,22 @@ class GitHub:
                     "-f",
                     f"commit_message=DeployBot batch {batch_id}: PR #{entry.number}",
                 )
+                branch_head = str((merged or {}).get("sha") or branch_head)
                 merged_heads.append(entry.head_sha)
             except QueueError as error:
+                # GitHub returns 204 with an empty body when a concurrent
+                # update makes this merge a no-op. _json cannot decode that
+                # response, so re-read the authoritative branch head and
+                # accept it only when the exact frozen source is now present.
+                if str(error) == "GitHub returned invalid JSON":
+                    ref = self._json(
+                        "api", f"repos/{self.repository}/git/ref/heads/{branch}"
+                    )
+                    current_head = str((ref.get("object") or {}).get("sha") or "")
+                    if current_head and self.is_ancestor(entry.head_sha, current_head):
+                        branch_head = current_head
+                        merged_heads.append(entry.head_sha)
+                        continue
                 conflict = {
                     "number": entry.number,
                     "head_sha": entry.head_sha,
