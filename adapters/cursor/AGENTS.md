@@ -16,6 +16,14 @@ freeze the queue just to inspect it.
 Only the user's exact `deploy` instruction authorizes `request_deployment` for
 the current thread. DeployBot uses the recorded PR-opening Cursor thread; a
 coordinator must never substitute its own thread ID. Never record prompt contents.
+Never merge through Cursor, GitHub's merge API, or a direct push to the base
+branch. This remains forbidden when branch protection is unavailable and when
+the user says `merge`, `ship`, `fix it`, or `do it`; only the exact `deploy`
+instruction authorizes a DeployBot request, and only DeployBot's designated
+coordinator may perform the eventual merge. Updating a feature branch with the
+base branch is allowed, but making that feature head reachable from the base
+branch is itself a merge and is forbidden outside DeployBot.
+
 Never poll, merge an unlabeled PR, or absorb unrelated work. Let the event worker
 promote fresh exact heads, use one integration PR for overlaps or cumulative
 validation, return repair packets to the source thread, atomically resume after

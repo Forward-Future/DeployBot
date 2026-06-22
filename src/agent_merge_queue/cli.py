@@ -2134,6 +2134,8 @@ class GitHub:
                 "branch": branch,
                 "conflict": conflict,
                 "batch_id": batch_id,
+                "heads": heads,
+                "pull_requests": pull_requests,
             }
         finally:
             if staging_created:
@@ -2887,7 +2889,14 @@ def pipeline_status(client: GitHub) -> dict[str, Any]:
         timestamp = parse_time(entry.queued_at)
         elapsed = (now - timestamp).total_seconds() if timestamp else None
         if elapsed is not None and elapsed > queue_target:
-            active_gate = "; ".join(entry.reasons or []) or "merge worker"
+            detail = "; ".join(entry.reasons or [])
+            if client.config.blocked_label in entry.labels:
+                active_gate = (
+                    "repair is blocked; source thread must resume"
+                    + (f": {detail}" if detail else "")
+                )
+            else:
+                active_gate = detail or "merge worker"
             if not entry.reasons and entry.number in integration_numbers:
                 active_gate = integration_ci_active_gate(client, entry) or active_gate
             alerts.append(
@@ -3353,8 +3362,12 @@ def record_repair(
     intent: dict[str, Any] | None,
     reason: str,
     *,
+    base_sha: str | None = None,
     resume_pull_request: int | None = None,
+    source_heads: dict[str, str] | None = None,
+    source_pull_requests: list[int] | None = None,
 ) -> dict[str, Any]:
+    current_base_sha = base_sha or client.base_sha()
     comments = client.comments(entry.number)
     previous = latest_payload(
         comments,
@@ -3366,6 +3379,10 @@ def record_repair(
         and previous.get("head_sha") == entry.head_sha
         and previous.get("reason") == reason
         and previous.get("intent_id") == (intent or {}).get("intent_id")
+        and previous.get("base_sha") == current_base_sha
+        and previous.get("repair_pull_request") == resume_pull_request
+        and previous.get("source_heads") == source_heads
+        and previous.get("source_pull_requests") == source_pull_requests
     ):
         return previous
     created_at = utc_now()
@@ -3381,7 +3398,7 @@ def record_repair(
             or created_at
         )
     payload = {
-        "base_sha": client.base_sha(),
+        "base_sha": current_base_sha,
         "created_at": created_at,
         "head_sha": entry.head_sha,
         "hold_started_at": hold_started_at,
@@ -3398,6 +3415,10 @@ def record_repair(
     }
     if resume_pull_request is not None:
         payload["repair_pull_request"] = resume_pull_request
+    if source_heads is not None:
+        payload["source_heads"] = source_heads
+    if source_pull_requests is not None:
+        payload["source_pull_requests"] = source_pull_requests
     client.comment(entry.number, repair_body(payload))
     labels = client.labels(entry.number)
     if client.config.blocked_label not in labels:
@@ -3435,6 +3456,19 @@ def record_integration_conflict_repair(
         return None
     integration_number = int(result["number"])
     conflicting_number = int(conflict["number"])
+    frozen_heads_value = result.get("heads")
+    frozen_numbers_value = result.get("pull_requests")
+    if not isinstance(frozen_heads_value, dict) or not isinstance(
+        frozen_numbers_value, list
+    ):
+        raise QueueError("integration repair packet is missing frozen membership")
+    frozen_heads = {
+        str(number): str(head_sha)
+        for number, head_sha in frozen_heads_value.items()
+    }
+    frozen_numbers = [int(number) for number in frozen_numbers_value]
+    if set(frozen_heads) != {str(number) for number in frozen_numbers}:
+        raise QueueError("integration repair packet has inconsistent frozen members")
     owner: QueueEntry | None = None
     owner_intent: dict[str, Any] | None = None
     for entry in entries:
@@ -3467,6 +3501,8 @@ def record_integration_conflict_repair(
         owner_intent,
         reason,
         resume_pull_request=integration_number,
+        source_heads=frozen_heads,
+        source_pull_requests=frozen_numbers,
     )
     result["repair_owner"] = {
         "pull_request": owner.number,
@@ -3643,6 +3679,36 @@ def command_promote(
                     if label != client.config.blocked_label
                 ]
             else:
+                reasons = entry.reasons or []
+                if (
+                    "pull request conflicts with main" in reasons
+                    and deployment_repair_required(entry)
+                ):
+                    current_base_sha = client.base_sha()
+                    if not repair or repair.get("base_sha") != current_base_sha:
+                        reason = "; ".join(reasons or ["blocked"])
+                        repair = record_repair(
+                            client,
+                            entry,
+                            intent,
+                            reason,
+                            base_sha=current_base_sha,
+                        )
+                        entry.repair_overlap_hold = repair_overlap_hold_active(
+                            client,
+                            entry,
+                            intent,
+                            repair,
+                        )
+                        return (
+                            "blocked",
+                            {
+                                "number": number,
+                                "reason": reason,
+                                "repair": repair,
+                            },
+                            entry,
+                        )
                 return (
                     "waiting",
                     {

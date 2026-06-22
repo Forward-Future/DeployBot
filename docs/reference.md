@@ -170,6 +170,9 @@ Provider fields are:
 | `ci_failure_grace_seconds` | Non-negative window for an exact-main CI retry to replace a failed attempt before the release fails. Default: 90. |
 | `promotion_workers` | Positive maximum number of deploy requests promoted concurrently. Default: 4. |
 | `repair_hold_minutes` | Positive maximum time that a genuine repair may hold overlapping ready work without becoming merge-eligible. Default: 60. |
+| repair handoff refresh | When `main` changes during a conflict repair, DeployBot emits a new `repair-required` handoff with the new base SHA for each affected source owner while preserving the original bounded hold start. |
+| integration repair packet | Includes `source_pull_requests` and the complete `source_heads` map so the elected owner can verify every frozen source before resuming the cumulative PR. |
+| suppressed integration PR run | Integration `pull_request` runs, including `action_required` zero-job placeholders, are not exact CI evidence. DeployBot uses its own exact-branch `workflow_dispatch` run, whose real failures still fail closed. |
 | `hold_merges_while_releasing` | Default `true`; after a merge, admit no newer batch until the release reaches the `release_admission` gate. |
 | `release_admission` | How far an in-flight release must progress before the next batch is admitted; allowed: `verified` (default, safest) waits for the cumulative exact-main revision to be live, `ci-passed` reopens admission once exact-main CI is green while deploy and health checks keep following in the background. `ci-passed` trades a larger failure blast radius for throughput, and verification and notifications for a release may be emitted by a later reaction rather than the merging one. |
 | `repair_branch_prefix` | Deterministic release-repair lease branch prefix; default `"deploybot/repair"`. |
