@@ -238,6 +238,15 @@ new `repair-required` event for the new base SHA even when the PR head and failu
 text are unchanged. Every affected source owner can refresh in parallel; FIFO is
 still enforced when repaired heads re-enter the merge queue.
 
+Integration-conflict repair packets include the complete frozen pull-request and
+head map. The elected owner must prove every frozen head is present before
+resuming the cumulative integration pull request.
+
+Token-authored integration PR `pull_request` runs are never accepted as exact CI
+evidence. This includes GitHub's `action_required` zero-job placeholder:
+DeployBot ignores it and dispatches the configured exact-branch
+`workflow_dispatch` run itself. Failures in that owned run still fail closed.
+
 DeployBot does not treat a registry comment as user notification. If native
 delivery fails, an independent outbox entry stays visible under pending
 `notifications`, even if the PR-opening thread starts new work, and the same

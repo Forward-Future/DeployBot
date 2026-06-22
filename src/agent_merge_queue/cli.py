@@ -2134,6 +2134,8 @@ class GitHub:
                 "branch": branch,
                 "conflict": conflict,
                 "batch_id": batch_id,
+                "heads": heads,
+                "pull_requests": pull_requests,
             }
         finally:
             if staging_created:
@@ -3362,6 +3364,8 @@ def record_repair(
     *,
     base_sha: str | None = None,
     resume_pull_request: int | None = None,
+    source_heads: dict[str, str] | None = None,
+    source_pull_requests: list[int] | None = None,
 ) -> dict[str, Any]:
     current_base_sha = base_sha or client.base_sha()
     comments = client.comments(entry.number)
@@ -3376,6 +3380,9 @@ def record_repair(
         and previous.get("reason") == reason
         and previous.get("intent_id") == (intent or {}).get("intent_id")
         and previous.get("base_sha") == current_base_sha
+        and previous.get("repair_pull_request") == resume_pull_request
+        and previous.get("source_heads") == source_heads
+        and previous.get("source_pull_requests") == source_pull_requests
     ):
         return previous
     created_at = utc_now()
@@ -3408,6 +3415,10 @@ def record_repair(
     }
     if resume_pull_request is not None:
         payload["repair_pull_request"] = resume_pull_request
+    if source_heads is not None:
+        payload["source_heads"] = source_heads
+    if source_pull_requests is not None:
+        payload["source_pull_requests"] = source_pull_requests
     client.comment(entry.number, repair_body(payload))
     labels = client.labels(entry.number)
     if client.config.blocked_label not in labels:
@@ -3445,6 +3456,19 @@ def record_integration_conflict_repair(
         return None
     integration_number = int(result["number"])
     conflicting_number = int(conflict["number"])
+    frozen_heads_value = result.get("heads")
+    frozen_numbers_value = result.get("pull_requests")
+    if not isinstance(frozen_heads_value, dict) or not isinstance(
+        frozen_numbers_value, list
+    ):
+        raise QueueError("integration repair packet is missing frozen membership")
+    frozen_heads = {
+        str(number): str(head_sha)
+        for number, head_sha in frozen_heads_value.items()
+    }
+    frozen_numbers = [int(number) for number in frozen_numbers_value]
+    if set(frozen_heads) != {str(number) for number in frozen_numbers}:
+        raise QueueError("integration repair packet has inconsistent frozen members")
     owner: QueueEntry | None = None
     owner_intent: dict[str, Any] | None = None
     for entry in entries:
@@ -3477,6 +3501,8 @@ def record_integration_conflict_repair(
         owner_intent,
         reason,
         resume_pull_request=integration_number,
+        source_heads=frozen_heads,
+        source_pull_requests=frozen_numbers,
     )
     result["repair_owner"] = {
         "pull_request": owner.number,
