@@ -55,6 +55,7 @@ class PipelineConfig:
     auto_promote: bool
     intent_scope: str
     pause_on_failure: bool
+    release_admission: str
     webhook_url_env: str | None
     verifications: tuple[VerificationConfig, ...]
 
@@ -91,6 +92,7 @@ ALLOWED_REVIEW_PROVIDERS = {"bot", "check", "github-approvals"}
 ALLOWED_MERGE_METHODS = {"merge", "squash", "rebase"}
 ALLOWED_INTEGRATION_MODES = {"manual", "overlap", "all"}
 ALLOWED_INTENT_SCOPES = {"head"}
+ALLOWED_RELEASE_ADMISSION = {"verified", "ci-passed"}
 DEFAULT_CONFIG = """\
 [queue]
 base_branch = "main"
@@ -136,6 +138,11 @@ merge_to_live_target_minutes = 10
 auto_promote = true
 intent_scope = "head"
 pause_on_failure = true
+# verified (safest): hold new merges until the cumulative release is live.
+# ci-passed: admit the next batch once exact-main CI passes; deploy and health
+# checks keep following in the background, trading a larger failure blast radius
+# for higher merge throughput.
+release_admission = "verified"
 # Receives best-effort events, including retryable thread-deployed messages.
 # webhook_url_env = "DEPLOYBOT_WEBHOOK_URL"
 
@@ -417,6 +424,12 @@ def parse_config(payload: dict[str, Any]) -> QueueConfig:
     if intent_scope not in ALLOWED_INTENT_SCOPES:
         allowed = ", ".join(sorted(ALLOWED_INTENT_SCOPES))
         raise ConfigError(f"pipeline.intent_scope must be one of: {allowed}")
+    release_admission = _require_string(
+        pipeline.get("release_admission"), "pipeline.release_admission", "verified"
+    )
+    if release_admission not in ALLOWED_RELEASE_ADMISSION:
+        allowed = ", ".join(sorted(ALLOWED_RELEASE_ADMISSION))
+        raise ConfigError(f"pipeline.release_admission must be one of: {allowed}")
 
     return QueueConfig(
         base_branch=_require_string(
@@ -530,6 +543,7 @@ def parse_config(payload: dict[str, Any]) -> QueueConfig:
                 "pipeline.pause_on_failure",
                 True,
             ),
+            release_admission=release_admission,
             webhook_url_env=webhook_url_env,
             verifications=_verifications(pipeline.get("verifications")),
         ),

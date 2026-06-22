@@ -174,6 +174,9 @@ A larger indivisible source-overlap or dependency closure is the sole exception:
 it ships alone, never mixed with unrelated work.
 After any merge, admission stays closed until the cumulative exact-main release
 is verified live, preventing newer merges from starving an older deployment.
+Set `pipeline.release_admission = "ci-passed"` to reopen admission as soon as
+exact-main CI is green—deploy and health checks keep following in the
+background—when higher merge throughput is worth a larger failure blast radius.
 Draft status and incomplete
 checks or reviews remain waiting states; they do not create a repair latch. A
 conflict, failed gate, unresolved review, manual block, or stale authorized head
@@ -262,6 +265,7 @@ merge_to_live_target_minutes = 10
 auto_promote = true
 intent_scope = "head"
 pause_on_failure = true
+release_admission = "verified" # or "ci-passed" for higher merge throughput
 
 [[pipeline.verifications]]
 name = "Login"

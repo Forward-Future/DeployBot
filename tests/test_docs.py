@@ -138,6 +138,7 @@ class DocumentationTest(unittest.TestCase):
                 "auto_promote",
                 "intent_scope",
                 "pause_on_failure",
+                "release_admission",
                 "webhook_url_env",
                 "verifications",
                 "name",
