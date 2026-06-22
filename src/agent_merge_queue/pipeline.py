@@ -209,6 +209,7 @@ def follow_release(
     *,
     timeout_seconds: int,
     poll_seconds: int,
+    admit_gate: str = "verified",
 ) -> dict[str, Any]:
     deadline = time.monotonic() + timeout_seconds
     observed_sha = ""
@@ -262,6 +263,19 @@ def follow_release(
                     client.dispatch_deploy_workflows(ci_run=ci)
                 )
                 dispatched_for.add(key)
+        if admit_gate == "ci-passed" and value["state"] in {
+            "awaiting-deploy",
+            "deploying",
+        }:
+            # Exact-main CI already passed and the deployment is in flight. Hand
+            # control back so the next batch can merge; a later reaction (or the
+            # scheduled reconciliation) follows this deployment through to
+            # verification, records the watermark, and emits notifications.
+            return {
+                **value,
+                "dispatched_deployments": dispatched_deployments,
+                "verifications": [],
+            }
         if value["state"] == "verified":
             checks = http_verifications(client.config.pipeline)
             last_verifications = checks

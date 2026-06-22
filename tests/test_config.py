@@ -115,6 +115,7 @@ class ConfigTest(unittest.TestCase):
 
         self.assertEqual(path.name, ".mergequeue.toml")
         self.assertEqual(config.required_checks, ("CI",))
+        self.assertEqual(config.pipeline.release_admission, "verified")
         self.assertEqual(
             config.trusted_actors,
             ("@repository-owner",),
@@ -188,6 +189,7 @@ class ConfigTest(unittest.TestCase):
                     "promotion_workers": 3,
                     "repair_hold_minutes": 90,
                     "hold_merges_while_releasing": False,
+                    "release_admission": "ci-passed",
                     "repair_branch_prefix": "repairs/main",
                     "auto_promote": False,
                     "verifications": [
@@ -212,6 +214,7 @@ class ConfigTest(unittest.TestCase):
         self.assertEqual(config.pipeline.promotion_workers, 3)
         self.assertEqual(config.pipeline.repair_hold_minutes, 90)
         self.assertFalse(config.pipeline.hold_merges_while_releasing)
+        self.assertEqual(config.pipeline.release_admission, "ci-passed")
         self.assertEqual(config.pipeline.repair_branch_prefix, "repairs/main")
         self.assertFalse(config.pipeline.auto_promote)
         self.assertEqual(config.pipeline.verifications[0].expected_status, 200)
@@ -291,6 +294,16 @@ class ConfigTest(unittest.TestCase):
                         "trusted_actors": ["trusted"],
                     },
                     "pipeline": {"intent_scope": "pull-request"},
+                }
+            )
+        with self.assertRaisesRegex(ConfigError, "release_admission"):
+            parse_config(
+                {
+                    "queue": {
+                        "required_checks": ["CI"],
+                        "trusted_actors": ["trusted"],
+                    },
+                    "pipeline": {"release_admission": "deployed"},
                 }
             )
         with self.assertRaisesRegex(ConfigError, "batch_settle_seconds"):

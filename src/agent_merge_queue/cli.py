@@ -5116,12 +5116,14 @@ def command_follow(
     poll_seconds: int,
     json_output: bool,
     emit: bool = True,
+    admit_gate: str = "verified",
 ) -> dict[str, Any]:
     try:
         result = follow_release(
             client,
             timeout_seconds=timeout_seconds,
             poll_seconds=poll_seconds,
+            admit_gate=admit_gate,
         )
     except QueueError as error:
         if client.config.pipeline.pause_on_failure:
@@ -5537,7 +5539,24 @@ def command_react(
             release_is_verified = release_before_merge["state"] == "verified"
         if release_is_verified:
             client.record_verified_main(current_main_sha)
-        if has_release_owner and not release_is_verified and not recovering_current_main:
+        # In "verified" mode the next batch waits for the cumulative release to
+        # be fully live. In "ci-passed" mode admission reopens as soon as
+        # exact-main CI is green (deploy in flight), so merges stop waiting on
+        # deploy and health-check time.
+        admission_gate = client.config.pipeline.release_admission
+        admitted_states = {"verified"}
+        if admission_gate == "ci-passed":
+            admitted_states |= {"awaiting-deploy", "deploying"}
+        release_admitted = (
+            release_already_verified
+            or release_is_verified
+            or release_before_merge.get("state") in admitted_states
+        )
+        if (
+            has_release_owner
+            and not release_admitted
+            and not recovering_current_main
+        ):
             release = release_before_merge
             if follow:
                 release = command_follow(
@@ -5546,8 +5565,9 @@ def command_react(
                     poll_seconds=10,
                     json_output=False,
                     emit=False,
+                    admit_gate=admission_gate,
                 )
-            if release.get("state") != "verified":
+            if release.get("state") not in admitted_states:
                 result = {
                     "state": "release-held",
                     "release": release,
@@ -5561,8 +5581,9 @@ def command_react(
                 }
                 print(json.dumps(result, indent=2, sort_keys=True))
                 return result
-            release_completed_before_merge = True
-            release_before_batch = release
+            if release.get("state") == "verified":
+                release_completed_before_merge = True
+                release_before_batch = release
 
     def own_integration_checks(
         numbers: Iterable[int] | None = None,
@@ -5770,6 +5791,7 @@ def command_react(
             poll_seconds=10,
             json_output=False,
             emit=False,
+            admit_gate=client.config.pipeline.release_admission,
         )
     result = {
         "state": "complete",

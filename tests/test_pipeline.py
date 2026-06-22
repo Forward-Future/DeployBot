@@ -172,6 +172,42 @@ class PipelineTest(unittest.TestCase):
         self.assertEqual(result["state"], "verified")
         self.assertEqual(result["dispatched_deployments"][0]["id"], 9)
 
+    def test_follow_admits_at_ci_passed_without_waiting_for_deploy(self) -> None:
+        sha = "a" * 40
+        ci = {
+            "id": 1,
+            "name": "CI",
+            "head_sha": sha,
+            "status": "completed",
+            "conclusion": "success",
+            "event": "workflow_dispatch",
+            "created_at": "2026-06-20T00:00:00Z",
+        }
+        client = Mock()
+        client.config = CONFIG
+        client.base_sha.return_value = sha
+        client.workflow_runs.return_value = [ci]
+        client.dispatch_deploy_workflows.return_value = [
+            {"id": 9, "name": "Deploy", "ci_sha": sha, "ci_run_id": 1}
+        ]
+        with (
+            patch("agent_merge_queue.pipeline.time.sleep") as sleep,
+            patch("agent_merge_queue.pipeline.time.monotonic", return_value=0),
+        ):
+            result = follow_release(
+                client,
+                timeout_seconds=10,
+                poll_seconds=1,
+                admit_gate="ci-passed",
+            )
+
+        # CI is green, so admission returns immediately even though the deploy is
+        # only just dispatched and never verified within this call.
+        client.dispatch_deploy_workflows.assert_called_once()
+        self.assertEqual(result["state"], "awaiting-deploy")
+        self.assertEqual(result["dispatched_deployments"][0]["id"], 9)
+        sleep.assert_not_called()
+
     def test_follow_absorbs_a_ci_rerun_during_failure_grace(self) -> None:
         sha = "a" * 40
         failed = {
