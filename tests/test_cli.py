@@ -11,6 +11,7 @@ from unittest.mock import Mock, call, patch
 from agent_merge_queue.cli import (
     FreezeResult,
     GitHub,
+    INTEGRATION_SEAL_PREFIX,
     QueueEntry,
     QueueError,
     RELEASE_REPAIR_LEASE_PREFIX,
@@ -73,11 +74,13 @@ from agent_merge_queue.cli import (
 )
 from agent_merge_queue.config import parse_config
 from agent_merge_queue.records import (
+    INTEGRATION_MARKER,
     PullRequestThreadOwnerRecord,
     ThreadRecord,
     control_body,
     integration_body,
     intent_body,
+    latest_payload,
     release_repair_body,
     repair_body,
     thread_record_body,
@@ -119,6 +122,26 @@ def entry(number: int, *paths: str, state: str = "ready") -> QueueEntry:
         reasons=[] if state == "ready" else ["waiting gate"],
     )
     return value
+
+
+def integration_seal_payload(
+    batch: dict[str, object],
+    entries: list[QueueEntry],
+    *,
+    base_sha: str,
+    merged_heads: list[str] | None = None,
+    conflict: dict[str, object] | None = None,
+) -> dict[str, object]:
+    return {
+        "base_sha": base_sha,
+        "batch_id": batch["batch_id"],
+        "conflict": conflict,
+        "heads": {str(value.number): value.head_sha for value in entries},
+        "merged_heads": merged_heads
+        if merged_heads is not None
+        else list(dict.fromkeys(value.head_sha for value in entries)),
+        "pull_requests": [value.number for value in entries],
+    }
 
 
 def deployment_notification(
@@ -2541,12 +2564,16 @@ class QueueCoreTest(unittest.TestCase):
         client._json = Mock(
             side_effect=[
                 {},
-                {},
+                {"status": "behind"},
+                {"sha": "1" * 40},
+                {"status": "behind"},
+                {"sha": "2" * 40},
                 {},
                 [],
                 {"number": 99, "user": {"login": "github-actions[bot]"}},
             ]
         )
+        client.create_integration_seal = Mock(return_value="s" * 40)
         client._run = Mock(return_value="")
 
         with self.assertRaisesRegex(QueueError, "GitHub App installation token"):
@@ -2554,7 +2581,7 @@ class QueueCoreTest(unittest.TestCase):
                 batch={"batch_id": "batch"},
                 entries=[entry(1), entry(2)],
             )
-        self.assertEqual(client._run.call_count, 2)
+        self.assertEqual(client._run.call_count, 3)
 
     def test_integration_requires_app_author_to_be_a_coordinator(self) -> None:
         config = parse_config(
@@ -2575,12 +2602,16 @@ class QueueCoreTest(unittest.TestCase):
         client._json = Mock(
             side_effect=[
                 {},
-                {},
+                {"status": "behind"},
+                {"sha": "1" * 40},
+                {"status": "behind"},
+                {"sha": "2" * 40},
                 {},
                 [],
                 {"number": 99, "user": {"login": "deploybot-app[bot]"}},
             ]
         )
+        client.create_integration_seal = Mock(return_value="s" * 40)
         client._run = Mock(return_value="")
 
         with self.assertRaisesRegex(QueueError, "queue.coordinator_actors"):
@@ -2588,7 +2619,7 @@ class QueueCoreTest(unittest.TestCase):
                 batch={"batch_id": "batch"},
                 entries=[entry(1), entry(2)],
             )
-        self.assertEqual(client._run.call_count, 2)
+        self.assertEqual(client._run.call_count, 3)
 
     def test_queue_marker_rejects_forgery_and_free_text_injection(self) -> None:
         sha = "a" * 40
@@ -3806,6 +3837,32 @@ class QueueCoreTest(unittest.TestCase):
             datetime(2026, 6, 20, 1, tzinfo=timezone.utc),
         )
 
+    def test_integration_seal_round_trips_through_git_commit(self) -> None:
+        parent_sha = "p" * 40
+        seal_sha = "s" * 40
+        payload = {"batch_id": "batch-1", "heads": {"1": "1" * 40}}
+        client = object.__new__(GitHub)
+        client.repository = "example/repo"
+        client._json = Mock(
+            side_effect=[
+                {"tree": {"sha": "t" * 40}},
+                {"sha": seal_sha},
+                {
+                    "message": INTEGRATION_SEAL_PREFIX
+                    + json.dumps(payload, sort_keys=True)
+                },
+            ]
+        )
+
+        created = client.create_integration_seal(
+            parent_sha=parent_sha,
+            payload=payload,
+        )
+        restored = client.integration_seal(created)
+
+        self.assertEqual(created, seal_sha)
+        self.assertEqual(restored, payload)
+
     def test_integration_pr_contains_every_frozen_head(self) -> None:
         first = entry(1, "shared.py")
         second = entry(2, "shared.py")
@@ -3827,12 +3884,17 @@ class QueueCoreTest(unittest.TestCase):
         client._json = Mock(
             side_effect=[
                 {},
+                {"status": "behind"},
                 {"sha": "1" * 40},
+                {"status": "behind"},
                 {"sha": "2" * 40},
+                {},
                 [],
                 {"number": 99, "html_url": "https://example.test/99"},
             ]
         )
+        client.create_integration_seal = Mock(return_value="s" * 40)
+        client._run = Mock(return_value="")
         client.comment = Mock()
         client.labels = Mock(return_value={"merge-queue", "deploy-requested"})
         client.remove_label = Mock()
@@ -3857,6 +3919,322 @@ class QueueCoreTest(unittest.TestCase):
             ],
         )
 
+    def test_concurrent_integration_pr_creation_reuses_the_winner(self) -> None:
+        first = entry(1, "shared.py")
+        batch = new_batch([first], frozen_at="2026-06-20T00:00:00Z")
+        client = object.__new__(GitHub)
+        client.config = parse_config(
+            {
+                "queue": {
+                    "required_checks": ["CI"],
+                    "trusted_actors": ["trusted"],
+                },
+                "integration": {"mode": "all"},
+            }
+        )
+        client.repository = "example/repo"
+        client.owner = "example"
+        client.name = "repo"
+        client.base_sha = Mock(return_value="b" * 40)
+        client.is_ancestor = Mock(return_value=True)
+        client._json = Mock(
+            side_effect=[
+                {},
+                {},
+                [],
+                QueueError("pull request already exists"),
+                [{"number": 99, "html_url": "https://example.test/99"}],
+            ]
+        )
+        client.create_integration_seal = Mock(return_value="s" * 40)
+        client._run = Mock(return_value="")
+        client.comment = Mock()
+        client.labels = Mock(return_value=set())
+        client.remove_label = Mock()
+
+        result = client.create_integration_pull_request(batch=batch, entries=[first])
+
+        self.assertEqual(result["number"], 99)
+        client.comment.assert_called_once()
+
+    def test_sealed_recovery_allows_prs_with_the_same_head(self) -> None:
+        first = entry(1, "shared.py")
+        second = entry(2, "shared.py")
+        second.head_sha = first.head_sha
+        entries = [first, second]
+        batch = new_batch(entries, frozen_at="2026-06-20T00:00:00Z")
+        base_sha = "b" * 40
+        sealed_sha = "f" * 40
+        client = object.__new__(GitHub)
+        client.config = parse_config(
+            {
+                "queue": {
+                    "required_checks": ["CI"],
+                    "trusted_actors": ["trusted"],
+                },
+                "integration": {"mode": "all"},
+            }
+        )
+        client.repository = "example/repo"
+        client.owner = "example"
+        client.name = "repo"
+        client.base_sha = Mock(return_value=base_sha)
+        client.is_ancestor = Mock(side_effect=[False, True, True, True])
+        client._json = Mock(
+            side_effect=[
+                {},
+                {"sha": "m" * 40},
+                QueueError("Reference already exists"),
+                {"object": {"sha": sealed_sha}},
+                [{"number": 99, "html_url": "https://example.test/99"}],
+            ]
+        )
+        client.create_integration_seal = Mock(return_value="s" * 40)
+        client.integration_seal = Mock(
+            return_value=integration_seal_payload(
+                batch,
+                entries,
+                base_sha=base_sha,
+            )
+        )
+        client._run = Mock(return_value="")
+        client.comment = Mock()
+        client.labels = Mock(return_value=set())
+        client.remove_label = Mock()
+
+        result = client.create_integration_pull_request(batch=batch, entries=entries)
+
+        self.assertEqual(result["number"], 99)
+        marker = latest_payload(
+            [
+                {
+                    "id": 1,
+                    "created_at": "2026-06-20T00:01:00Z",
+                    "user": {"login": "coordinator"},
+                    "body": client.comment.call_args.args[1],
+                }
+            ],
+            INTEGRATION_MARKER,
+            {"coordinator"},
+        )
+        self.assertEqual(marker["merged_heads"], [first.head_sha])
+
+    def test_closed_unmerged_integration_pr_is_reopened(self) -> None:
+        first = entry(1, "shared.py")
+        batch = new_batch([first], frozen_at="2026-06-20T00:00:00Z")
+        closed_pull = {
+            "number": 99,
+            "html_url": "https://example.test/99",
+            "state": "closed",
+            "merged_at": None,
+        }
+        reopened_pull = {**closed_pull, "state": "open"}
+        client = object.__new__(GitHub)
+        client.config = parse_config(
+            {
+                "queue": {
+                    "required_checks": ["CI"],
+                    "trusted_actors": ["trusted"],
+                },
+                "integration": {"mode": "all"},
+            }
+        )
+        client.repository = "example/repo"
+        client.owner = "example"
+        client.name = "repo"
+        client.base_sha = Mock(return_value="b" * 40)
+        client.is_ancestor = Mock(return_value=True)
+        client._json = Mock(
+            side_effect=[
+                {},
+                {},
+                [],
+                QueueError("pull request already exists"),
+                [],
+                [closed_pull],
+                reopened_pull,
+            ]
+        )
+        client.create_integration_seal = Mock(return_value="s" * 40)
+        client._run = Mock(return_value="")
+        client.comment = Mock()
+        client.labels = Mock(return_value=set())
+        client.remove_label = Mock()
+
+        result = client.create_integration_pull_request(batch=batch, entries=[first])
+
+        self.assertEqual(result["number"], 99)
+        self.assertTrue(
+            any(
+                "pulls?state=closed" in str(call.args)
+                for call in client._json.call_args_list
+            )
+        )
+        self.assertTrue(
+            any(
+                "repos/example/repo/pulls/99" in call.args
+                and "state=open" in call.args
+                for call in client._json.call_args_list
+            )
+        )
+
+    def test_sealed_recovery_uses_full_batch_after_partial_label_cleanup(self) -> None:
+        first = entry(1, "shared.py")
+        second = entry(2, "other.py")
+        batch = new_batch([first, second], frozen_at="2026-06-20T00:00:00Z")
+        base_sha = "b" * 40
+        sealed_sha = "f" * 40
+        client = object.__new__(GitHub)
+        client.config = parse_config(
+            {
+                "queue": {
+                    "required_checks": ["CI"],
+                    "trusted_actors": ["trusted"],
+                },
+                "integration": {"mode": "all"},
+            }
+        )
+        client.repository = "example/repo"
+        client.owner = "example"
+        client.name = "repo"
+        client.base_sha = Mock(return_value=base_sha)
+        client.is_ancestor = Mock(return_value=True)
+        client._json = Mock(
+            side_effect=[
+                {},
+                QueueError("Reference already exists"),
+                {"object": {"sha": sealed_sha}},
+                [{"number": 99, "html_url": "https://example.test/99"}],
+            ]
+        )
+        client.create_integration_seal = Mock(return_value="s" * 40)
+        client.integration_seal = Mock(
+            return_value=integration_seal_payload(
+                batch,
+                [first, second],
+                base_sha=base_sha,
+            )
+        )
+        client._run = Mock(return_value="")
+        client.comment = Mock()
+        client.labels = Mock(
+            side_effect=lambda number: (
+                {"merge-queue"} if number == second.number else set()
+            )
+        )
+        client.remove_label = Mock()
+
+        result = client.create_integration_pull_request(batch=batch, entries=[second])
+
+        self.assertEqual(result["number"], 99)
+        marker = latest_payload(
+            [
+                {
+                    "id": 1,
+                    "created_at": "2026-06-20T00:01:00Z",
+                    "user": {"login": "coordinator"},
+                    "body": client.comment.call_args.args[1],
+                }
+            ],
+            INTEGRATION_MARKER,
+            {"coordinator"},
+        )
+        self.assertEqual(marker["pull_requests"], [1, 2])
+        self.assertEqual(marker["heads"], batch["heads"])
+        client.remove_label.assert_called_once_with(2, "merge-queue")
+
+    def test_overlap_integration_preserves_the_selected_subset(self) -> None:
+        first = entry(1, "shared.py")
+        second = entry(2, "shared.py")
+        independent = entry(3, "independent.py")
+        batch = new_batch(
+            [first, second, independent], frozen_at="2026-06-20T00:00:00Z"
+        )
+        client = object.__new__(GitHub)
+        client.config = parse_config(
+            {
+                "queue": {
+                    "required_checks": ["CI"],
+                    "trusted_actors": ["trusted"],
+                },
+                "integration": {"mode": "overlap"},
+            }
+        )
+        client.repository = "example/repo"
+        client.owner = "example"
+        client.name = "repo"
+        client.base_sha = Mock(return_value="b" * 40)
+        client.is_ancestor = Mock(return_value=True)
+        client._json = Mock(
+            side_effect=[
+                {},
+                {},
+                [],
+                {"number": 99, "html_url": "https://example.test/99"},
+            ]
+        )
+        client.create_integration_seal = Mock(return_value="s" * 40)
+        client._run = Mock(return_value="")
+        client.comment = Mock()
+        client.labels = Mock(return_value={"merge-queue"})
+        client.remove_label = Mock()
+
+        result = client.create_integration_pull_request(
+            batch=batch,
+            entries=[first, second],
+        )
+
+        self.assertEqual(result["number"], 99)
+        seal = client.create_integration_seal.call_args.kwargs["payload"]
+        self.assertEqual(seal["pull_requests"], [1, 2])
+        self.assertEqual(
+            seal["heads"],
+            {"1": first.head_sha, "2": second.head_sha},
+        )
+        self.assertEqual(
+            [call.args[0] for call in client.remove_label.call_args_list],
+            [1, 2],
+        )
+
+    def test_recovered_seal_rejects_non_object_conflict(self) -> None:
+        first = entry(1, "shared.py")
+        batch = new_batch([first], frozen_at="2026-06-20T00:00:00Z")
+        malformed = integration_seal_payload(
+            batch,
+            [first],
+            base_sha="b" * 40,
+            merged_heads=[],
+        )
+        malformed["conflict"] = "merge conflict"
+        client = object.__new__(GitHub)
+        client.config = parse_config(
+            {
+                "queue": {
+                    "required_checks": ["CI"],
+                    "trusted_actors": ["trusted"],
+                },
+                "integration": {"mode": "all"},
+            }
+        )
+        client.repository = "example/repo"
+        client.owner = "example"
+        client.name = "repo"
+        client.base_sha = Mock(return_value="b" * 40)
+        client.is_ancestor = Mock(return_value=True)
+        client._json = Mock(
+            side_effect=[
+                {},
+                QueueError("Reference already exists"),
+                {"object": {"sha": "f" * 40}},
+            ]
+        )
+        client.create_integration_seal = Mock(return_value="s" * 40)
+        client.integration_seal = Mock(return_value=malformed)
+        client._run = Mock(return_value="")
+
+        with self.assertRaisesRegex(QueueError, "invalid conflict data"):
+            client.create_integration_pull_request(batch=batch, entries=[first])
+
     def test_conflicted_integration_keeps_source_intents_discoverable(self) -> None:
         first = entry(1, "shared.py")
         second = entry(2, "shared.py")
@@ -3878,12 +4256,17 @@ class QueueCoreTest(unittest.TestCase):
         client._json = Mock(
             side_effect=[
                 {},
+                {"status": "behind"},
                 {"sha": "1" * 40},
+                {"status": "behind"},
                 QueueError("gh: Merge conflict (HTTP 409)"),
+                {},
                 [],
                 {"number": 99, "html_url": "https://example.test/99"},
             ]
         )
+        client.create_integration_seal = Mock(return_value="s" * 40)
+        client._run = Mock(return_value="")
         client.comment = Mock()
         client.labels = Mock(return_value={"merge-queue", "deploy-requested"})
         client.remove_label = Mock()
@@ -4058,7 +4441,7 @@ class QueueCoreTest(unittest.TestCase):
             ],
         )
 
-    def test_failed_integration_pr_creation_removes_its_orphan_branch(self) -> None:
+    def test_failed_integration_pr_creation_preserves_sealed_branch(self) -> None:
         first = entry(1, "shared.py")
         second = entry(2, "shared.py")
         batch = new_batch([first, second], frozen_at="2026-06-20T00:00:00Z")
@@ -4079,24 +4462,565 @@ class QueueCoreTest(unittest.TestCase):
         client._json = Mock(
             side_effect=[
                 {},
+                {"status": "behind"},
                 {"sha": "1" * 40},
+                {"status": "behind"},
                 {"sha": "2" * 40},
+                {},
                 [],
                 QueueError("GitHub Actions may not create pull requests"),
+                [],
+                [],
             ]
         )
+        client.create_integration_seal = Mock(return_value="s" * 40)
         client._run = Mock(return_value="")
 
         with self.assertRaisesRegex(QueueError, "may not create"):
             client.create_integration_pull_request(batch=batch, entries=[first, second])
 
-        branch = f"deploybot/integration/{batch['batch_id']}"
-        client._run.assert_called_once_with(
-            "api",
-            "--method",
-            "DELETE",
-            f"repos/example/repo/git/refs/heads/{branch}",
+        client._run.assert_called_once()
+        cleanup = client._run.call_args.args
+        self.assertEqual(cleanup[:3], ("api", "--method", "DELETE"))
+        self.assertIn("git/refs/heads/deploybot/integration-staging/", cleanup[3])
+
+    def test_existing_sealed_integration_on_older_base_is_recovered(self) -> None:
+        first = entry(1, "shared.py")
+        batch = new_batch([first], frozen_at="2026-06-20T00:00:00Z")
+        base_sha = "b" * 40
+        old_base_sha = "a" * 40
+        client = object.__new__(GitHub)
+        client.config = parse_config(
+            {
+                "queue": {
+                    "required_checks": ["CI"],
+                    "trusted_actors": ["trusted"],
+                },
+                "integration": {"mode": "all"},
+            }
         )
+        client.repository = "example/repo"
+        client.owner = "example"
+        client.name = "repo"
+        client.coordinator_logins = {"coordinator"}
+        client.base_sha = Mock(return_value=base_sha)
+        client.is_ancestor = Mock(return_value=True)
+        client._json = Mock(
+            side_effect=[
+                {},
+                QueueError("Reference already exists"),
+                {"object": {"sha": old_base_sha}},
+                [],
+                {"number": 99, "html_url": "https://example.test/99"},
+            ]
+        )
+        client.create_integration_seal = Mock(return_value="s" * 40)
+        client.integration_seal = Mock(
+            return_value=integration_seal_payload(
+                batch,
+                [first],
+                base_sha=old_base_sha,
+            )
+        )
+        client.comments = Mock(
+            return_value=[
+                {
+                    "id": 1,
+                    "created_at": "2026-06-20T00:00:00Z",
+                    "user": {"login": "coordinator"},
+                    "body": integration_body(
+                        {
+                            "base_sha": old_base_sha,
+                            "batch_id": batch["batch_id"],
+                            "heads": {"1": first.head_sha},
+                            "integration_sha": old_base_sha,
+                            "pull_requests": [1],
+                        }
+                    ),
+                }
+            ]
+        )
+        client.comment = Mock()
+        client.labels = Mock(return_value=set())
+        client.remove_label = Mock()
+        client._run = Mock(return_value="")
+
+        result = client.create_integration_pull_request(batch=batch, entries=[first])
+
+        self.assertEqual(result["number"], 99)
+        self.assertFalse(any("PATCH" in call.args for call in client._json.call_args_list))
+        self.assertFalse(
+            any(
+                "repos/example/repo/merges" in call.args
+                for call in client._json.call_args_list
+            )
+        )
+        client.comment.assert_called_once()
+
+    def test_existing_integration_branch_with_unmarked_tip_fails_closed(self) -> None:
+        first = entry(1, "shared.py")
+        batch = new_batch([first], frozen_at="2026-06-20T00:00:00Z")
+        base_sha = "b" * 40
+        marked_tip = "f" * 40
+        untrusted_tip = "x" * 40
+        client = object.__new__(GitHub)
+        client.config = parse_config(
+            {
+                "queue": {
+                    "required_checks": ["CI"],
+                    "trusted_actors": ["trusted"],
+                },
+                "integration": {"mode": "all"},
+            }
+        )
+        client.repository = "example/repo"
+        client.owner = "example"
+        client.name = "repo"
+        client.coordinator_logins = {"coordinator"}
+        client.base_sha = Mock(return_value=base_sha)
+        client.is_ancestor = Mock(return_value=True)
+        client._json = Mock(
+            side_effect=[
+                {},
+                QueueError("Reference already exists"),
+                {"object": {"sha": untrusted_tip}},
+            ]
+        )
+        client.create_integration_seal = Mock(return_value="s" * 40)
+        client.integration_seal = Mock(
+            side_effect=QueueError("existing integration branch is not immutably sealed")
+        )
+        client.comments = Mock(
+            return_value=[
+                {
+                    "id": 1,
+                    "created_at": "2026-06-20T00:00:00Z",
+                    "user": {"login": "coordinator"},
+                    "body": integration_body(
+                        {
+                            "base_sha": base_sha,
+                            "batch_id": batch["batch_id"],
+                            "heads": {"1": first.head_sha},
+                            "integration_sha": marked_tip,
+                            "pull_requests": [1],
+                        }
+                    ),
+                }
+            ]
+        )
+        client.comment = Mock()
+        client.labels = Mock(return_value=set())
+        client.remove_label = Mock()
+        client._run = Mock(return_value="")
+
+        with self.assertRaisesRegex(QueueError, "not immutably sealed"):
+            client.create_integration_pull_request(batch=batch, entries=[first])
+
+        self.assertFalse(any("PATCH" in call.args for call in client._json.call_args_list))
+        self.assertFalse(
+            any(
+                "repos/example/repo/merges" in call.args
+                for call in client._json.call_args_list
+            )
+        )
+        client.comment.assert_not_called()
+
+    def test_existing_sealed_integration_without_pr_is_recovered(self) -> None:
+        first = entry(1, "shared.py")
+        batch = new_batch([first], frozen_at="2026-06-20T00:00:00Z")
+        base_sha = "b" * 40
+        client = object.__new__(GitHub)
+        client.config = parse_config(
+            {
+                "queue": {
+                    "required_checks": ["CI"],
+                    "trusted_actors": ["trusted"],
+                },
+                "integration": {"mode": "all"},
+            }
+        )
+        client.repository = "example/repo"
+        client.owner = "example"
+        client.name = "repo"
+        client.coordinator_logins = {"coordinator"}
+        client.base_sha = Mock(return_value=base_sha)
+        client.is_ancestor = Mock(return_value=True)
+        client._json = Mock(
+            side_effect=[
+                {},
+                QueueError("Reference already exists"),
+                {"object": {"sha": base_sha}},
+                [],
+                {"number": 99, "html_url": "https://example.test/99"},
+            ]
+        )
+        client.create_integration_seal = Mock(return_value="s" * 40)
+        client.integration_seal = Mock(
+            return_value=integration_seal_payload(
+                batch,
+                [first],
+                base_sha=base_sha,
+            )
+        )
+        client.comment = Mock()
+        client.labels = Mock(return_value=set())
+        client.remove_label = Mock()
+        client._run = Mock(return_value="")
+
+        result = client.create_integration_pull_request(batch=batch, entries=[first])
+
+        self.assertEqual(result["number"], 99)
+        client.comment.assert_called_once()
+
+    def test_existing_integration_branch_with_mismatched_marker_is_rejected(
+        self,
+    ) -> None:
+        first = entry(1, "shared.py")
+        batch = new_batch([first], frozen_at="2026-06-20T00:00:00Z")
+        base_sha = "b" * 40
+        client = object.__new__(GitHub)
+        client.config = parse_config(
+            {
+                "queue": {
+                    "required_checks": ["CI"],
+                    "trusted_actors": ["trusted"],
+                },
+                "integration": {"mode": "all"},
+            }
+        )
+        client.repository = "example/repo"
+        client.owner = "example"
+        client.name = "repo"
+        client.coordinator_logins = {"coordinator"}
+        client.base_sha = Mock(return_value=base_sha)
+        client.is_ancestor = Mock(return_value=True)
+        client._json = Mock(
+            side_effect=[
+                {},
+                QueueError("Reference already exists"),
+                {"object": {"sha": "a" * 40}},
+            ]
+        )
+        client.create_integration_seal = Mock(return_value="s" * 40)
+        mismatched_seal = integration_seal_payload(
+            batch,
+            [first],
+            base_sha=base_sha,
+        )
+        mismatched_seal["batch_id"] = "different-batch"
+        client.integration_seal = Mock(return_value=mismatched_seal)
+        client.comments = Mock(
+            return_value=[
+                {
+                    "id": 1,
+                    "created_at": "2026-06-20T00:00:00Z",
+                    "user": {"login": "coordinator"},
+                    "body": integration_body(
+                        {
+                            "base_sha": base_sha,
+                            "batch_id": "different-batch",
+                            "heads": {"1": first.head_sha},
+                            "pull_requests": [1],
+                        }
+                    ),
+                }
+            ]
+        )
+        client.comment = Mock()
+        client.labels = Mock(return_value=set())
+        client.remove_label = Mock()
+        client._run = Mock(return_value="")
+
+        with self.assertRaisesRegex(QueueError, "does not match"):
+            client.create_integration_pull_request(batch=batch, entries=[first])
+
+        self.assertFalse(
+            any(
+                "repos/example/repo/merges" in call.args
+                for call in client._json.call_args_list
+            )
+        )
+        self.assertFalse(
+            any("PATCH" in call.args for call in client._json.call_args_list)
+        )
+        client.comment.assert_not_called()
+
+    def test_existing_integration_branch_rerun_is_idempotent_and_truthful(
+        self,
+    ) -> None:
+        first = entry(1, "shared.py")
+        second = entry(2, "shared.py")
+        batch = new_batch([first, second], frozen_at="2026-06-20T00:00:00Z")
+        base_sha = "b" * 40
+        tip_sha = "f" * 40
+        client = object.__new__(GitHub)
+        client.config = parse_config(
+            {
+                "queue": {
+                    "required_checks": ["CI"],
+                    "trusted_actors": ["trusted"],
+                },
+                "integration": {"mode": "all"},
+            }
+        )
+        client.repository = "example/repo"
+        client.owner = "example"
+        client.name = "repo"
+        client.coordinator_logins = {"coordinator"}
+        client.base_sha = Mock(return_value=base_sha)
+        client.is_ancestor = Mock(return_value=True)
+        client._json = Mock(
+            side_effect=[
+                {},
+                QueueError("Reference already exists"),
+                {"object": {"sha": tip_sha}},
+                [{"number": 99, "html_url": "https://example.test/99"}],
+            ]
+        )
+        client.create_integration_seal = Mock(return_value="s" * 40)
+        client.integration_seal = Mock(
+            return_value=integration_seal_payload(
+                batch,
+                [first, second],
+                base_sha=base_sha,
+            )
+        )
+        client.comments = Mock(
+            return_value=[
+                {
+                    "id": 1,
+                    "created_at": "2026-06-20T00:00:00Z",
+                    "user": {"login": "coordinator"},
+                    "body": integration_body(
+                        {
+                            "base_sha": base_sha,
+                            "batch_id": batch["batch_id"],
+                            "heads": {
+                                "1": first.head_sha,
+                                "2": second.head_sha,
+                            },
+                            "conflict": None,
+                            "integration_sha": tip_sha,
+                            "merged_heads": [first.head_sha, second.head_sha],
+                            "pull_requests": [1, 2],
+                        }
+                    ),
+                }
+            ]
+        )
+        client.comment = Mock()
+        client.labels = Mock(return_value=set())
+        client.remove_label = Mock()
+        client._run = Mock(return_value="")
+
+        result = client.create_integration_pull_request(
+            batch=batch, entries=[first, second]
+        )
+
+        self.assertEqual(result["number"], 99)
+        self.assertFalse(
+            any(
+                "repos/example/repo/merges" in call.args
+                for call in client._json.call_args_list
+            )
+        )
+        marker = latest_payload(
+            [
+                {
+                    "id": 2,
+                    "created_at": "2026-06-20T00:01:00Z",
+                    "user": {"login": "coordinator"},
+                    "body": client.comment.call_args.args[1],
+                }
+            ],
+            INTEGRATION_MARKER,
+            {"coordinator"},
+        )
+        self.assertEqual(marker["base_sha"], base_sha)
+        self.assertEqual(marker["heads"], {"1": first.head_sha, "2": second.head_sha})
+        self.assertEqual(marker["integration_sha"], tip_sha)
+        self.assertEqual(marker["merged_heads"], [first.head_sha, second.head_sha])
+
+    def test_existing_draft_integration_pr_is_marked_ready_after_clean_rerun(
+        self,
+    ) -> None:
+        first = entry(1, "shared.py")
+        batch = new_batch([first], frozen_at="2026-06-20T00:00:00Z")
+        base_sha = "b" * 40
+        tip_sha = "f" * 40
+        client = object.__new__(GitHub)
+        client.config = parse_config(
+            {
+                "queue": {
+                    "required_checks": ["CI"],
+                    "trusted_actors": ["trusted"],
+                },
+                "integration": {"mode": "all"},
+            }
+        )
+        client.repository = "example/repo"
+        client.owner = "example"
+        client.name = "repo"
+        client.coordinator_logins = {"coordinator"}
+        client.base_sha = Mock(return_value=base_sha)
+        client.is_ancestor = Mock(return_value=True)
+        client._json = Mock(
+            side_effect=[
+                {},
+                QueueError("Reference already exists"),
+                {"object": {"sha": tip_sha}},
+                [{"number": 99, "html_url": "https://example.test/99", "draft": True}],
+            ]
+        )
+        client.create_integration_seal = Mock(return_value="s" * 40)
+        client.integration_seal = Mock(
+            return_value=integration_seal_payload(
+                batch,
+                [first],
+                base_sha=base_sha,
+            )
+        )
+        client.comments = Mock(
+            return_value=[
+                {
+                    "id": 1,
+                    "created_at": "2026-06-20T00:00:00Z",
+                    "user": {"login": "coordinator"},
+                    "body": integration_body(
+                        {
+                            "base_sha": base_sha,
+                            "batch_id": batch["batch_id"],
+                            "conflict": None,
+                            "heads": {"1": first.head_sha},
+                            "integration_sha": tip_sha,
+                            "merged_heads": [first.head_sha],
+                            "pull_requests": [1],
+                        }
+                    ),
+                }
+            ]
+        )
+        client._run = Mock()
+        client.comment = Mock()
+        client.labels = Mock(return_value=set())
+        client.remove_label = Mock()
+
+        result = client.create_integration_pull_request(batch=batch, entries=[first])
+
+        self.assertEqual(result["number"], 99)
+        client._run.assert_any_call(
+            "pr", "ready", "99", "--repo", "example/repo"
+        )
+        marker = latest_payload(
+            [
+                {
+                    "id": 2,
+                    "created_at": "2026-06-20T00:01:00Z",
+                    "user": {"login": "coordinator"},
+                    "body": client.comment.call_args.args[1],
+                }
+            ],
+            INTEGRATION_MARKER,
+            {"coordinator"},
+        )
+        self.assertIsNone(marker["conflict"])
+
+    def test_existing_ready_integration_pr_is_redrafted_after_sealed_conflict(
+        self,
+    ) -> None:
+        first = entry(1, "shared.py")
+        batch = new_batch([first], frozen_at="2026-06-20T00:00:00Z")
+        base_sha = "b" * 40
+        tip_sha = "f" * 40
+        client = object.__new__(GitHub)
+        client.config = parse_config(
+            {
+                "queue": {
+                    "required_checks": ["CI"],
+                    "trusted_actors": ["trusted"],
+                },
+                "integration": {"mode": "all"},
+            }
+        )
+        client.repository = "example/repo"
+        client.owner = "example"
+        client.name = "repo"
+        client.coordinator_logins = {"coordinator"}
+        client.base_sha = Mock(return_value=base_sha)
+        client.is_ancestor = Mock(side_effect=[False, True])
+        client._json = Mock(
+            side_effect=[
+                {},
+                QueueError("merge conflict"),
+                QueueError("Reference already exists"),
+                {"object": {"sha": tip_sha}},
+                [{"number": 99, "html_url": "https://example.test/99", "draft": False}],
+            ]
+        )
+        conflict = {
+            "number": 1,
+            "head_sha": first.head_sha,
+            "reason": "merge conflict",
+        }
+        client.create_integration_seal = Mock(return_value="s" * 40)
+        client.integration_seal = Mock(
+            return_value=integration_seal_payload(
+                batch,
+                [first],
+                base_sha=base_sha,
+                merged_heads=[],
+                conflict=conflict,
+            )
+        )
+        client.comments = Mock(
+            return_value=[
+                {
+                    "id": 1,
+                    "created_at": "2026-06-20T00:00:00Z",
+                    "user": {"login": "coordinator"},
+                    "body": integration_body(
+                        {
+                            "base_sha": base_sha,
+                            "batch_id": batch["batch_id"],
+                            "conflict": {
+                                "number": 1,
+                                "head_sha": first.head_sha,
+                                "reason": "merge conflict",
+                            },
+                            "heads": {"1": first.head_sha},
+                            "integration_sha": tip_sha,
+                            "merged_heads": [],
+                            "pull_requests": [1],
+                        }
+                    ),
+                }
+            ]
+        )
+        client._run = Mock()
+        client.comment = Mock()
+        client.labels = Mock(return_value=set())
+        client.remove_label = Mock()
+
+        result = client.create_integration_pull_request(batch=batch, entries=[first])
+
+        self.assertEqual(result["number"], 99)
+        client._run.assert_any_call(
+            "pr", "ready", "99", "--undo", "--repo", "example/repo"
+        )
+        marker = latest_payload(
+            [
+                {
+                    "id": 2,
+                    "created_at": "2026-06-20T00:01:00Z",
+                    "user": {"login": "coordinator"},
+                    "body": client.comment.call_args.args[1],
+                }
+            ],
+            INTEGRATION_MARKER,
+            {"coordinator"},
+        )
+        self.assertEqual(marker["conflict"]["number"], 1)
+        self.assertEqual(marker["merged_heads"], [])
 
     def test_reactor_uses_cumulative_pr_in_all_mode(self) -> None:
         config = parse_config(

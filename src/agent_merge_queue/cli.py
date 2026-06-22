@@ -90,6 +90,7 @@ BATCH_COMPLETE_MARKER = re.compile(
 )
 PULL_REQUEST_NUMBER = re.compile(r"#(\d+)\b")
 RELEASE_REPAIR_LEASE_PREFIX = "DeployBot release repair lease v1 "
+INTEGRATION_SEAL_PREFIX = "DeployBot integration seal v1 "
 PR_OPENING_PHASES = {"pr-draft", "pr-review", "ready"}
 FAILED_CHECK_STATES = {
     "ACTION_REQUIRED",
@@ -1366,6 +1367,88 @@ class GitHub:
         )
         return comparison.get("status") in {"ahead", "identical"}
 
+    def branch_ref_sha(self, branch: str) -> str:
+        value = self._json("api", f"repos/{self.repository}/git/ref/heads/{branch}")
+        sha = (value.get("object") or {}).get("sha") if isinstance(value, dict) else ""
+        if not sha:
+            raise QueueError(f"could not read integration branch {branch}")
+        return str(sha)
+
+    def integration_pulls(
+        self, branch: str, *, state: str = "open"
+    ) -> list[dict[str, Any]]:
+        values = self._json(
+            "api",
+            f"repos/{self.repository}/pulls?state={state}&head={self.owner}:{branch}",
+        )
+        return values if isinstance(values, list) else []
+
+    def open_integration_pulls(self, branch: str) -> list[dict[str, Any]]:
+        return self.integration_pulls(branch, state="open")
+
+    def latest_integration_marker(self, pull_number: int) -> dict[str, Any] | None:
+        return latest_payload(
+            self.comments(pull_number),
+            INTEGRATION_MARKER,
+            self.coordinator_logins,
+        )
+
+    @staticmethod
+    def integration_marker_matches(
+        marker: dict[str, Any],
+        *,
+        batch_id: str,
+        heads: dict[str, str],
+        pull_requests: list[int],
+    ) -> bool:
+        return (
+            marker.get("batch_id") == batch_id
+            and marker.get("heads") == heads
+            and marker.get("pull_requests") == pull_requests
+        )
+
+    def create_integration_seal(
+        self,
+        *,
+        parent_sha: str,
+        payload: dict[str, Any],
+    ) -> str:
+        parent = self._json(
+            "api", f"repos/{self.repository}/git/commits/{parent_sha}"
+        )
+        tree_sha = str((parent.get("tree") or {}).get("sha") or "")
+        if not tree_sha:
+            raise QueueError("GitHub did not return the integration candidate tree")
+        value = self._json(
+            "api",
+            "--method",
+            "POST",
+            f"repos/{self.repository}/git/commits",
+            "-f",
+            f"message={INTEGRATION_SEAL_PREFIX}{json.dumps(payload, sort_keys=True)}",
+            "-f",
+            f"tree={tree_sha}",
+            "-f",
+            f"parents[]={parent_sha}",
+        )
+        seal_sha = str(value.get("sha") or "")
+        if not seal_sha:
+            raise QueueError("GitHub did not create the integration seal commit")
+        return seal_sha
+
+    def integration_seal(self, sha: str) -> dict[str, Any]:
+        value = self._json("api", f"repos/{self.repository}/git/commits/{sha}")
+        message = str(value.get("message") or "")
+        if not message.startswith(INTEGRATION_SEAL_PREFIX):
+            raise QueueError("existing integration branch is not immutably sealed")
+        try:
+            payload = json.loads(message[len(INTEGRATION_SEAL_PREFIX) :])
+        except json.JSONDecodeError as error:
+            raise QueueError("existing integration branch has an invalid seal") from error
+        if not isinstance(payload, dict):
+            raise QueueError("existing integration branch has an invalid seal")
+        return payload
+
     def registry_issue_number(self, *, create: bool) -> int | None:
         cached = getattr(self, "_registry_issue_cache", None)
         if cached is not None:
@@ -1727,7 +1810,33 @@ class GitHub:
         batch_id = str(batch["batch_id"])
         safe_id = re.sub(r"[^a-zA-Z0-9._-]+", "-", batch_id)[-80:]
         branch = f"{self.config.integration.branch_prefix}/{safe_id}"
+        staging_branch = (
+            f"{self.config.integration.branch_prefix}-staging/"
+            f"{safe_id}-{secrets.token_hex(8)}"
+        )
         base_sha = self.base_sha()
+        entry_heads = {str(entry.number): entry.head_sha for entry in entries}
+        frozen_heads = batch.get("heads")
+        frozen_pull_requests = batch.get("pull_requests")
+        if isinstance(frozen_heads, dict) and isinstance(
+            frozen_pull_requests, list
+        ):
+            heads = {str(number): str(sha) for number, sha in frozen_heads.items()}
+            frozen_numbers = [int(number) for number in frozen_pull_requests]
+            if set(heads) != {str(number) for number in frozen_numbers}:
+                raise QueueError("frozen integration batch has inconsistent members")
+            if any(heads.get(number) != sha for number, sha in entry_heads.items()):
+                raise QueueError("current integration entries changed after freeze")
+        else:
+            heads = entry_heads
+            frozen_numbers = [entry.number for entry in entries]
+        batch_heads = heads
+        batch_numbers = frozen_numbers
+        heads = entry_heads
+        pull_requests = [entry.number for entry in entries]
+        frozen_sources = [(number, heads[str(number)]) for number in pull_requests]
+        current_tip = base_sha
+        staging_created = False
         try:
             self._json(
                 "api",
@@ -1735,148 +1844,308 @@ class GitHub:
                 "POST",
                 f"repos/{self.repository}/git/refs",
                 "-f",
-                f"ref=refs/heads/{branch}",
+                f"ref=refs/heads/{staging_branch}",
                 "-f",
                 f"sha={base_sha}",
             )
-        except QueueError as error:
-            if "Reference already exists" not in str(error):
-                raise
+            staging_created = True
+            merged_heads: list[str] = []
+            conflict: dict[str, Any] | None = None
+            for number, head_sha in frozen_sources:
+                try:
+                    if self.is_ancestor(head_sha, current_tip):
+                        if head_sha not in merged_heads:
+                            merged_heads.append(head_sha)
+                        continue
+                    merge = self._json(
+                        "api",
+                        "--method",
+                        "POST",
+                        f"repos/{self.repository}/merges",
+                        "-f",
+                        f"base={staging_branch}",
+                        "-f",
+                        f"head={head_sha}",
+                        "-f",
+                        f"commit_message=DeployBot batch {batch_id}: PR #{number}",
+                    )
+                    if isinstance(merge, dict) and merge.get("sha"):
+                        current_tip = str(merge["sha"])
+                    else:
+                        current_tip = self.branch_ref_sha(staging_branch)
+                    if head_sha not in merged_heads:
+                        merged_heads.append(head_sha)
+                except QueueError as error:
+                    conflict = {
+                        "number": number,
+                        "head_sha": head_sha,
+                        "reason": str(error),
+                    }
+                    break
 
-        merged_heads: list[str] = []
-        conflict: dict[str, Any] | None = None
-        for entry in entries:
+            seal = {
+                "base_sha": base_sha,
+                "batch_id": batch_id,
+                "conflict": conflict,
+                "heads": heads,
+                "merged_heads": merged_heads,
+                "pull_requests": pull_requests,
+            }
+            seal_sha = self.create_integration_seal(
+                parent_sha=current_tip,
+                payload=seal,
+            )
+            integration_sha = seal_sha
             try:
                 self._json(
                     "api",
                     "--method",
                     "POST",
-                    f"repos/{self.repository}/merges",
+                    f"repos/{self.repository}/git/refs",
                     "-f",
-                    f"base={branch}",
+                    f"ref=refs/heads/{branch}",
                     "-f",
-                    f"head={entry.head_sha}",
-                    "-f",
-                    f"commit_message=DeployBot batch {batch_id}: PR #{entry.number}",
+                    f"sha={seal_sha}",
                 )
-                merged_heads.append(entry.head_sha)
             except QueueError as error:
-                conflict = {
-                    "number": entry.number,
-                    "head_sha": entry.head_sha,
-                    "reason": str(error),
+                if "Reference already exists" not in str(error):
+                    raise
+                integration_sha = self.branch_ref_sha(branch)
+                existing_seal = self.integration_seal(integration_sha)
+                sealed_head_map_value = existing_seal.get("heads")
+                sealed_numbers_value = existing_seal.get("pull_requests")
+                if (
+                    existing_seal.get("batch_id") != batch_id
+                    or not isinstance(sealed_head_map_value, dict)
+                    or not isinstance(sealed_numbers_value, list)
+                ):
+                    raise QueueError(
+                        "existing sealed integration branch does not match "
+                        "the active frozen batch"
+                    )
+                sealed_head_map = {
+                    str(number): str(sha)
+                    for number, sha in sealed_head_map_value.items()
                 }
-                break
+                sealed_numbers = [int(number) for number in sealed_numbers_value]
+                if set(sealed_head_map) != {str(number) for number in sealed_numbers}:
+                    raise QueueError(
+                        "existing sealed integration branch has inconsistent members"
+                    )
+                if any(
+                    number not in batch_numbers
+                    or batch_heads.get(str(number)) != sealed_head_map[str(number)]
+                    for number in sealed_numbers
+                ) or any(
+                    sealed_head_map.get(number) != sha
+                    for number, sha in entry_heads.items()
+                ):
+                    raise QueueError(
+                        "existing sealed integration branch does not match "
+                        "the active frozen subset"
+                    )
+                heads = sealed_head_map
+                pull_requests = sealed_numbers
+                sealed_base = str(existing_seal.get("base_sha") or "")
+                if (
+                    not re.fullmatch(r"[0-9a-f]{40}", sealed_base)
+                    or not self.is_ancestor(sealed_base, integration_sha)
+                ):
+                    raise QueueError(
+                        "existing sealed integration branch does not contain "
+                        "its recorded base"
+                    )
+                sealed_heads = [
+                    str(value) for value in existing_seal.get("merged_heads") or []
+                ]
+                if len(sealed_heads) != len(set(sealed_heads)) or not set(
+                    sealed_heads
+                ).issubset(set(heads.values())):
+                    raise QueueError(
+                        "existing sealed integration branch has invalid merged heads"
+                    )
+                for sealed_head in sealed_heads:
+                    if not self.is_ancestor(sealed_head, integration_sha):
+                        raise QueueError(
+                            "existing sealed integration branch does not contain "
+                            "a recorded source head"
+                        )
+                sealed_conflict = existing_seal.get("conflict")
+                if sealed_conflict is not None and not isinstance(
+                    sealed_conflict, dict
+                ):
+                    raise QueueError(
+                        "existing sealed integration branch has invalid conflict data"
+                    )
+                if isinstance(sealed_conflict, dict):
+                    try:
+                        conflict_number = int(sealed_conflict.get("number") or 0)
+                    except (TypeError, ValueError) as error:
+                        raise QueueError(
+                            "existing sealed integration branch has invalid "
+                            "conflict data"
+                        ) from error
+                    if (
+                        conflict_number not in pull_requests
+                        or str(sealed_conflict.get("head_sha") or "")
+                        != heads[str(conflict_number)]
+                        or not str(sealed_conflict.get("reason") or "")
+                    ):
+                        raise QueueError(
+                            "existing sealed integration branch has invalid "
+                            "conflict data"
+                        )
+                if sealed_conflict is None and set(sealed_heads) != set(heads.values()):
+                    raise QueueError(
+                        "existing sealed integration branch is incomplete without "
+                        "a recorded conflict"
+                    )
+                seal = existing_seal
+                conflict = sealed_conflict
+                merged_heads = [str(value) for value in seal.get("merged_heads") or []]
 
-        existing = self._json(
-            "api",
-            f"repos/{self.repository}/pulls?state=open&head={self.owner}:{branch}",
-        )
-        if isinstance(existing, list) and existing:
-            pull = existing[0]
-        else:
-            members = ", ".join(f"#{entry.number}" for entry in entries)
-            body = (
-                f"DeployBot cumulative batch `{batch_id}` for {members}.\n\n"
-                "Every source head was frozen and independently authorized. "
-                "If a merge conflict remains, an agent must resolve it without "
-                "dropping either side before marking this PR ready."
-            )
-            try:
-                pull = self._json(
-                    "api",
-                    "--method",
-                    "POST",
-                    f"repos/{self.repository}/pulls",
-                    "-f",
-                    f"title={self.config.integration.title_prefix}: {safe_id}",
-                    "-f",
-                    f"head={branch}",
-                    "-f",
-                    f"base={self.config.base_branch}",
-                    "-f",
-                    f"body={body}",
-                    "-F",
-                    f"draft={'true' if conflict else 'false'}",
+            existing = self.open_integration_pulls(branch)
+            reused_existing_pull = bool(existing)
+            if existing:
+                pull = existing[0]
+            else:
+                members = ", ".join(f"#{number}" for number in pull_requests)
+                body = (
+                    f"DeployBot cumulative batch `{batch_id}` for {members}.\n\n"
+                    "Every source head was frozen and independently authorized. "
+                    "If a merge conflict remains, an agent must resolve it without "
+                    "dropping either side before marking this PR ready."
                 )
-            except QueueError:
-                # No durable integration marker can exist without its PR. The
-                # batch remains frozen for retry, so remove the private branch
-                # instead of leaving an orphan that can mask a clean replay.
+                try:
+                    pull = self._json(
+                        "api",
+                        "--method",
+                        "POST",
+                        f"repos/{self.repository}/pulls",
+                        "-f",
+                        f"title={self.config.integration.title_prefix}: {safe_id}",
+                        "-f",
+                        f"head={branch}",
+                        "-f",
+                        f"base={self.config.base_branch}",
+                        "-f",
+                        f"body={body}",
+                        "-F",
+                        f"draft={'true' if conflict else 'false'}",
+                    )
+                except QueueError as error:
+                    # Another coordinator may have created the immutable PR
+                    # after our read. Re-read instead of deleting its sealed ref.
+                    existing = self.open_integration_pulls(branch)
+                    if existing:
+                        pull = existing[0]
+                    else:
+                        closed = [
+                            value
+                            for value in self.integration_pulls(
+                                branch, state="closed"
+                            )
+                            if not value.get("merged_at")
+                        ]
+                        if not closed:
+                            raise error
+                        previous = closed[0]
+                        reopened = self._json(
+                            "api",
+                            "--method",
+                            "PATCH",
+                            f"repos/{self.repository}/pulls/{previous['number']}",
+                            "-f",
+                            "state=open",
+                        )
+                        pull = reopened if isinstance(reopened, dict) else previous
+                    reused_existing_pull = True
+
+            author = str((pull.get("user") or {}).get("login") or "")
+            identity_error: str | None = None
+            if self.config.integration.require_non_actions_author:
+                if author.lower() == "github-actions[bot]":
+                    identity_error = (
+                        "integration PRs require a GitHub App installation token; "
+                        "pass the action's token input and do not use github.token"
+                    )
+                elif author.lower() not in {
+                    login.lower() for login in self.coordinator_logins
+                }:
+                    identity_error = (
+                        f"integration PR author {author or '<unknown>'} is not trusted; "
+                        "add the GitHub App bot login to queue.coordinator_actors"
+                    )
+            if identity_error:
+                cleanup_calls = (
+                    (
+                        "api",
+                        "--method",
+                        "PATCH",
+                        f"repos/{self.repository}/pulls/{pull['number']}",
+                        "-f",
+                        "state=closed",
+                    ),
+                    (
+                        "api",
+                        "--method",
+                        "DELETE",
+                        f"repos/{self.repository}/git/refs/heads/{branch}",
+                    ),
+                )
+                for cleanup_call in cleanup_calls:
+                    try:
+                        self._run(*cleanup_call)
+                    except QueueError:
+                        pass
+                raise QueueError(identity_error)
+            integration_number = int(pull["number"])
+            if reused_existing_pull and conflict is not None and not pull.get("draft"):
+                self._run(
+                    "pr",
+                    "ready",
+                    str(integration_number),
+                    "--undo",
+                    "--repo",
+                    self.repository,
+                )
+            if reused_existing_pull and conflict is None and pull.get("draft"):
+                self._run(
+                    "pr", "ready", str(integration_number), "--repo", self.repository
+                )
+            marker = {
+                **seal,
+                "author": author,
+                "created_at": utc_now(),
+                "integration_sha": integration_sha,
+            }
+            self.comment(integration_number, integration_body(marker))
+            # The cumulative PR now owns the queue position, but the source intent
+            # remains discoverable until delivery succeeds. This lets promotion
+            # recover the exact-head request if the integration closes, conflicts,
+            # or rejects a source that changed after the batch was frozen.
+            for source_number in pull_requests:
+                source_labels = self.labels(source_number)
+                if self.config.queue_label in source_labels:
+                    self.remove_label(source_number, self.config.queue_label)
+            return {
+                "number": integration_number,
+                "url": pull.get("html_url"),
+                "branch": branch,
+                "conflict": conflict,
+                "batch_id": batch_id,
+            }
+        finally:
+            if staging_created:
                 try:
                     self._run(
                         "api",
                         "--method",
                         "DELETE",
-                        f"repos/{self.repository}/git/refs/heads/{branch}",
+                        f"repos/{self.repository}/git/refs/heads/{staging_branch}",
                     )
                 except QueueError:
                     pass
-                raise
-        author = str((pull.get("user") or {}).get("login") or "")
-        identity_error: str | None = None
-        if self.config.integration.require_non_actions_author:
-            if author.lower() == "github-actions[bot]":
-                identity_error = (
-                    "integration PRs require a GitHub App installation token; "
-                    "pass the action's token input and do not use github.token"
-                )
-            elif author.lower() not in {
-                login.lower() for login in self.coordinator_logins
-            }:
-                identity_error = (
-                    f"integration PR author {author or '<unknown>'} is not trusted; "
-                    "add the GitHub App bot login to queue.coordinator_actors"
-                )
-        if identity_error:
-            # Installation-token identity is available on the PR response,
-            # unlike GET /user. Remove the unusable workflow-token PR before it
-            # can own the frozen source batch.
-            try:
-                self._run(
-                    "api",
-                    "--method",
-                    "PATCH",
-                    f"repos/{self.repository}/pulls/{pull['number']}",
-                    "-f",
-                    "state=closed",
-                )
-                self._run(
-                    "api",
-                    "--method",
-                    "DELETE",
-                    f"repos/{self.repository}/git/refs/heads/{branch}",
-                )
-            except QueueError:
-                pass
-            raise QueueError(identity_error)
-        number = int(pull["number"])
-        marker = {
-            "author": author,
-            "base_sha": base_sha,
-            "batch_id": batch_id,
-            "conflict": conflict,
-            "created_at": utc_now(),
-            "heads": {str(entry.number): entry.head_sha for entry in entries},
-            "merged_heads": merged_heads,
-            "pull_requests": [entry.number for entry in entries],
-        }
-        self.comment(number, integration_body(marker))
-        # The cumulative PR now owns the queue position, but the source intent
-        # remains discoverable until delivery succeeds. This lets promotion
-        # recover the exact-head request if the integration closes, conflicts,
-        # or rejects a source that changed after the batch was frozen.
-        for entry in entries:
-            source_labels = self.labels(entry.number)
-            if self.config.queue_label in source_labels:
-                self.remove_label(entry.number, self.config.queue_label)
-        return {
-            "number": number,
-            "url": pull.get("html_url"),
-            "branch": branch,
-            "conflict": conflict,
-            "batch_id": batch_id,
-        }
 
     def _paged_api(self, endpoint: str) -> list[dict[str, Any]]:
         data = self._json("api", "--paginate", "--slurp", endpoint)
