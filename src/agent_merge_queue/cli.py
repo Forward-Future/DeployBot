@@ -3290,7 +3290,13 @@ def promote_integrations(
     known_checks_by_number: dict[int, dict[str, str]] | None = None,
 ) -> list[int]:
     promoted: list[int] = []
+    delegated_integrations = client.active_integration_sources()
     for number in client.integration_pull_request_numbers():
+        # A newer cumulative PR owns any integration PR listed among its
+        # sources. Re-promoting that nested source would recursively integrate
+        # the same frozen work into another cumulative PR.
+        if number in delegated_integrations:
+            continue
         comments = client.comments(number)
         integration = latest_payload(
             comments,
