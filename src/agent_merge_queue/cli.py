@@ -1792,17 +1792,14 @@ class GitHub:
             "pull_requests": [entry.number for entry in entries],
         }
         self.comment(number, integration_body(marker))
-        # The cumulative PR now owns this batch. Remove source queue labels only
-        # after its durable marker exists so repeated events cannot scaffold a
-        # second integration PR for the same source work.
+        # The cumulative PR now owns the queue position, but the source intent
+        # remains discoverable until delivery succeeds. This lets promotion
+        # recover the exact-head request if the integration closes, conflicts,
+        # or rejects a source that changed after the batch was frozen.
         for entry in entries:
             source_labels = self.labels(entry.number)
-            for label in (
-                self.config.queue_label,
-                self.config.pipeline.intent_label,
-            ):
-                if label in source_labels:
-                    self.remove_label(entry.number, label)
+            if self.config.queue_label in source_labels:
+                self.remove_label(entry.number, self.config.queue_label)
         return {
             "number": number,
             "url": pull.get("html_url"),
@@ -2924,6 +2921,8 @@ def record_repair(
     entry: QueueEntry,
     intent: dict[str, Any] | None,
     reason: str,
+    *,
+    resume_pull_request: int | None = None,
 ) -> dict[str, Any]:
     comments = client.comments(entry.number)
     previous = latest_payload(
@@ -2959,11 +2958,15 @@ def record_repair(
         "provider": (intent or {}).get("provider"),
         "pull_request": entry.number,
         "reason": reason,
-        "resume_command": f"deploybot resume {entry.number}",
+        "resume_command": (
+            f"deploybot resume {resume_pull_request or entry.number}"
+        ),
         "source_paths": entry.source_paths,
         "thread_id": (intent or {}).get("thread_id"),
         "thread_url": (intent or {}).get("thread_url"),
     }
+    if resume_pull_request is not None:
+        payload["repair_pull_request"] = resume_pull_request
     client.comment(entry.number, repair_body(payload))
     labels = client.labels(entry.number)
     if client.config.blocked_label not in labels:
@@ -2987,6 +2990,59 @@ def record_repair(
         {"repository": client.repository, **payload},
     )
     return payload
+
+
+def record_integration_conflict_repair(
+    client: GitHub,
+    result: dict[str, Any],
+    entries: list[QueueEntry],
+) -> dict[str, Any] | None:
+    """Elect one tracked source thread to repair a conflicted integration."""
+
+    conflict = result.get("conflict")
+    if not isinstance(conflict, dict):
+        return None
+    integration_number = int(result["number"])
+    conflicting_number = int(conflict["number"])
+    owner: QueueEntry | None = None
+    owner_intent: dict[str, Any] | None = None
+    for entry in entries:
+        intent = latest_intent(client.comments(entry.number), client.trusted_logins)
+        if (
+            intent
+            and intent.get("state") == "requested"
+            and intent.get("provider")
+            and intent.get("thread_id")
+        ):
+            owner = entry
+            owner_intent = intent
+            break
+    if owner is None:
+        owner = next(
+            entry for entry in entries if entry.number == conflicting_number
+        )
+        owner_intent = latest_intent(
+            client.comments(owner.number), client.trusted_logins
+        )
+    reason = (
+        f"integration PR #{integration_number} could not merge delegated PR "
+        f"#{conflicting_number}: {conflict.get('reason') or 'merge conflict'}; "
+        f"repair {result.get('branch') or 'the integration branch'} without "
+        "dropping any frozen source head"
+    )
+    repair = record_repair(
+        client,
+        owner,
+        owner_intent,
+        reason,
+        resume_pull_request=integration_number,
+    )
+    result["repair_owner"] = {
+        "pull_request": owner.number,
+        "provider": repair.get("provider"),
+        "thread_id": repair.get("thread_id"),
+    }
+    return repair
 
 
 def reconcile_externally_merged_threads(client: GitHub) -> list[dict[str, Any]]:
@@ -3131,7 +3187,14 @@ def command_promote(
             )
             return "blocked", {"number": number, "reason": reason}, entry
         if client.config.blocked_label in entry.labels:
-            if repair_marker_is_transitional(repair):
+            # A conflict repair targets the cumulative PR while it is open.
+            # If that integration disappears, active_integration_sources() no
+            # longer suppresses this source, so release the integration-owned
+            # hold and let the original exact-head intent recover normally.
+            integration_repair_abandoned = bool(
+                repair and repair.get("repair_pull_request")
+            )
+            if repair_marker_is_transitional(repair) or integration_repair_abandoned:
                 if deployment_repair_required(entry):
                     reason = "; ".join(entry.reasons or ["blocked"])
                     repair = record_repair(client, entry, intent, reason)
@@ -3247,8 +3310,12 @@ def promote_integrations(
         client.add_label(number, client.config.queue_label)
         for source_number in integration.get("pull_requests") or []:
             source_labels = client.labels(int(source_number))
-            if client.config.queue_label in source_labels:
-                client.remove_label(int(source_number), client.config.queue_label)
+            for label in (
+                client.config.queue_label,
+                client.config.blocked_label,
+            ):
+                if label in source_labels:
+                    client.remove_label(int(source_number), label)
         promoted.append(number)
         notify(
             client.config.pipeline,
@@ -3422,8 +3489,12 @@ def command_resume(client: GitHub, selector: str | None) -> None:
             client.remove_label(number, client.config.blocked_label)
         for source_number in integration.get("pull_requests") or []:
             source_labels = client.labels(int(source_number))
-            if client.config.queue_label in source_labels:
-                client.remove_label(int(source_number), client.config.queue_label)
+            for label in (
+                client.config.queue_label,
+                client.config.blocked_label,
+            ):
+                if label in source_labels:
+                    client.remove_label(int(source_number), label)
         print(f"resumed and queued integration PR #{number} on {entry.head_sha}")
         return
     intent = latest_intent(comments, client.trusted_logins)
@@ -4287,16 +4358,7 @@ def command_integrate(client: GitHub, *, all_entries: bool) -> dict[str, Any]:
         batch=frozen.batch,
         entries=selected,
     )
-    if result.get("conflict"):
-        conflicting_number = int(result["conflict"]["number"])
-        entry = next(value for value in selected if value.number == conflicting_number)
-        intent = latest_intent(client.comments(entry.number), client.trusted_logins)
-        record_repair(
-            client,
-            entry,
-            intent,
-            "integration branch conflict: " + str(result["conflict"]["reason"]),
-        )
+    record_integration_conflict_repair(client, result, selected)
     notify(
         client.config.pipeline,
         "integration-created",
@@ -5088,12 +5150,12 @@ def command_react(
         )
     integrations: list[dict[str, Any]] = []
     if frozen.batch is not None and client.config.integration.mode == "all":
-        integrations.append(
-            client.create_integration_pull_request(
-                batch=frozen.batch,
-                entries=frozen.queue,
-            )
+        integration = client.create_integration_pull_request(
+            batch=frozen.batch,
+            entries=frozen.queue,
         )
+        record_integration_conflict_repair(client, integration, frozen.queue)
+        integrations.append(integration)
         deferred_drain: dict[str, Any] = {
             "batch_id": frozen.batch["batch_id"],
             "batch_ids": [frozen.batch["batch_id"]],
@@ -5121,12 +5183,12 @@ def command_react(
             overlap_entries = [
                 entry for entry in frozen.queue if entry.number in overlap_members
             ]
-            integrations.append(
-                client.create_integration_pull_request(
-                    batch=frozen.batch,
-                    entries=overlap_entries,
-                )
+            integration = client.create_integration_pull_request(
+                batch=frozen.batch,
+                entries=overlap_entries,
             )
+            record_integration_conflict_repair(client, integration, overlap_entries)
+            integrations.append(integration)
     created_clean = [
         int(value["number"])
         for value in integrations

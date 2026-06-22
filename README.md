@@ -11,11 +11,11 @@ integration PRs, follows `main` through production, and pauses after failures.
 
 ## Install
 
-Install the reviewed `v0.2.15` source commit directly from GitHub:
+Install the reviewed `v0.2.16` source commit directly from GitHub:
 
 ```bash
 python3 -m pip install \
-  'deploybot-merge-queue[mcp] @ git+https://github.com/Forward-Future/DeployBot.git@1170353958fb31718977dfff465ce9e1a89b8db4'
+  'deploybot-merge-queue[mcp] @ git+https://github.com/Forward-Future/DeployBot.git@415f0a360bad2e54b156b330c2d21e3a64823a5a'
 deploybot init
 ```
 
@@ -95,7 +95,7 @@ worker can dispatch deployment when GitHub suppresses the `workflow_run` event
 for token-dispatched CI. Pin the Action to the full reviewed release commit:
 
 ```yaml
-- uses: Forward-Future/DeployBot@1170353958fb31718977dfff465ce9e1a89b8db4
+- uses: Forward-Future/DeployBot@415f0a360bad2e54b156b330c2d21e3a64823a5a
 ```
 
 The Action uses GitHub's built-in workflow token. GitHub intentionally does not
