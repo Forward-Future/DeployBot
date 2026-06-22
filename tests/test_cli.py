@@ -1717,20 +1717,48 @@ class QueueCoreTest(unittest.TestCase):
         self.assertEqual(value.state, "blocked")
         self.assertIn("one finding", value.reasons)
 
-    def test_github_blocked_state_fails_closed_but_mergeable_states_do_not(
-        self,
-    ) -> None:
+    def test_clean_merge_state_is_ready_when_other_policy_passes(self) -> None:
+        clean = entry(1)
+        clean.merge_state = "CLEAN"
+        clean.classify(CONFIG)
+        self.assertEqual(clean.state, "ready")
+        self.assertEqual(clean.reasons, [])
+
+    def test_has_hooks_merge_state_is_ready_when_other_policy_passes(self) -> None:
+        has_hooks = entry(1)
+        has_hooks.merge_state = "HAS_HOOKS"
+        has_hooks.classify(CONFIG)
+        self.assertEqual(has_hooks.state, "ready")
+        self.assertEqual(has_hooks.reasons, [])
+
+    def test_github_blocked_state_fails_closed(self) -> None:
         blocked = entry(1)
         blocked.merge_state = "BLOCKED"
         blocked.classify(CONFIG)
         self.assertEqual(blocked.state, "blocked")
         self.assertIn("merge state as BLOCKED", blocked.reasons[-1])
 
-        for index, state in enumerate(("BEHIND", "HAS_HOOKS", "UNSTABLE"), start=2):
-            value = entry(index)
-            value.merge_state = state
-            value.classify(CONFIG)
-            self.assertEqual(value.state, "ready", state)
+    def test_behind_merge_state_is_blocked(self) -> None:
+        behind = entry(2)
+        behind.merge_state = "BEHIND"
+        behind.classify(CONFIG)
+        self.assertEqual(behind.state, "blocked")
+        self.assertIn("head ref is out of date", behind.reasons[-1])
+
+    def test_unstable_merge_state_waits_without_required_check_proof(self) -> None:
+        unstable = entry(3)
+        unstable.merge_state = "UNSTABLE"
+        unstable.checks = {}
+        unstable.classify(CONFIG)
+        self.assertEqual(unstable.state, "waiting")
+        self.assertIn("non-passing commit status", unstable.reasons[-1])
+
+    def test_unstable_merge_state_allows_exact_required_check_success(self) -> None:
+        unstable = entry(4)
+        unstable.merge_state = "UNSTABLE"
+        unstable.classify(CONFIG)
+        self.assertEqual(unstable.state, "ready")
+        self.assertEqual(unstable.reasons, [])
 
     def test_overlap_groups_are_connected_components(self) -> None:
         groups = overlap_groups(
