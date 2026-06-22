@@ -1495,6 +1495,196 @@ class QueueCoreTest(unittest.TestCase):
         self.assertEqual(value.state, "waiting")
         client.changed_paths.assert_not_called()
 
+    def test_status_keeps_intent_paths_while_deferring_other_waiting_paths(self) -> None:
+        client = object.__new__(GitHub)
+        client.config = CONFIG
+        client.repository = "example/repo"
+        client.trusted_logins = {"trusted"}
+        client.coordinator_logins = {"trusted"}
+        client.comments = Mock(return_value=[])
+        client.changed_paths = Mock(return_value=(["a.py"], []))
+        client._json = Mock(
+            return_value={
+                "baseRefName": "main",
+                "body": "",
+                "headRefOid": "a" * 40,
+                "isDraft": False,
+                "labels": [{"name": "deploy-requested"}],
+                "mergeStateStatus": "CLEAN",
+                "mergeable": "MERGEABLE",
+                "number": 1,
+                "state": "OPEN",
+                "statusCheckRollup": [],
+                "title": "Waiting",
+                "url": "https://example.test/1",
+            }
+        )
+
+        value = client.snapshot(
+            1,
+            require_marker=False,
+            allow_blocked_label=True,
+            defer_paths_until_ready=True,
+            include_intent_paths=True,
+        )
+
+        self.assertEqual(value.source_paths, ["a.py"])
+        client.changed_paths.assert_called_once_with(1)
+
+    def test_snapshot_defers_review_details_for_irrelevant_draft(self) -> None:
+        config = parse_config(
+            {
+                "queue": {"required_checks": ["CI"], "trusted_actors": ["trusted"]},
+                "review": {
+                    "providers": [
+                        {
+                            "kind": "bot",
+                            "name": "Review bot",
+                            "login": "review-bot",
+                            "check_name": "Review Bot",
+                            "minimum_score": 4,
+                            "score_pattern": r"Score:\s*(\d)",
+                            "require_resolved_threads": True,
+                        }
+                    ]
+                },
+            }
+        )
+        client = object.__new__(GitHub)
+        client.config = config
+        client.repository = "example/repo"
+        client.trusted_logins = {"trusted"}
+        client.coordinator_logins = {"trusted"}
+        client.comments = Mock(return_value=[])
+        client.reviews = Mock()
+        client.review_threads = Mock()
+        client.changed_paths = Mock(return_value=([], []))
+        client._json = Mock(
+            return_value={
+                "baseRefName": "main",
+                "body": "",
+                "headRefOid": "a" * 40,
+                "isDraft": True,
+                "labels": [],
+                "mergeStateStatus": "CLEAN",
+                "mergeable": "MERGEABLE",
+                "number": 1,
+                "state": "OPEN",
+                "statusCheckRollup": [],
+                "title": "Draft",
+                "url": "https://example.test/1",
+            }
+        )
+
+        value = client.snapshot(
+            1,
+            require_marker=False,
+            defer_review_details_for_irrelevant_drafts=True,
+        )
+
+        self.assertEqual(value.state, "blocked")
+        client.reviews.assert_not_called()
+        client.review_threads.assert_not_called()
+
+        client.comments.return_value = [
+            {
+                "created_at": "2026-06-20T00:00:00Z",
+                "user": {"login": "trusted"},
+                "body": intent_body(
+                    intent_id="intent-1",
+                    state="requested",
+                    requested_at="2026-06-20T00:00:00Z",
+                    requested_head="a" * 40,
+                ),
+            }
+        ]
+        client.review_threads.return_value = []
+        client.snapshot(
+            1,
+            require_marker=False,
+            defer_review_details_for_irrelevant_drafts=True,
+        )
+
+        client.review_threads.assert_called_once_with(1)
+
+    def test_snapshot_reads_ready_bot_threads_while_another_provider_waits(self) -> None:
+        head = "a" * 40
+        config = parse_config(
+            {
+                "queue": {"required_checks": ["CI"], "trusted_actors": ["trusted"]},
+                "review": {
+                    "providers": [
+                        {
+                            "kind": "bot",
+                            "name": "Review bot",
+                            "login": "review-bot",
+                            "check_name": "Review Bot",
+                            "minimum_score": 4,
+                            "score_pattern": r"Score:\s*(\d)",
+                            "require_resolved_threads": True,
+                        },
+                        {
+                            "kind": "check",
+                            "name": "Other review",
+                            "check_name": "Other Review",
+                        },
+                    ]
+                },
+            }
+        )
+        client = object.__new__(GitHub)
+        client.config = config
+        client.repository = "example/repo"
+        client.trusted_logins = {"trusted"}
+        client.coordinator_logins = {"trusted"}
+        client.comments = Mock(
+            return_value=[
+                {
+                    "created_at": "2026-06-20T00:00:00Z",
+                    "user": {"login": "review-bot[bot]"},
+                    "body": f"Score: 5\ncommit {head}",
+                }
+            ]
+        )
+        client.review_threads = Mock(
+            return_value=[
+                {
+                    "isResolved": False,
+                    "isOutdated": False,
+                    "comments": {
+                        "nodes": [{"author": {"login": "review-bot[bot]"}}]
+                    },
+                }
+            ]
+        )
+        client.changed_paths = Mock(return_value=([], []))
+        client._json = Mock(
+            return_value={
+                "baseRefName": "main",
+                "body": "",
+                "headRefOid": head,
+                "isDraft": False,
+                "labels": [],
+                "mergeStateStatus": "CLEAN",
+                "mergeable": "MERGEABLE",
+                "number": 1,
+                "state": "OPEN",
+                "statusCheckRollup": [
+                    {"name": "CI", "conclusion": "SUCCESS"},
+                    {"name": "Review Bot", "conclusion": "SUCCESS"},
+                ],
+                "title": "Reviewed",
+                "url": "https://example.test/1",
+            }
+        )
+
+        value = client.snapshot(1, require_marker=False)
+
+        self.assertEqual(value.state, "blocked")
+        self.assertIn("unresolved Review bot", "; ".join(value.reasons or []))
+        self.assertIn("Other Review is not complete", value.reasons or [])
+        client.review_threads.assert_called_once_with(1)
+
     def test_integration_snapshot_uses_exact_commit_check_fallback(self) -> None:
         head_sha = "a" * 40
         marker = {
@@ -2428,6 +2618,7 @@ class QueueCoreTest(unittest.TestCase):
         client.owner = "example"
         client.coordinator_logins = {"trusted"}
         client.base_sha = Mock(return_value="b" * 40)
+        client.is_ancestor = Mock(return_value=False)
         client._json = Mock(
             side_effect=[
                 {},
@@ -2462,6 +2653,7 @@ class QueueCoreTest(unittest.TestCase):
         client.owner = "example"
         client.coordinator_logins = {"trusted"}
         client.base_sha = Mock(return_value="b" * 40)
+        client.is_ancestor = Mock(return_value=False)
         client._json = Mock(
             side_effect=[
                 {},
@@ -3621,6 +3813,7 @@ class QueueCoreTest(unittest.TestCase):
         client.owner = "example"
         client.name = "repo"
         client.base_sha = Mock(return_value="b" * 40)
+        client.is_ancestor = Mock(return_value=False)
         client._json = Mock(
             side_effect=[
                 {},
@@ -3672,6 +3865,7 @@ class QueueCoreTest(unittest.TestCase):
         client.owner = "example"
         client.name = "repo"
         client.base_sha = Mock(return_value="b" * 40)
+        client.is_ancestor = Mock(return_value=False)
         client._json = Mock(
             side_effect=[
                 {},
@@ -3873,6 +4067,7 @@ class QueueCoreTest(unittest.TestCase):
         client.owner = "example"
         client.name = "repo"
         client.base_sha = Mock(return_value="b" * 40)
+        client.is_ancestor = Mock(return_value=False)
         client._json = Mock(
             side_effect=[
                 {},
@@ -5216,6 +5411,8 @@ class QueueCoreTest(unittest.TestCase):
             return_value=[{"id": 8, "name": "Deploy", "state": "active"}]
         )
         client._run = Mock(return_value="")
+        client.claim_deploy_dispatch = Mock(return_value="claim-1")
+        client.complete_deploy_dispatch = Mock()
         sha = "a" * 40
 
         result = client.dispatch_deploy_workflows(ci_run={"id": 42, "head_sha": sha})
@@ -5237,6 +5434,168 @@ class QueueCoreTest(unittest.TestCase):
             "-f",
             "ci_run_id=42",
         )
+        client.complete_deploy_dispatch.assert_called_once_with(
+            ci_run={"id": 42, "head_sha": sha},
+            workflow_id=8,
+            workflow_name="Deploy",
+            claim_id="claim-1",
+        )
+
+    def test_deploy_dispatch_lease_allows_only_the_first_follower(self) -> None:
+        client = object.__new__(GitHub)
+        client.repository = "example/repo"
+        client.coordinator_logins = {"trusted"}
+        client.require_actor = Mock(return_value="trusted")
+        sha = "a" * 40
+        tree = "t" * 40
+        lease = "l" * 40
+        client._json = Mock(
+            side_effect=[
+                {"tree": {"sha": tree}},
+                QueueError("HTTP 404: Not Found"),
+                {"sha": lease},
+                {},
+            ]
+        )
+
+        claimed = client.claim_deploy_dispatch(
+            ci_run={"id": 42, "head_sha": sha},
+            workflow_id=8,
+            workflow_name="Deploy",
+        )
+
+        self.assertIsNotNone(claimed)
+        client.require_actor.assert_called_once()
+
+    def test_deploy_dispatch_lease_rejects_a_duplicate_follower(self) -> None:
+        client = object.__new__(GitHub)
+        client.repository = "example/repo"
+        client.coordinator_logins = {"trusted"}
+        client.require_actor = Mock(return_value="trusted")
+        sha = "a" * 40
+        tree = "t" * 40
+        lease = "l" * 40
+        payload = {
+            "claimed_at": "2026-06-20T00:00:00Z",
+            "claim_id": "claim-1",
+            "ci_run_id": 42,
+            "main_sha": sha,
+            "schema": 1,
+            "state": "claimed",
+            "workflow_id": 8,
+            "workflow_name": "Deploy",
+        }
+        client._json = Mock(
+            side_effect=[
+                {"tree": {"sha": tree}},
+                {"object": {"sha": lease}},
+                {
+                    "message": "DeployBot deployment dispatch lease v1 "
+                    + json.dumps(payload, sort_keys=True),
+                    "tree": {"sha": tree},
+                },
+            ]
+        )
+
+        claimed = client.claim_deploy_dispatch(
+            ci_run={"id": 42, "head_sha": sha},
+            workflow_id=8,
+            workflow_name="Deploy",
+        )
+
+        self.assertIsNone(claimed)
+
+    def test_deploy_dispatch_leases_are_isolated_by_release_and_workflow(self) -> None:
+        client = object.__new__(GitHub)
+        first = client.deploy_dispatch_lease_branch(
+            ci_run={"id": 42, "head_sha": "a" * 40}, workflow_id=8
+        )
+        second_release = client.deploy_dispatch_lease_branch(
+            ci_run={"id": 43, "head_sha": "b" * 40}, workflow_id=8
+        )
+        second_workflow = client.deploy_dispatch_lease_branch(
+            ci_run={"id": 42, "head_sha": "a" * 40}, workflow_id=9
+        )
+
+        self.assertEqual(len({first, second_release, second_workflow}), 3)
+
+    def test_completed_deploy_dispatch_is_never_reclaimed(self) -> None:
+        client = object.__new__(GitHub)
+        client.repository = "example/repo"
+        client.coordinator_logins = {"trusted"}
+        client.require_actor = Mock(return_value="trusted")
+        sha = "a" * 40
+        tree = "t" * 40
+        lease = "l" * 40
+        payload = {
+            "claimed_at": "2026-06-20T00:00:00Z",
+            "claim_id": "claim-1",
+            "ci_run_id": 42,
+            "main_sha": sha,
+            "schema": 1,
+            "state": "dispatched",
+            "workflow_id": 8,
+            "workflow_name": "Deploy",
+        }
+        client._json = Mock(
+            side_effect=[
+                {"tree": {"sha": tree}},
+                {"object": {"sha": lease}},
+                {
+                    "message": "DeployBot deployment dispatch lease v1 "
+                    + json.dumps(payload, sort_keys=True),
+                    "tree": {"sha": tree},
+                },
+            ]
+        )
+
+        claimed = client.claim_deploy_dispatch(
+            ci_run={"id": 42, "head_sha": sha},
+            workflow_id=8,
+            workflow_name="Deploy",
+        )
+
+        self.assertIsNone(claimed)
+
+    def test_claimed_dispatch_is_never_automatically_reclaimed(self) -> None:
+        client = object.__new__(GitHub)
+        client.repository = "example/repo"
+        client.coordinator_logins = {"trusted"}
+        client.require_actor = Mock(return_value="trusted")
+        sha = "a" * 40
+        tree = "t" * 40
+        lease = "l" * 40
+        payload = {
+            "claimed_at": "2026-06-20T00:00:00Z",
+            "claim_id": "claim-1",
+            "ci_run_id": 42,
+            "main_sha": sha,
+            "schema": 1,
+            "state": "claimed",
+            "workflow_id": 8,
+            "workflow_name": "Deploy",
+        }
+        client._json = Mock(
+            side_effect=[
+                {"tree": {"sha": tree}},
+                {"object": {"sha": lease}},
+                {
+                    "message": "DeployBot deployment dispatch lease v1 "
+                    + json.dumps(payload, sort_keys=True),
+                    "tree": {"sha": tree},
+                },
+            ]
+        )
+        client.workflow_runs_for_workflows = Mock()
+
+        claimed = client.claim_deploy_dispatch(
+            ci_run={"id": 42, "head_sha": sha},
+            workflow_id=8,
+            workflow_name="Deploy",
+        )
+
+        self.assertIsNone(claimed)
+        client.workflow_runs_for_workflows.assert_not_called()
 
     def test_pipeline_pause_blocks_every_merge_path(self) -> None:
         client = Mock()

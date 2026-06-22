@@ -7,6 +7,9 @@ description: Inspect and operate the full DeployBot delivery pipeline. Use when 
 
 Read `.mergequeue.toml` before acting. Prefer the DeployBot MCP tools; fall back
 to the `deploybot` CLI. Treat GitHub as the durable source of truth.
+If the task worktree does not contain the policy, use the repository's known
+configured checkout or pass its path with `--config`; never run `deploybot init`
+inside an existing task worktree merely to read status.
 
 ## Read Status
 

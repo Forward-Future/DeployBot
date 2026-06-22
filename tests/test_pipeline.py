@@ -77,6 +77,54 @@ class PipelineTest(unittest.TestCase):
         self.assertEqual(value["state"], "awaiting-deploy")
         self.assertIsNone(value["latest_deploy"])
 
+    def test_release_state_requires_every_configured_deployment_workflow(self) -> None:
+        sha = "a" * 40
+        config = parse_config(
+            {
+                "queue": {"required_checks": ["CI"], "trusted_actors": ["trusted"]},
+                "pipeline": {"deploy_workflows": ["Deploy API", "Deploy UI"]},
+            }
+        )
+        ci = {
+            "id": 1,
+            "name": "CI",
+            "head_sha": sha,
+            "status": "completed",
+            "conclusion": "success",
+            "created_at": "2026-06-20T00:00:00Z",
+        }
+        api = {
+            "id": 2,
+            "name": "Deploy API",
+            "head_sha": sha,
+            "status": "completed",
+            "conclusion": "success",
+            "created_at": "2026-06-20T00:01:00Z",
+        }
+        ui = {
+            "id": 3,
+            "name": "Deploy UI",
+            "head_sha": sha,
+            "status": "in_progress",
+            "conclusion": None,
+            "created_at": "2026-06-20T00:01:30Z",
+        }
+
+        waiting = release_state(main_sha=sha, runs=[ci, api], config=config.pipeline)
+        deploying = release_state(
+            main_sha=sha, runs=[ci, api, ui], config=config.pipeline
+        )
+        verified = release_state(
+            main_sha=sha,
+            runs=[ci, api, {**ui, "status": "completed", "conclusion": "success"}],
+            config=config.pipeline,
+        )
+
+        self.assertEqual(waiting["state"], "awaiting-deploy")
+        self.assertIsNone(waiting["deployments"]["Deploy UI"])
+        self.assertEqual(deploying["state"], "deploying")
+        self.assertEqual(verified["state"], "verified")
+
     def test_new_successful_ci_supersedes_an_older_failed_deploy(self) -> None:
         sha = "a" * 40
         runs = [
@@ -156,6 +204,7 @@ class PipelineTest(unittest.TestCase):
         client.config = CONFIG
         client.base_sha.return_value = sha
         client.workflow_runs.side_effect = [[ci], [ci, deploy]]
+        client.claim_deploy_dispatch.return_value = True
         client.dispatch_deploy_workflows.return_value = [
             {"id": 9, "name": "Deploy", "ci_sha": sha, "ci_run_id": 1}
         ]
@@ -171,6 +220,41 @@ class PipelineTest(unittest.TestCase):
         self.assertEqual(dispatched_ci["head_sha"], sha)
         self.assertEqual(result["state"], "verified")
         self.assertEqual(result["dispatched_deployments"][0]["id"], 9)
+
+    def test_follow_accepts_an_idempotent_empty_dispatch_result(self) -> None:
+        sha = "a" * 40
+        ci = {
+            "id": 1,
+            "name": "CI",
+            "head_sha": sha,
+            "status": "completed",
+            "conclusion": "success",
+            "event": "workflow_dispatch",
+            "created_at": "2026-06-20T00:00:00Z",
+        }
+        deploy = {
+            "id": 2,
+            "name": "Deploy",
+            "head_sha": sha,
+            "status": "completed",
+            "conclusion": "success",
+            "event": "workflow_dispatch",
+            "created_at": "2026-06-20T00:01:00Z",
+        }
+        client = Mock()
+        client.config = CONFIG
+        client.base_sha.return_value = sha
+        client.workflow_runs.side_effect = [[ci], [ci, deploy]]
+        client.dispatch_deploy_workflows.return_value = []
+
+        with (
+            patch("agent_merge_queue.pipeline.time.sleep"),
+            patch("agent_merge_queue.pipeline.time.monotonic", side_effect=[0, 1]),
+        ):
+            result = follow_release(client, timeout_seconds=10, poll_seconds=1)
+
+        self.assertEqual(result["state"], "verified")
+        client.dispatch_deploy_workflows.assert_called_once()
 
     def test_follow_absorbs_a_ci_rerun_during_failure_grace(self) -> None:
         sha = "a" * 40

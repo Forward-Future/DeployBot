@@ -15,6 +15,8 @@ current directory. `--repository` defaults to the repository resolved by the
 GitHub CLI. `--version` prints the installed version. Wherever `[PR]` appears,
 the selector may be a pull-request number, URL, or branch; when omitted,
 DeployBot resolves the pull request for the current branch.
+If an existing task worktree lacks the policy, run from the configured checkout
+or pass `--config PATH`; do not initialize a second policy just to inspect it.
 
 ### Setup and read-only inspection
 

@@ -103,7 +103,9 @@ turn merges made by that token into ordinary `push` workflow runs, so DeployBot
 dispatches each configured CI workflow once after it merges a batch. GitHub can
 also suppress the usual `workflow_run` handoff after that token-driven CI run,
 so DeployBot explicitly dispatches each configured deployment workflow after
-exact-main CI succeeds. CI workflows must accept `workflow_dispatch`.
+exact-main CI succeeds. A compare-and-set Git ref leases each exact CI dispatch,
+so concurrent followers cannot launch the same production deployment twice.
+CI workflows must accept `workflow_dispatch`.
 Deployment workflows must accept `workflow_dispatch` inputs named `ci_sha` and
 `ci_run_id`, verify that run through the GitHub API, and deploy only when it is
 successful CI for the current base-branch head. Skipped deployment wake-ups

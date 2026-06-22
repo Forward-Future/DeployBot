@@ -575,7 +575,9 @@ def load_config(path: str | None = None, *, cwd: Path | None = None) -> QueueCon
         raw = config_path.read_bytes()
     except FileNotFoundError as error:
         raise ConfigError(
-            f"merge queue config not found: {config_path}; run `deploybot init`"
+            f"merge queue config not found: {config_path}; run from the configured "
+            "checkout, pass `--config PATH`, or use `deploybot init` only for a "
+            "new repository"
         ) from error
     try:
         payload = tomllib.loads(raw.decode("utf-8"))
