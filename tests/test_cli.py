@@ -3902,6 +3902,109 @@ class QueueCoreTest(unittest.TestCase):
             datetime(2026, 6, 20, 1, tzinfo=timezone.utc),
         )
 
+    def test_metrics_report_target_attainment_and_first_pass_rate(self) -> None:
+        clean_merge = "c" * 40
+        repaired_merge = "f" * 40
+        clean_deploy = "d" * 40
+        repaired_deploy = "e" * 40
+        head_42 = "a" * 40
+        head_43 = "b" * 40
+        client = Mock()
+        client.config = CONFIG
+        client.repository = "example/repo"
+        client.trusted_logins = {"trusted"}
+        client.coordinator_logins = {"trusted"}
+        client.successful_workflow_runs.return_value = [
+            {
+                "name": "Deploy",
+                "conclusion": "success",
+                "head_sha": clean_deploy,
+                "created_at": "2026-06-20T00:09:00Z",
+                "updated_at": "2026-06-20T00:09:00Z",
+            },
+            {
+                "name": "Deploy",
+                "conclusion": "success",
+                "head_sha": repaired_deploy,
+                "created_at": "2026-06-20T00:25:00Z",
+                "updated_at": "2026-06-20T00:25:00Z",
+            },
+        ]
+        client.recent_merged_pull_requests.return_value = [
+            {
+                "number": 42,
+                "merged_at": "2026-06-20T00:05:00Z",
+                "merge_commit_sha": clean_merge,
+            },
+            {
+                "number": 43,
+                "merged_at": "2026-06-20T00:05:00Z",
+                "merge_commit_sha": repaired_merge,
+            },
+        ]
+
+        def comment(login: str, body: str, created_at: str) -> dict[str, Any]:
+            return {"user": {"login": login}, "body": body, "created_at": created_at}
+
+        def intent_comment(head: str) -> dict[str, Any]:
+            return comment(
+                "trusted",
+                intent_body(
+                    intent_id=f"intent-{head[:1]}",
+                    state="requested",
+                    requested_at="2026-06-20T00:00:00Z",
+                    requested_head=head,
+                ),
+                "2026-06-20T00:00:00Z",
+            )
+
+        def queue_comment(head: str) -> dict[str, Any]:
+            return comment(
+                "trusted",
+                queue_state_body("queued", head, queued_at="2026-06-20T00:01:00Z"),
+                "2026-06-20T00:01:00Z",
+            )
+
+        client.comments_for_pull_requests.return_value = {
+            42: [intent_comment(head_42), queue_comment(head_42)],
+            43: [
+                intent_comment(head_43),
+                queue_comment(head_43),
+                comment(
+                    "trusted",
+                    repair_body({"head_sha": head_43, "reason": "CI failed"}),
+                    "2026-06-20T00:02:00Z",
+                ),
+            ],
+        }
+
+        def is_ancestor(merge_sha: str, deployed_sha: str) -> bool:
+            return (merge_sha, deployed_sha) in {
+                (clean_merge, clean_deploy),
+                (repaired_merge, repaired_deploy),
+            }
+
+        client.is_ancestor.side_effect = is_ancestor
+
+        result = delivery_metrics(client, limit=25)
+
+        self.assertEqual(result["sample_count"], 2)
+        self.assertEqual(result["reliability"]["first_pass_merges"], 1)
+        self.assertEqual(result["reliability"]["repaired_merges"], 1)
+        self.assertEqual(result["reliability"]["first_pass_rate"], 0.5)
+        merge_to_live = result["merge_to_live_seconds"]
+        self.assertEqual(merge_to_live["target_seconds"], 600)
+        self.assertEqual(merge_to_live["within_target"], 1)
+        self.assertEqual(merge_to_live["within_target_rate"], 0.5)
+        request_to_live = result["request_to_live_seconds"]
+        self.assertEqual(request_to_live["target_seconds"], 1500)
+        self.assertEqual(request_to_live["within_target"], 2)
+        self.assertNotIn("target_seconds", result["request_to_queue_seconds"])
+        repaired = {
+            value["pull_request"]: value["repaired"] for value in result["samples"]
+        }
+        self.assertEqual(repaired, {42: False, 43: True})
+
     def test_integration_seal_round_trips_through_git_commit(self) -> None:
         parent_sha = "p" * 40
         seal_sha = "s" * 40

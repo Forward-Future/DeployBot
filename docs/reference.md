@@ -26,7 +26,7 @@ DeployBot resolves the pull request for the current branch.
 | `deploybot status [--json]` | Read active thread metadata, unbound open PRs, pending native notifications, PR stages, exact-head deploy intent, pre-queue intent overlaps, request-stage timing alerts, queue state, exact-main CI, deployment, and pipeline control state. |
 | `deploybot plan [--json]` | Read the ordered queue, dependencies, blockers, and source-overlap groups. |
 | `deploybot inspect [PR] [--json]` | Evaluate one exact PR head without granting merge authority. |
-| `deploybot metrics [--limit N] [--json]` | Summarize p50, p95, and maximum delivery timings for recent merged PRs. The default limit is 25. |
+| `deploybot metrics [--limit N] [--json]` | Summarize p50, p95, and maximum delivery timings for recent merged PRs, each stage's attainment against the configured speed targets, and the first-pass merge rate (deliveries that merged without a recorded repair handoff). The default limit is 25. |
 
 `status`, `plan`, `inspect`, `doctor`, and `metrics` are read-only. In
 particular, do not use `freeze` as a status command because it writes a durable
