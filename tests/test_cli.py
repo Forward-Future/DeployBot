@@ -3756,6 +3756,113 @@ class QueueCoreTest(unittest.TestCase):
         self.assertIn("deploybot resume", result["waiting"][0]["reasons"][0])
         client.add_label.assert_not_called()
 
+    @patch("agent_merge_queue.cli.utc_now", return_value="2026-06-22T20:00:00Z")
+    def test_promote_refreshes_repair_handoff_when_main_moves(
+        self, _utc_now: Mock
+    ) -> None:
+        blocked = entry(1, state="blocked")
+        blocked.labels = ["deploy-requested", "merge-queue-blocked"]
+        blocked.reasons = ["pull request conflicts with main"]
+        intent_comment = {
+            "id": 1,
+            "created_at": "2026-06-22T19:00:00Z",
+            "user": {"login": "trusted"},
+            "body": intent_body(
+                intent_id="intent-1",
+                state="requested",
+                requested_at="2026-06-22T19:00:00Z",
+                requested_head=blocked.head_sha,
+                provider="codex",
+                thread_id="thread-1",
+            ),
+        }
+        repair_comment = {
+            "id": 2,
+            "created_at": "2026-06-22T19:01:00Z",
+            "user": {"login": "coordinator"},
+            "body": repair_body(
+                {
+                    "base_sha": "a" * 40,
+                    "created_at": "2026-06-22T19:01:00Z",
+                    "head_sha": blocked.head_sha,
+                    "hold_started_at": "2026-06-22T19:01:00Z",
+                    "intent_id": "intent-1",
+                    "provider": "codex",
+                    "pull_request": 1,
+                    "reason": "pull request conflicts with main",
+                    "resume_command": "deploybot resume 1",
+                    "source_paths": blocked.source_paths,
+                    "thread_id": "thread-1",
+                }
+            ),
+        }
+        client = Mock()
+        client.config = CONFIG
+        client.repository = "example/repo"
+        client.trusted_logins = {"trusted"}
+        client.coordinator_logins = {"coordinator"}
+        client.intent_numbers.return_value = [1]
+        client.active_integration_sources.return_value = set()
+        client.comments.return_value = [intent_comment, repair_comment]
+        client.snapshot.return_value = blocked
+        client.base_sha.return_value = "b" * 40
+        client.labels.return_value = set(blocked.labels)
+
+        with patch("agent_merge_queue.cli.notify") as notify:
+            with redirect_stdout(io.StringIO()):
+                result = command_promote(client)
+
+        self.assertEqual(result["blocked"][0]["number"], 1)
+        refreshed = result["blocked"][0]["repair"]
+        self.assertEqual(refreshed["base_sha"], "b" * 40)
+        self.assertEqual(refreshed["hold_started_at"], "2026-06-22T19:01:00Z")
+        self.assertEqual(client.record_thread.call_args.args[0].thread_id, "thread-1")
+        notify.assert_called_once_with(
+            CONFIG.pipeline,
+            "repair-required",
+            {"repository": "example/repo", **refreshed},
+        )
+
+    @patch("agent_merge_queue.cli.utc_now", return_value="2026-06-22T20:00:00Z")
+    def test_record_repair_deduplicates_only_the_current_main(
+        self, _utc_now: Mock
+    ) -> None:
+        blocked = entry(7, state="blocked")
+        intent = {"intent_id": "intent-7"}
+        previous = {
+            "base_sha": "a" * 40,
+            "created_at": "2026-06-22T19:00:00Z",
+            "head_sha": blocked.head_sha,
+            "hold_started_at": "2026-06-22T19:00:00Z",
+            "intent_id": "intent-7",
+            "pull_request": 7,
+            "reason": "pull request conflicts with main",
+        }
+        client = Mock()
+        client.config = CONFIG
+        client.repository = "example/repo"
+        client.coordinator_logins = {"coordinator"}
+        client.comments.return_value = [
+            {
+                "body": repair_body(previous),
+                "created_at": previous["created_at"],
+                "user": {"login": "coordinator"},
+            }
+        ]
+        client.labels.return_value = []
+
+        refreshed = record_repair(
+            client,
+            blocked,
+            intent,
+            previous["reason"],
+            base_sha="b" * 40,
+        )
+
+        self.assertEqual(refreshed["base_sha"], "b" * 40)
+        self.assertEqual(refreshed["hold_started_at"], previous["hold_started_at"])
+        client.comment.assert_called_once_with(7, repair_body(refreshed))
+
     def test_promote_recovers_owner_after_conflicted_integration_closes(self) -> None:
         ready = entry(1)
         ready.labels = ["deploy-requested", "merge-queue-blocked"]

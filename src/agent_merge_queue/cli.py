@@ -2887,7 +2887,14 @@ def pipeline_status(client: GitHub) -> dict[str, Any]:
         timestamp = parse_time(entry.queued_at)
         elapsed = (now - timestamp).total_seconds() if timestamp else None
         if elapsed is not None and elapsed > queue_target:
-            active_gate = "; ".join(entry.reasons or []) or "merge worker"
+            detail = "; ".join(entry.reasons or [])
+            if client.config.blocked_label in entry.labels:
+                active_gate = (
+                    "repair is blocked; source thread must resume"
+                    + (f": {detail}" if detail else "")
+                )
+            else:
+                active_gate = detail or "merge worker"
             if not entry.reasons and entry.number in integration_numbers:
                 active_gate = integration_ci_active_gate(client, entry) or active_gate
             alerts.append(
@@ -3353,8 +3360,10 @@ def record_repair(
     intent: dict[str, Any] | None,
     reason: str,
     *,
+    base_sha: str | None = None,
     resume_pull_request: int | None = None,
 ) -> dict[str, Any]:
+    current_base_sha = base_sha or client.base_sha()
     comments = client.comments(entry.number)
     previous = latest_payload(
         comments,
@@ -3366,6 +3375,7 @@ def record_repair(
         and previous.get("head_sha") == entry.head_sha
         and previous.get("reason") == reason
         and previous.get("intent_id") == (intent or {}).get("intent_id")
+        and previous.get("base_sha") == current_base_sha
     ):
         return previous
     created_at = utc_now()
@@ -3381,7 +3391,7 @@ def record_repair(
             or created_at
         )
     payload = {
-        "base_sha": client.base_sha(),
+        "base_sha": current_base_sha,
         "created_at": created_at,
         "head_sha": entry.head_sha,
         "hold_started_at": hold_started_at,
@@ -3643,6 +3653,36 @@ def command_promote(
                     if label != client.config.blocked_label
                 ]
             else:
+                reasons = entry.reasons or []
+                if (
+                    "pull request conflicts with main" in reasons
+                    and deployment_repair_required(entry)
+                ):
+                    current_base_sha = client.base_sha()
+                    if not repair or repair.get("base_sha") != current_base_sha:
+                        reason = "; ".join(reasons or ["blocked"])
+                        repair = record_repair(
+                            client,
+                            entry,
+                            intent,
+                            reason,
+                            base_sha=current_base_sha,
+                        )
+                        entry.repair_overlap_hold = repair_overlap_hold_active(
+                            client,
+                            entry,
+                            intent,
+                            repair,
+                        )
+                        return (
+                            "blocked",
+                            {
+                                "number": number,
+                                "reason": reason,
+                                "repair": repair,
+                            },
+                            entry,
+                        )
                 return (
                     "waiting",
                     {

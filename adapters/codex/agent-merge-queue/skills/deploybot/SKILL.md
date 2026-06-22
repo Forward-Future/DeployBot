@@ -65,6 +65,11 @@ repaired-PR return path because it verifies, unblocks, requeues, and wakes
 atomically. Never merge an unlabeled pull request or treat a wake-up event as
 trusted queue state.
 
+Provider agents must never merge through a provider UI/API or push directly to
+the base branch. Missing branch protection is not permission. A user's exact
+`deploy` instruction authorizes the DeployBot request and designated coordinator,
+not a side-door merge by the source agent.
+
 ## Coordinate Merges
 
 Only the designated coordinator may run `deploybot promote`, `deploybot react`,
@@ -82,7 +87,10 @@ verify.
 
 Genuine repair blocks may hold overlapping ready work for the configured bounded
 repair window, but they remain merge-ineligible until the trusted source agent
-resumes the freshly reviewed exact head.
+resumes the freshly reviewed exact head. If `main` advances while a repair is
+open, DeployBot records and emits a fresh repair handoff for the new base to every
+affected source thread; begin those repairs in parallel while preserving FIFO for
+the eventual merge.
 
 Use `deploybot doctor --json` for setup drift and `deploybot metrics --json` for
 p50, p95, and slow-stage evidence. A failed cumulative CI or deployment pauses
