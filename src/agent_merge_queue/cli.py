@@ -5456,6 +5456,16 @@ def command_react(
         if not isinstance(workflow_runs, list):
             workflow_runs = []
         current_main_sha = client.base_sha()
+        # A failed release that an operator explicitly unpaused is being
+        # replaced, not verified. Its only fix is the elected repair, whose
+        # merge advances main past the failed SHA. Holding admission for that
+        # exact SHA would strand the repair behind a release that can never
+        # turn green, so let it drain while the recovery owns this main.
+        recovering_current_main = (
+            control.get("state") == "running"
+            and bool(control.get("recovered_main_sha"))
+            and control.get("recovered_main_sha") == current_main_sha
+        )
         release_before_merge = release_state(
             main_sha=current_main_sha,
             runs=workflow_runs,
@@ -5527,7 +5537,7 @@ def command_react(
             release_is_verified = release_before_merge["state"] == "verified"
         if release_is_verified:
             client.record_verified_main(current_main_sha)
-        if has_release_owner and not release_is_verified:
+        if has_release_owner and not release_is_verified and not recovering_current_main:
             release = release_before_merge
             if follow:
                 release = command_follow(
@@ -5786,6 +5796,10 @@ def command_unpause(
     *,
     main_sha: str,
     control_id: str,
+    wake: bool = True,
+    follow: bool = False,
+    timeout_seconds: int = 1800,
+    dispatch_ci: bool = False,
 ) -> None:
     control = client.pipeline_control()
     if control.get("state") != "paused":
@@ -5830,6 +5844,23 @@ def command_unpause(
     # verification; binding `running` to the failed SHA forever would instead
     # re-pause the repair merge and strand takeover workers.
     print(f"DeployBot pipeline is running for recovered main {main_sha}")
+    if not wake:
+        return
+    # The recovery control is a registry comment, which does not raise a
+    # coordinator wake-up event. Drive one reaction now so the elected repair
+    # merges immediately instead of idling until the next delivery event or the
+    # five-minute reconciliation sweep. The recovery is already durable, so a
+    # transient reaction error must not strand it; the normal event flow still
+    # completes the merge on the next wake-up.
+    try:
+        command_react(
+            client,
+            follow=follow,
+            timeout_seconds=timeout_seconds,
+            dispatch_ci=dispatch_ci,
+        )
+    except QueueError as error:
+        print(f"recovery wake-up reaction deferred to the next event: {error}")
 
 
 def command_claim_release_repair(
@@ -6018,6 +6049,24 @@ def build_parser() -> argparse.ArgumentParser:
     )
     unpause.add_argument("--sha", required=True, dest="main_sha")
     unpause.add_argument("--control-id", required=True)
+    unpause.add_argument(
+        "--no-wake",
+        action="store_false",
+        dest="wake",
+        help="only record the recovery; do not react immediately",
+    )
+    unpause.add_argument(
+        "--follow",
+        action="store_true",
+        help="follow the recovered main through deployment in the wake reaction",
+    )
+    unpause.add_argument(
+        "--dispatch-ci",
+        action="store_true",
+        dest="dispatch_ci",
+        help="dispatch configured CI after the wake reaction merges the repair",
+    )
+    unpause.add_argument("--timeout", type=int, default=1800)
     claim_repair = subparsers.add_parser(
         "claim-release-repair",
         help="atomically claim ownership of the current failed release",
@@ -6143,10 +6192,16 @@ def main(argv: list[str] | None = None) -> int:
         elif arguments.command == "pause":
             command_control(client, state="paused", reason=arguments.reason)
         elif arguments.command == "unpause":
+            if arguments.timeout < 1:
+                raise QueueError("--timeout must be positive")
             command_unpause(
                 client,
                 main_sha=arguments.main_sha,
                 control_id=arguments.control_id,
+                wake=arguments.wake,
+                follow=arguments.follow,
+                timeout_seconds=arguments.timeout,
+                dispatch_ci=arguments.dispatch_ci,
             )
         elif arguments.command == "claim-release-repair":
             command_claim_release_repair(
