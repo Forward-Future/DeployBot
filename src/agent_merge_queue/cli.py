@@ -5869,12 +5869,15 @@ def delivery_metrics(client: GitHub, *, limit: int) -> dict[str, Any]:
     comments_by_number = client.comments_for_pull_requests(
         int(pull["number"]) for pull in pulls
     )
+    repair_logins = coordinator_logins(client) | set(client.trusted_logins)
 
     def sample(pull: dict[str, Any]) -> dict[str, Any]:
         number = int(pull["number"])
         comments = comments_by_number.get(number, [])
         intent = latest_intent(comments, client.trusted_logins)
         marker = queue_marker_for_client(client, comments)
+        repair = latest_payload(comments, REPAIR_MARKER, repair_logins)
+        repaired = bool(repair) and not repair_marker_is_transitional(repair)
         merged_at = str(pull.get("merged_at") or "") or None
         merge_sha = str(pull.get("merge_commit_sha") or "")
         live_at: str | None = None
@@ -5897,6 +5900,7 @@ def delivery_metrics(client: GitHub, *, limit: int) -> dict[str, Any]:
             "queued_at": queued_at,
             "merged_at": merged_at,
             "live_at": live_at,
+            "repaired": repaired,
             "request_to_queue_seconds": seconds_between(requested_at, queued_at),
             "queue_to_merge_seconds": seconds_between(queued_at, merged_at),
             "merge_to_live_seconds": seconds_between(merged_at, live_at),
@@ -5910,7 +5914,27 @@ def delivery_metrics(client: GitHub, *, limit: int) -> dict[str, Any]:
             max_workers=min(client.config.pipeline.promotion_workers, len(pulls))
         ) as executor:
             samples = list(executor.map(sample, pulls))
-    return summarize_metrics(samples)
+    # Compare each stage against the operator's own speed targets so the
+    # historical view answers "are PRs going out the door quickly enough?",
+    # mirroring how `status` applies these same targets to live work.
+    ready_target = client.config.pipeline.ready_to_merge_target_minutes * 60
+    live_target = client.config.pipeline.merge_to_live_target_minutes * 60
+    targets = {
+        "queue_to_merge_seconds": ready_target,
+        "merge_to_live_seconds": live_target,
+        "request_to_live_seconds": ready_target + live_target,
+    }
+    summary = summarize_metrics(samples, targets=targets)
+    repaired_merges = sum(1 for value in samples if value.get("repaired"))
+    summary["reliability"] = {
+        "merged_samples": len(samples),
+        "first_pass_merges": len(samples) - repaired_merges,
+        "repaired_merges": repaired_merges,
+        "first_pass_rate": (
+            (len(samples) - repaired_merges) / len(samples) if samples else None
+        ),
+    }
+    return summary
 
 
 def print_doctor(rows: list[dict[str, Any]], *, json_output: bool) -> None:
@@ -6164,12 +6188,32 @@ def main(argv: list[str] | None = None) -> int:
                 print(json.dumps(value, indent=2, sort_keys=True))
             else:
                 print(f"delivery samples: {value['sample_count']}")
+                reliability = value.get("reliability") or {}
+                if reliability.get("merged_samples"):
+                    rate = reliability.get("first_pass_rate")
+                    rate_text = f"{rate * 100:.0f}%" if rate is not None else "n/a"
+                    print(
+                        "first-pass merges: "
+                        f"{reliability['first_pass_merges']}/"
+                        f"{reliability['merged_samples']} ({rate_text})"
+                    )
                 for name, summary in value.items():
-                    if name.endswith("_seconds"):
-                        print(
-                            f"{name}: p50={summary['p50']}s "
-                            f"p95={summary['p95']}s max={summary['max']}s"
+                    if not name.endswith("_seconds"):
+                        continue
+                    line = (
+                        f"{name}: p50={summary['p50']}s "
+                        f"p95={summary['p95']}s max={summary['max']}s"
+                    )
+                    if summary.get("target_seconds") is not None:
+                        within = summary.get("within_target_rate")
+                        within_text = (
+                            f"{within * 100:.0f}%" if within is not None else "n/a"
                         )
+                        line += (
+                            f" target={summary['target_seconds']}s "
+                            f"within={within_text}"
+                        )
+                    print(line)
         elif arguments.command == "block":
             command_block(client, arguments.pr, arguments.reason)
         elif arguments.command == "unblock":

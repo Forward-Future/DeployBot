@@ -183,24 +183,38 @@ def percentile(values: Iterable[float], fraction: float) -> float | None:
     return ordered[index]
 
 
-def summarize_metrics(samples: list[dict[str, Any]]) -> dict[str, Any]:
+def summarize_metrics(
+    samples: list[dict[str, Any]],
+    *,
+    targets: dict[str, float] | None = None,
+) -> dict[str, Any]:
     stages = (
         "request_to_queue_seconds",
         "queue_to_merge_seconds",
         "merge_to_live_seconds",
         "request_to_live_seconds",
     )
+    targets = targets or {}
     summary: dict[str, Any] = {"sample_count": len(samples), "samples": samples}
     for stage in stages:
         values = [
             float(sample[stage]) for sample in samples if sample.get(stage) is not None
         ]
-        summary[stage] = {
+        stage_summary: dict[str, Any] = {
             "count": len(values),
             "p50": percentile(values, 0.50),
             "p95": percentile(values, 0.95),
             "max": max(values) if values else None,
         }
+        target = targets.get(stage)
+        if target is not None:
+            within = sum(1 for value in values if value <= target)
+            stage_summary["target_seconds"] = target
+            stage_summary["within_target"] = within
+            stage_summary["within_target_rate"] = (
+                within / len(values) if values else None
+            )
+        summary[stage] = stage_summary
     return summary
 
 

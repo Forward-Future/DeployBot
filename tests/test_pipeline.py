@@ -306,6 +306,28 @@ class PipelineTest(unittest.TestCase):
         self.assertEqual(summary["request_to_queue_seconds"]["p50"], 1)
         self.assertEqual(summary["request_to_queue_seconds"]["p95"], 3)
 
+    def test_metrics_report_target_attainment(self) -> None:
+        summary = summarize_metrics(
+            [
+                {"merge_to_live_seconds": 100},
+                {"merge_to_live_seconds": 700},
+            ],
+            targets={"merge_to_live_seconds": 600},
+        )
+        stage = summary["merge_to_live_seconds"]
+        self.assertEqual(stage["target_seconds"], 600)
+        self.assertEqual(stage["within_target"], 1)
+        self.assertEqual(stage["within_target_rate"], 0.5)
+
+    def test_metrics_omit_attainment_without_targets(self) -> None:
+        summary = summarize_metrics([{"merge_to_live_seconds": 100}])
+        self.assertNotIn("target_seconds", summary["merge_to_live_seconds"])
+        self.assertIsNone(
+            summarize_metrics([], targets={"merge_to_live_seconds": 600})[
+                "merge_to_live_seconds"
+            ]["within_target_rate"]
+        )
+
     def test_webhook_failure_never_blocks_delivery_state(self) -> None:
         config = parse_config(
             {
