@@ -44,6 +44,12 @@ update` in `pr-draft`, `pr-review`, or `ready` phase with the PR number. The
 first trusted binding is immutable and owns repair handoffs and the final
 deployment receipt. Later deploy and coordinator threads never replace it.
 
+Before this PR-opening thread finishes its response, run `deploybot status
+--json` and confirm that the exact PR appears in
+`pull_request_thread_owners` and not in `unbound_pull_requests`. A missing
+binding means the PR-opening task is still incomplete: publish the binding from
+this thread and verify it before stopping.
+
 Require the user's exact `deploy` instruction before running `deploybot request`
 for that conversation's pull request. DeployBot resolves the recorded
 PR-opening thread; never substitute the current coordinator's thread ID. If an

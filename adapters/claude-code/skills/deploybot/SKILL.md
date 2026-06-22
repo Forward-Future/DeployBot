@@ -49,6 +49,11 @@ the destination for repair handoffs and the final deployment receipt. A later
 deploy, repair, integration, or coordinator thread must never claim ownership
 of an already-open PR.
 
+Before the PR-opening thread finishes its response, call `pipeline_status` and
+confirm that the exact PR appears in `pull_request_thread_owners` and not in
+`unbound_pull_requests`. A missing binding means the PR-opening task is still
+incomplete: publish the binding from this thread and verify it before stopping.
+
 Require the user's exact `deploy` instruction before calling
 `request_deployment` or `deploybot request` for that conversation's pull
 request. DeployBot resolves the previously recorded PR-opening thread; never

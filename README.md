@@ -11,11 +11,11 @@ integration PRs, follows `main` through production, and pauses after failures.
 
 ## Install
 
-Install the reviewed `v0.2.19` source commit directly from GitHub:
+Install the reviewed `v0.2.20` source commit directly from GitHub:
 
 ```bash
 python3 -m pip install \
-  'deploybot-merge-queue[mcp] @ git+https://github.com/Forward-Future/DeployBot.git@1b6379a258a0b6f743ce77c2d108dfd7e83d582b'
+  'deploybot-merge-queue[mcp] @ git+https://github.com/Forward-Future/DeployBot.git@3bf238140fba3d4d5fbd2d739b9f5422e99567dd'
 deploybot init
 ```
 
@@ -95,7 +95,7 @@ worker can dispatch deployment when GitHub suppresses the `workflow_run` event
 for token-dispatched CI. Pin the Action to the full reviewed release commit:
 
 ```yaml
-- uses: Forward-Future/DeployBot@1b6379a258a0b6f743ce77c2d108dfd7e83d582b
+- uses: Forward-Future/DeployBot@3bf238140fba3d4d5fbd2d739b9f5422e99567dd
 ```
 
 The Action uses GitHub's built-in workflow token. GitHub intentionally does not
@@ -160,9 +160,12 @@ they cannot create the original per-pull-request deploy intent.
 `deploybot status` reports active metadata-only agent threads, pending native
 notifications, every PR stage, deploy requests and their exact authorized heads,
 queue order, queued and pre-queue intent overlaps, exact-`main` CI, deployment,
-and pipeline pause state. It alerts when a deploy request exceeds the configured
+pipeline pause state, and every open PR that has not been bound to its native
+opening thread. It alerts when a deploy request exceeds the configured
 ready-to-merge target and names the current gate. It never stores prompts,
-transcripts, source, or credentials.
+transcripts, source, or credentials. A failed PR rollup is reconciled against
+the exact commit's check runs before DeployBot creates a repair block, so a
+cancelled superseded run cannot hide its replacement.
 
 `deploybot react` promotes ready intent, skips blockers, drains independent
 work, and creates integration PRs when configured. New batches contain at most

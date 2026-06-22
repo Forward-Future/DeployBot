@@ -19,6 +19,9 @@ the repository's policy; never assume a particular review vendor.
 6. Immediately after opening the PR, call `update_agent_thread` in `pr-draft`,
    `pr-review`, or `ready` phase with its number so this opening thread becomes
    the immutable repair and deployment-receipt destination.
+7. Before finishing the PR-opening response, call `pipeline_status` and verify
+   that the exact PR is in `pull_request_thread_owners`, not
+   `unbound_pull_requests`. Bind and recheck it if missing.
 
 Do not merge merely because review is complete.
 
