@@ -57,6 +57,7 @@ from agent_merge_queue.cli import (
     queue_from_intent,
     queue_timestamp,
     reconcile_externally_merged_threads,
+    record_integration_conflict_repair,
     record_repair,
     release_follow_needed,
     repair_overlap_hold_active,
@@ -3281,6 +3282,53 @@ class QueueCoreTest(unittest.TestCase):
         self.assertIn("deploybot resume", result["waiting"][0]["reasons"][0])
         client.add_label.assert_not_called()
 
+    def test_promote_recovers_owner_after_conflicted_integration_closes(self) -> None:
+        ready = entry(1)
+        ready.labels = ["deploy-requested", "merge-queue-blocked"]
+        intent_comment = {
+            "id": 1,
+            "created_at": "2026-06-20T00:00:00Z",
+            "user": {"login": "trusted"},
+            "body": intent_body(
+                intent_id="intent-1",
+                state="requested",
+                requested_at="2026-06-20T00:00:00Z",
+                requested_head=ready.head_sha,
+            ),
+        }
+        repair_comment = {
+            "id": 2,
+            "created_at": "2026-06-20T00:01:00Z",
+            "user": {"login": "coordinator"},
+            "body": repair_body(
+                {
+                    "head_sha": ready.head_sha,
+                    "intent_id": "intent-1",
+                    "pull_request": 1,
+                    "reason": "integration PR #99 could not merge delegated PR #2",
+                    "repair_pull_request": 99,
+                    "resume_command": "deploybot resume 99",
+                }
+            ),
+        }
+        client = Mock()
+        client.config = CONFIG
+        client.repository = "example/repo"
+        client.trusted_logins = {"trusted"}
+        client.coordinator_logins = {"coordinator"}
+        client.intent_numbers.return_value = [1]
+        client.active_integration_sources.return_value = set()
+        client.comments.return_value = [intent_comment, repair_comment]
+        client.snapshot.return_value = ready
+        client.labels.return_value = set(ready.labels)
+
+        with redirect_stdout(io.StringIO()):
+            result = command_promote(client)
+
+        self.assertEqual(result["promoted"], [1])
+        client.remove_label.assert_any_call(1, "merge-queue-blocked")
+        client.add_label.assert_called_with(1, "merge-queue")
+
     def test_promote_does_not_hold_resumed_repair_against_itself(self) -> None:
         ready = entry(1)
         ready.labels = ["deploy-requested", "merge-queue"]
@@ -3600,9 +3648,185 @@ class QueueCoreTest(unittest.TestCase):
             [call.args for call in client.remove_label.call_args_list],
             [
                 (1, "merge-queue"),
-                (1, "deploy-requested"),
                 (2, "merge-queue"),
-                (2, "deploy-requested"),
+            ],
+        )
+
+    def test_conflicted_integration_keeps_source_intents_discoverable(self) -> None:
+        first = entry(1, "shared.py")
+        second = entry(2, "shared.py")
+        batch = new_batch([first, second], frozen_at="2026-06-20T00:00:00Z")
+        client = object.__new__(GitHub)
+        client.config = parse_config(
+            {
+                "queue": {
+                    "required_checks": ["CI"],
+                    "trusted_actors": ["trusted"],
+                },
+                "integration": {"mode": "overlap"},
+            }
+        )
+        client.repository = "example/repo"
+        client.owner = "example"
+        client.name = "repo"
+        client.base_sha = Mock(return_value="b" * 40)
+        client._json = Mock(
+            side_effect=[
+                {},
+                {"sha": "1" * 40},
+                QueueError("gh: Merge conflict (HTTP 409)"),
+                [],
+                {"number": 99, "html_url": "https://example.test/99"},
+            ]
+        )
+        client.comment = Mock()
+        client.labels = Mock(return_value={"merge-queue", "deploy-requested"})
+        client.remove_label = Mock()
+
+        result = client.create_integration_pull_request(
+            batch=batch, entries=[first, second]
+        )
+
+        self.assertEqual(result["conflict"]["number"], 2)
+        self.assertEqual(
+            [value.args for value in client.remove_label.call_args_list],
+            [(1, "merge-queue"), (2, "merge-queue")],
+        )
+
+    def test_conflicted_integration_elects_one_tracked_repair_owner(self) -> None:
+        first = entry(1, "first.py")
+        second = entry(2, "second.py")
+        intent = {
+            "id": 1,
+            "created_at": "2026-06-20T00:00:00Z",
+            "user": {"login": "trusted"},
+            "body": intent_body(
+                intent_id="intent-1",
+                state="requested",
+                requested_at="2026-06-20T00:00:00Z",
+                requested_head=first.head_sha,
+                provider="codex",
+                thread_id="thread-1",
+            ),
+        }
+        client = Mock()
+        client.config = CONFIG
+        client.trusted_logins = {"trusted"}
+        client.coordinator_logins = {"coordinator"}
+        client.comments.side_effect = lambda number: [intent] if number == 1 else []
+        client.labels.return_value = {"deploy-requested"}
+        client.base_sha.return_value = "b" * 40
+        result = {
+            "number": 99,
+            "branch": "deploybot/integration/batch-1",
+            "conflict": {"number": 2, "reason": "merge conflict"},
+        }
+
+        repair = record_integration_conflict_repair(
+            client, result, [first, second]
+        )
+
+        self.assertEqual(result["repair_owner"]["pull_request"], 1)
+        self.assertEqual(repair["resume_command"], "deploybot resume 99")
+        self.assertEqual(repair["repair_pull_request"], 99)
+        client.add_label.assert_called_once_with(1, CONFIG.blocked_label)
+        self.assertTrue(
+            any(
+                "deploybot resume 99" in value.args[1]
+                for value in client.comment.call_args_list
+            )
+        )
+
+    def test_conflicted_integration_skips_cancelled_repair_owner(self) -> None:
+        first = entry(1, "first.py")
+        second = entry(2, "second.py")
+
+        def tracked_intent(
+            value: QueueEntry, *, state: str, thread_id: str
+        ) -> dict[str, object]:
+            return {
+                "id": value.number,
+                "created_at": "2026-06-20T00:00:00Z",
+                "user": {"login": "trusted"},
+                "body": intent_body(
+                    intent_id=f"intent-{value.number}",
+                    state=state,
+                    requested_at="2026-06-20T00:00:00Z",
+                    requested_head=value.head_sha,
+                    provider="codex",
+                    thread_id=thread_id,
+                ),
+            }
+
+        client = Mock()
+        client.config = CONFIG
+        client.trusted_logins = {"trusted"}
+        client.coordinator_logins = {"coordinator"}
+        client.comments.side_effect = lambda number: [
+            tracked_intent(
+                first if number == 1 else second,
+                state="cancelled" if number == 1 else "requested",
+                thread_id=f"thread-{number}",
+            )
+        ]
+        client.labels.return_value = {"deploy-requested"}
+        client.base_sha.return_value = "b" * 40
+        result = {
+            "number": 99,
+            "branch": "deploybot/integration/batch-1",
+            "conflict": {"number": 2, "reason": "merge conflict"},
+        }
+
+        repair = record_integration_conflict_repair(
+            client, result, [first, second]
+        )
+
+        self.assertEqual(result["repair_owner"]["pull_request"], 2)
+        self.assertEqual(repair["thread_id"], "thread-2")
+
+    def test_resumed_integration_finishes_source_label_delegation(self) -> None:
+        integration_head = "9" * 40
+        marker = {
+            "batch_id": "batch-1",
+            "conflict": {"number": 2, "reason": "merge conflict"},
+            "heads": {"1": "1" * 40, "2": "2" * 40},
+            "pull_requests": [1, 2],
+        }
+        comments = [
+            {
+                "id": 1,
+                "created_at": "2026-06-20T00:00:00Z",
+                "user": {"login": "coordinator"},
+                "body": integration_body(marker),
+            }
+        ]
+        integration = entry(99)
+        integration.head_sha = integration_head
+        client = Mock()
+        client.config = CONFIG
+        client.coordinator_logins = {"coordinator"}
+        client.resolve_pr.return_value = 99
+        client.comments.return_value = comments
+        client.snapshot.return_value = integration
+        client.is_ancestor.return_value = True
+        source_labels = {
+            CONFIG.queue_label,
+            CONFIG.pipeline.intent_label,
+            CONFIG.blocked_label,
+        }
+        client.labels.side_effect = lambda number: set() if number == 99 else source_labels
+
+        with redirect_stdout(io.StringIO()):
+            command_resume(client, "99")
+
+        client.add_label.assert_called_once_with(99, CONFIG.queue_label)
+        self.assertEqual(
+            [value.args for value in client.remove_label.call_args_list],
+            [
+                (1, CONFIG.queue_label),
+                (1, CONFIG.blocked_label),
+                (2, CONFIG.queue_label),
+                (2, CONFIG.blocked_label),
             ],
         )
 
@@ -4094,6 +4318,10 @@ class QueueCoreTest(unittest.TestCase):
         with (
             patch("agent_merge_queue.cli.promote_integrations", return_value=[]),
             patch("agent_merge_queue.cli.command_promote", return_value={}),
+            patch(
+                "agent_merge_queue.cli.record_integration_conflict_repair",
+                return_value={},
+            ),
             patch("agent_merge_queue.cli.freeze_queue", return_value=frozen),
             patch("agent_merge_queue.cli.command_drain") as drain,
             patch("agent_merge_queue.cli.command_follow") as follow_release,
