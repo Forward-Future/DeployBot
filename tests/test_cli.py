@@ -4706,6 +4706,7 @@ class QueueCoreTest(unittest.TestCase):
         client.config = CONFIG
         client.coordinator_logins = {"coordinator"}
         client.integration_pull_request_numbers.return_value = [number]
+        client.active_integration_sources.return_value = set()
         client.comments.return_value = [
             {
                 "created_at": "2026-06-20T00:00:00Z",
@@ -4730,6 +4731,41 @@ class QueueCoreTest(unittest.TestCase):
             require_marker=False,
             allow_blocked_label=True,
             known_checks={"CI": "passed"},
+        )
+
+    def test_integration_promotion_skips_nested_source_integrations(self) -> None:
+        nested = 38
+        canonical = 39
+        marker = {
+            "batch_id": "batch",
+            "conflict": None,
+            "heads": {str(nested): "a" * 40},
+            "pull_requests": [nested],
+        }
+        client = Mock()
+        client.config = CONFIG
+        client.coordinator_logins = {"coordinator"}
+        client.integration_pull_request_numbers.return_value = [nested, canonical]
+        client.active_integration_sources.return_value = {nested}
+        client.comments.return_value = [
+            {
+                "created_at": "2026-06-20T00:00:00Z",
+                "user": {"login": "coordinator"},
+                "body": integration_body(marker),
+            }
+        ]
+        client.labels.return_value = set()
+        ready = entry(canonical, "combined.py")
+        client.snapshot.return_value = ready
+
+        promoted = promote_integrations(client)
+
+        self.assertEqual(promoted, [canonical])
+        client.snapshot.assert_called_once_with(
+            canonical,
+            require_marker=False,
+            allow_blocked_label=True,
+            known_checks=None,
         )
 
     def test_reactor_pauses_when_post_merge_ci_dispatch_fails(self) -> None:
