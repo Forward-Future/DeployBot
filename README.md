@@ -11,11 +11,11 @@ integration PRs, follows `main` through production, and pauses after failures.
 
 ## Install
 
-Install the reviewed `v0.2.14` source commit directly from GitHub:
+Install the reviewed `v0.2.15` source commit directly from GitHub:
 
 ```bash
 python3 -m pip install \
-  'deploybot-merge-queue[mcp] @ git+https://github.com/Forward-Future/DeployBot.git@a5f80423f5168873d0801694baaf9d8b35d96ebd'
+  'deploybot-merge-queue[mcp] @ git+https://github.com/Forward-Future/DeployBot.git@1170353958fb31718977dfff465ce9e1a89b8db4'
 deploybot init
 ```
 
@@ -95,7 +95,7 @@ worker can dispatch deployment when GitHub suppresses the `workflow_run` event
 for token-dispatched CI. Pin the Action to the full reviewed release commit:
 
 ```yaml
-- uses: Forward-Future/DeployBot@a5f80423f5168873d0801694baaf9d8b35d96ebd
+- uses: Forward-Future/DeployBot@1170353958fb31718977dfff465ce9e1a89b8db4
 ```
 
 The Action uses GitHub's built-in workflow token. GitHub intentionally does not
@@ -181,6 +181,11 @@ controller recognizes them:
 In `overlap` mode, a ready source waits when another active, near-ready intent
 belongs to the same source-overlap component. Unrelated ready work still drains,
 and the held component freezes together once its remaining gates pass.
+When more than one cumulative integration pull request needs controller-owned
+exact-head CI, DeployBot dispatches every missing workflow before it waits. The
+workflows then run in parallel instead of making later batches wait for an
+earlier runner delay. Slow-queue status names the missing, queued, or failed
+exact integration workflow instead of reporting only a generic merge worker.
 
 ```bash
 deploybot resume <pr-number>
