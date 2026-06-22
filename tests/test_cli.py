@@ -2168,6 +2168,95 @@ class QueueCoreTest(unittest.TestCase):
         self.assertNotEqual(result.get("state"), "release-held")
         promote.assert_called_once()
 
+    def test_reactor_merges_repair_while_recovering_failed_main(self) -> None:
+        # Regression: after an operator unpauses a failed main, the reactor must
+        # let the elected repair drain even though the current main CI is still
+        # red. Holding admission for the recovered SHA would strand the repair
+        # behind a release that can only go green once that repair merges.
+        sha = "79cbedf65707fe2cbb0de92d7a933f45e550cc44"
+        client = Mock()
+        client.config = CONFIG
+        client.pipeline_control.return_value = {
+            "state": "running",
+            "control_id": "resume-1",
+            "resumes_control_id": "pause-1",
+            "recovered_main_sha": sha,
+        }
+        client.base_sha.return_value = sha
+        client.verified_main_sha.return_value = "f" * 40
+        client.workflow_runs.return_value = [
+            {
+                "id": 7,
+                "name": "CI",
+                "head_sha": sha,
+                "status": "completed",
+                "conclusion": "failure",
+            }
+        ]
+        frozen = FreezeResult(None, [], [], [], [])
+        with (
+            patch(
+                "agent_merge_queue.cli.reconcile_externally_merged_threads",
+                return_value=[],
+            ),
+            patch("agent_merge_queue.cli.settle_integration_checks", return_value=[]),
+            patch("agent_merge_queue.cli.promote_integrations", return_value=[]),
+            patch(
+                "agent_merge_queue.cli.command_promote",
+                return_value={"promoted": [], "waiting": [], "blocked": []},
+            ) as promote,
+            patch(
+                "agent_merge_queue.cli.command_drain",
+                return_value={"merged": []},
+            ),
+            patch("agent_merge_queue.cli.command_follow") as follow,
+            patch("agent_merge_queue.cli.freeze_queue", return_value=frozen),
+            redirect_stdout(io.StringIO()),
+        ):
+            result = command_react(client, follow=False, timeout_seconds=10)
+
+        self.assertNotEqual(result.get("state"), "release-held")
+        promote.assert_called_once()
+        # The recovered SHA must not be re-followed (and thus re-paused) inside
+        # the admission fence; that is exactly the stale pause that deadlocked.
+        follow.assert_not_called()
+        client.set_pipeline_control.assert_not_called()
+
+    def test_reactor_still_holds_failed_main_without_recovery(self) -> None:
+        # Scoping guard: the recovery bypass only applies to the exact unpaused
+        # SHA. A plain running pipeline that finds a red main still holds.
+        sha = "a" * 40
+        client = Mock()
+        client.config = CONFIG
+        client.pipeline_control.return_value = {"state": "running"}
+        client.base_sha.return_value = sha
+        client.verified_main_sha.return_value = "f" * 40
+        client.workflow_runs.return_value = [
+            {
+                "id": 7,
+                "name": "CI",
+                "head_sha": sha,
+                "status": "completed",
+                "conclusion": "failure",
+            }
+        ]
+        with (
+            patch(
+                "agent_merge_queue.cli.reconcile_externally_merged_threads",
+                return_value=[],
+            ),
+            patch("agent_merge_queue.cli.command_promote") as promote,
+            patch(
+                "agent_merge_queue.cli.command_follow",
+                return_value={"state": "ci-failed", "main_sha": sha},
+            ),
+            redirect_stdout(io.StringIO()),
+        ):
+            result = command_react(client, follow=True, timeout_seconds=10)
+
+        self.assertEqual(result["state"], "release-held")
+        promote.assert_not_called()
+
     def test_reactor_holds_newly_merged_revision_before_ci_is_visible(self) -> None:
         sha = "a" * 40
         client = Mock()
@@ -6092,13 +6181,95 @@ class QueueCoreTest(unittest.TestCase):
         client.base_sha.return_value = sha
         client.set_pipeline_control.return_value = "resume-1"
 
-        with redirect_stdout(io.StringIO()):
+        with (
+            patch("agent_merge_queue.cli.command_react") as react,
+            redirect_stdout(io.StringIO()),
+        ):
             command_unpause(
                 client,
                 main_sha=sha,
                 control_id=control_id,
             )
 
+        client.set_pipeline_control.assert_called_once_with(
+            "running", None, resumes_control_id=control_id
+        )
+        # The recovery wakes the coordinator immediately so the elected repair
+        # merges without waiting for another delivery event or the sweep.
+        react.assert_called_once_with(
+            client, follow=False, timeout_seconds=1800, dispatch_ci=False
+        )
+
+    def test_unpause_can_skip_the_immediate_wake(self) -> None:
+        sha = "a" * 40
+        control_id = "pause-1"
+        client = Mock()
+        client.pipeline_control.side_effect = [
+            {
+                "state": "paused",
+                "reason": f"ci-failed on {sha}",
+                "control_id": control_id,
+                "main_sha": sha,
+            },
+            {
+                "state": "running",
+                "control_id": "resume-1",
+                "resumes_control_id": control_id,
+            },
+        ]
+        client.base_sha.return_value = sha
+        client.set_pipeline_control.return_value = "resume-1"
+
+        with (
+            patch("agent_merge_queue.cli.command_react") as react,
+            redirect_stdout(io.StringIO()),
+        ):
+            command_unpause(
+                client,
+                main_sha=sha,
+                control_id=control_id,
+                wake=False,
+            )
+
+        react.assert_not_called()
+
+    def test_unpause_wake_failure_does_not_undo_durable_recovery(self) -> None:
+        sha = "a" * 40
+        control_id = "pause-1"
+        client = Mock()
+        client.pipeline_control.side_effect = [
+            {
+                "state": "paused",
+                "reason": f"ci-failed on {sha}",
+                "control_id": control_id,
+                "main_sha": sha,
+            },
+            {
+                "state": "running",
+                "control_id": "resume-1",
+                "resumes_control_id": control_id,
+            },
+        ]
+        client.base_sha.return_value = sha
+        client.set_pipeline_control.return_value = "resume-1"
+
+        stream = io.StringIO()
+        with (
+            patch(
+                "agent_merge_queue.cli.command_react",
+                side_effect=QueueError("transient GitHub error"),
+            ),
+            redirect_stdout(stream),
+        ):
+            command_unpause(
+                client,
+                main_sha=sha,
+                control_id=control_id,
+            )
+
+        # The recovery is already durable; a wake failure is reported but does
+        # not raise or re-pause the pipeline.
+        self.assertIn("deferred to the next event", stream.getvalue())
         client.set_pipeline_control.assert_called_once_with(
             "running", None, resumes_control_id=control_id
         )
@@ -6323,6 +6494,94 @@ class QueueCoreTest(unittest.TestCase):
                 reason=f"main advanced from {sha}",
                 main_sha=sha,
                 requires_control_id="resume-1",
+            ),
+        ]
+        client.registry_comments = Mock(
+            return_value=[
+                {
+                    "id": index,
+                    "created_at": f"2026-06-21T17:17:{index:02d}Z",
+                    "user": {"login": "coordinator"},
+                    "body": body,
+                }
+                for index, body in enumerate(records, start=1)
+            ]
+        )
+
+        control = client.pipeline_control()
+
+        self.assertEqual(control["state"], "paused")
+        self.assertEqual(control["control_id"], "pause-2")
+
+    def test_pipeline_control_preserves_recovery_against_stale_repause(self) -> None:
+        # Regression: a workflow pinned to an older DeployBot rereads the still
+        # failing CI for an already-recovered SHA and writes a fresh, byte
+        # identical pause. That stale restatement must not clear the recovery,
+        # or the elected repair can never merge to produce a passing main.
+        sha = "79cbedf65707fe2cbb0de92d7a933f45e550cc44"
+        client = object.__new__(GitHub)
+        client.coordinator_logins = {"coordinator"}
+        records = [
+            control_body(
+                state="paused",
+                control_id="pause-1",
+                reason=f"ci-failed on {sha}",
+                main_sha=sha,
+            ),
+            control_body(
+                state="running",
+                control_id="resume-1",
+                resumes_control_id="pause-1",
+            ),
+            control_body(
+                state="paused",
+                control_id="pause-stale",
+                reason=f"ci-failed on {sha}",
+                main_sha=sha,
+            ),
+        ]
+        client.registry_comments = Mock(
+            return_value=[
+                {
+                    "id": index,
+                    "created_at": f"2026-06-21T17:17:{index:02d}Z",
+                    "user": {"login": "coordinator"},
+                    "body": body,
+                }
+                for index, body in enumerate(records, start=1)
+            ]
+        )
+
+        control = client.pipeline_control()
+
+        self.assertEqual(control["state"], "running")
+        self.assertEqual(control["resumes_control_id"], "pause-1")
+        self.assertEqual(control["recovered_main_sha"], sha)
+
+    def test_pipeline_control_repauses_when_a_new_release_fails(self) -> None:
+        # A genuinely new failure (a different SHA, or a different reason such as
+        # a later deploy failure) must still pause even after a prior recovery.
+        sha = "a" * 40
+        newer = "b" * 40
+        client = object.__new__(GitHub)
+        client.coordinator_logins = {"coordinator"}
+        records = [
+            control_body(
+                state="paused",
+                control_id="pause-1",
+                reason=f"ci-failed on {sha}",
+                main_sha=sha,
+            ),
+            control_body(
+                state="running",
+                control_id="resume-1",
+                resumes_control_id="pause-1",
+            ),
+            control_body(
+                state="paused",
+                control_id="pause-2",
+                reason=f"ci-failed on {newer}",
+                main_sha=newer,
             ),
         ]
         client.registry_comments = Mock(
