@@ -264,6 +264,7 @@ expected_status = 200
 mode = "overlap"
 max_batch_size = 3
 # require_non_actions_author = true
+# ci_satisfies_checks = ["Stable PR head", "Full test suite"]
 ```
 
 For `overlap` or `all` mode with the hosted coordinator, enable **Allow GitHub

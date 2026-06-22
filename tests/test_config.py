@@ -202,6 +202,7 @@ class ConfigTest(unittest.TestCase):
                     "mode": "all",
                     "max_batch_size": 2,
                     "require_non_actions_author": True,
+                    "ci_satisfies_checks": ["CI"],
                 },
             }
         )
@@ -217,6 +218,34 @@ class ConfigTest(unittest.TestCase):
         self.assertEqual(config.integration.mode, "all")
         self.assertEqual(config.integration.max_batch_size, 2)
         self.assertTrue(config.integration.require_non_actions_author)
+        self.assertEqual(config.integration.ci_satisfies_checks, ("CI",))
+
+    def test_integration_ci_satisfied_checks_must_be_required(self) -> None:
+        with self.assertRaisesRegex(ConfigError, "must be a subset"):
+            parse_config(
+                {
+                    "queue": {
+                        "required_checks": ["CI"],
+                        "trusted_actors": ["trusted"],
+                    },
+                    "integration": {
+                        "ci_satisfies_checks": ["Unrelated security scan"]
+                    },
+                }
+            )
+
+    def test_integration_ci_satisfied_checks_require_a_workflow(self) -> None:
+        with self.assertRaisesRegex(ConfigError, "requires at least one"):
+            parse_config(
+                {
+                    "queue": {
+                        "required_checks": ["CI"],
+                        "trusted_actors": ["trusted"],
+                    },
+                    "pipeline": {"ci_workflows": []},
+                    "integration": {"ci_satisfies_checks": ["CI"]},
+                }
+            )
 
     def test_rejects_invalid_repair_branch_prefix(self) -> None:
         for prefix in ("/", "repairs//main", "repairs/../main", "repairs/main.lock"):

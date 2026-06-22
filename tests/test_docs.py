@@ -150,6 +150,7 @@ class DocumentationTest(unittest.TestCase):
                 "title_prefix",
                 "max_batch_size",
                 "require_non_actions_author",
+                "ci_satisfies_checks",
             },
         }
         queue_fields = {field.name for field in fields(QueueConfig)} - {
