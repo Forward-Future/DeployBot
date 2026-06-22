@@ -89,7 +89,7 @@ def request_deployment(
     repository: str | None = None,
     config: str | None = None,
 ) -> str:
-    """Persist deploy intent and return the mandatory receipt handoff action."""
+    """Persist intent and route receipts to the recorded PR-opening thread."""
     arguments = [pull_request]
     for flag, value in (
         ("--provider", provider),
@@ -233,7 +233,7 @@ def update_agent_thread(
     repository: str | None = None,
     config: str | None = None,
 ) -> str:
-    """Publish metadata-only thread state for cross-client coordination."""
+    """Publish state; opening PR phases immutably bind the native owner."""
     arguments = [
         "update",
         "--provider",

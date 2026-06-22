@@ -5,12 +5,15 @@ from datetime import datetime, timezone
 
 from agent_merge_queue.records import (
     DeploymentNotificationRecord,
+    PullRequestThreadOwnerRecord,
     ThreadRecord,
     deployment_notification_body,
     intent_body,
     latest_deployment_notifications,
     latest_intent,
     latest_thread_records,
+    pull_request_thread_owner_body,
+    pull_request_thread_owners,
     thread_record_body,
 )
 
@@ -25,6 +28,53 @@ def comment(login: str, body: str, created_at: str, comment_id: int = 1) -> dict
 
 
 class RecordTest(unittest.TestCase):
+    def test_pull_request_thread_owner_is_the_first_trusted_claim(self) -> None:
+        opened = PullRequestThreadOwnerRecord(
+            provider="cursor",
+            thread_id="opening-thread",
+            pull_request=42,
+            recorded_at="2026-06-20T00:00:00Z",
+            thread_url="https://example.test/opening-thread",
+        )
+        coordinator = PullRequestThreadOwnerRecord(
+            provider="codex",
+            thread_id="deploy-coordinator",
+            pull_request=42,
+            recorded_at="2026-06-20T01:00:00Z",
+        )
+        forged = PullRequestThreadOwnerRecord(
+            provider="codex",
+            thread_id="attacker-thread",
+            pull_request=42,
+            recorded_at="2026-06-19T23:00:00Z",
+        )
+
+        owners = pull_request_thread_owners(
+            [
+                comment(
+                    "trusted",
+                    pull_request_thread_owner_body(opened),
+                    opened.recorded_at,
+                    1,
+                ),
+                comment(
+                    "trusted",
+                    pull_request_thread_owner_body(coordinator),
+                    coordinator.recorded_at,
+                    2,
+                ),
+                comment(
+                    "attacker",
+                    pull_request_thread_owner_body(forged),
+                    forged.recorded_at,
+                    3,
+                ),
+            ],
+            {"trusted"},
+        )
+
+        self.assertEqual(owners[42], opened)
+
     def test_thread_registry_keeps_latest_active_metadata_only(self) -> None:
         old = ThreadRecord(
             provider="codex",

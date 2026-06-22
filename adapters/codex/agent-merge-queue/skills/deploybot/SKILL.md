@@ -39,9 +39,15 @@ Use these state meanings:
 
 ## Change Queue State
 
+Immediately after this native thread opens a pull request, run `deploybot thread
+update` in `pr-draft`, `pr-review`, or `ready` phase with the PR number. The
+first trusted binding is immutable and owns repair handoffs and the final
+deployment receipt. Later deploy and coordinator threads never replace it.
+
 Require the user's exact `deploy` instruction before running `deploybot request`
-for that conversation's pull request. Record the provider and stable native
-thread ID when available. This
+for that conversation's pull request. DeployBot resolves the recorded
+PR-opening thread; never substitute the current coordinator's thread ID. If an
+older PR is unbound, have its opening thread publish that binding first. This
 durable request waits for exact-head checks and review. If the head changes,
 the trusted source agent runs `deploybot refresh-request` only after the
 replacement head is ready; the user does not need to repeat `deploy`. Do not
@@ -110,7 +116,7 @@ workflow-token integration PR.
 ## Notify Source Threads
 
 After exact-main verification, `deploybot follow --json` returns one
-`thread_notifications` entry per source thread and records that thread as
+`thread_notifications` entry per PR-opening thread and records that thread as
 `deployed`. Deliver every entry's `message` into the recorded native thread so
 the user can see completion by looking at that thread. In Codex, use the app's
 `send_message_to_thread` tool to wake that thread with the supplied message and
@@ -132,13 +138,14 @@ comment for the native message. If native delivery is unavailable or fails,
 leave the notification `pending`; a later coordinator or the provider-neutral
 `thread-deployed` webhook can retry it.
 
-The source thread that runs `deploybot request` also owns a durable wake-up.
-If it will stop running before verification, attach the provider's native
+The PR-opening thread owns the durable wake-up even when a coordinator runs
+`deploybot request`. Before it stops running, attach the provider's native
 thread heartbeat or follow-up monitor before returning. In Codex, use a thread
 heartbeat automation. On wake, run `deploybot status --json`; once this thread
 is listed under pending `notifications`, first show its supplied message to the
 user, then acknowledge it and remove the heartbeat. Do not use a tight polling
 loop. Treat `notification_handoff.required_action` in the request result as
-mandatory. Do not finish the source-thread response until that action succeeds;
+mandatory. A coordinator routes it to the recorded opening thread and never
+attaches it to itself. Do not finish the source-thread response until that action succeeds;
 if the provider has no native monitor, report the receipt-delivery blocker and
 leave the notification pending.

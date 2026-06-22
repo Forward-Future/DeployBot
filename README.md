@@ -11,11 +11,11 @@ integration PRs, follows `main` through production, and pauses after failures.
 
 ## Install
 
-Install the reviewed `v0.2.18` source commit directly from GitHub:
+Install the reviewed `v0.2.19` source commit directly from GitHub:
 
 ```bash
 python3 -m pip install \
-  'deploybot-merge-queue[mcp] @ git+https://github.com/Forward-Future/DeployBot.git@208d4168e5a02b994905e94d648599d06b4afbd2'
+  'deploybot-merge-queue[mcp] @ git+https://github.com/Forward-Future/DeployBot.git@1b6379a258a0b6f743ce77c2d108dfd7e83d582b'
 deploybot init
 ```
 
@@ -95,7 +95,7 @@ worker can dispatch deployment when GitHub suppresses the `workflow_run` event
 for token-dispatched CI. Pin the Action to the full reviewed release commit:
 
 ```yaml
-- uses: Forward-Future/DeployBot@208d4168e5a02b994905e94d648599d06b4afbd2
+- uses: Forward-Future/DeployBot@1b6379a258a0b6f743ce77c2d108dfd7e83d582b
 ```
 
 The Action uses GitHub's built-in workflow token. GitHub intentionally does not
@@ -211,11 +211,11 @@ other threads receive the recorded owner instead of creating duplicate PRs.
 
 At merge time, DeployBot records a non-expiring notification obligation. At
 exact-main verification, it promotes every contained obligation to `pending`,
-moves the matching source thread to `deployed` when that thread has not moved
-on, and returns a stable `thread_notifications` payload for each one.
+moves the matching PR-opening thread to `deployed` when that thread has not
+moved on, and returns a stable `thread_notifications` payload for each one.
 The provider adapter posts the supplied message into that native thread; for
-Codex it wakes the thread with `send_message_to_thread`. The source thread then
-acknowledges delivery and becomes `completed`. The message is a human-readable
+Codex it wakes the thread with `send_message_to_thread`. The PR-opening thread
+then acknowledges delivery and becomes `completed`. The message is a human-readable
 release receipt with the pull-request title and link, up to three feature
 highlights from its release notes, the exact deployed `main`, and CI/deployment
 evidence. Adapters present that receipt verbatim and keep successful
@@ -229,15 +229,21 @@ deploybot thread acknowledge --provider codex --thread-id "$CODEX_THREAD_ID" \
 
 DeployBot does not treat a registry comment as user notification. If native
 delivery fails, an independent outbox entry stays visible under pending
-`notifications`, even if the source thread starts new work, and the same
+`notifications`, even if the PR-opening thread starts new work, and the same
 `notification_id` can be retried. When `pipeline.webhook_url_env` is configured,
 the provider-neutral webhook also receives the `thread-deployed` payload and
 scheduled followers retry it. Without a configured webhook, pending receipts do
 not keep the release worker running; the source adapter's native thread heartbeat
 retrieves, acknowledges, and displays the final notification instead.
-The request result makes this ownership explicit in
+The first trusted `thread update` in `pr-draft`, `pr-review`, or `ready` phase
+that includes a PR number immutably binds that PR to its opening native thread.
+Later deploy, repair, integration, and coordinator threads cannot replace it.
+`deploybot request` uses that recorded owner even when another thread authorizes
+the release. An unowned PR cannot enter the delivery pipeline, so DeployBot
+never silently routes its receipt to the authorizing caller. The
+request result makes this ownership explicit in
 `notification_handoff.required_action`; clients must complete that action before
-ending the source-thread response.
+ending the PR-opening-thread response.
 
 ```toml
 [pipeline]

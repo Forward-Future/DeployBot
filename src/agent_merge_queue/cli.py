@@ -38,6 +38,7 @@ from .records import (
     RELEASE_WATERMARK_MARKER,
     THREAD_PHASES,
     DeploymentNotificationRecord,
+    PullRequestThreadOwnerRecord,
     ThreadRecord,
     control_body,
     deployment_notification_body,
@@ -50,6 +51,8 @@ from .records import (
     latest_payload,
     latest_thread_records,
     parse_time,
+    pull_request_thread_owner_body,
+    pull_request_thread_owners,
     repair_body,
     release_repair_body,
     release_watermark_body,
@@ -87,6 +90,7 @@ BATCH_COMPLETE_MARKER = re.compile(
 )
 PULL_REQUEST_NUMBER = re.compile(r"#(\d+)\b")
 RELEASE_REPAIR_LEASE_PREFIX = "DeployBot release repair lease v1 "
+PR_OPENING_PHASES = {"pr-draft", "pr-review", "ready"}
 FAILED_CHECK_STATES = {
     "ACTION_REQUIRED",
     "CANCELLED",
@@ -1417,6 +1421,38 @@ class GitHub:
             raise QueueError("could not create DeployBot registry")
         self.issue_comment(number, thread_record_body(record))
 
+    def pull_request_thread_owners(
+        self,
+    ) -> dict[int, PullRequestThreadOwnerRecord]:
+        # Controller-only actors may advance the delivery pipeline, but they
+        # cannot claim the native thread that originated a pull request.
+        return pull_request_thread_owners(
+            self.registry_comments(), self.trusted_logins
+        )
+
+    def pull_request_thread_owner(
+        self, pull_request: int
+    ) -> PullRequestThreadOwnerRecord | None:
+        return self.pull_request_thread_owners().get(pull_request)
+
+    def claim_pull_request_thread_owner(
+        self, record: PullRequestThreadOwnerRecord
+    ) -> PullRequestThreadOwnerRecord:
+        current = self.pull_request_thread_owner(record.pull_request)
+        if current is not None:
+            return current
+        number = self.registry_issue_number(create=True)
+        if number is None:  # pragma: no cover - create owns this invariant.
+            raise QueueError("could not create DeployBot registry")
+        self.issue_comment(number, pull_request_thread_owner_body(record))
+        # The oldest trusted claim wins if two source agents race. Re-read the
+        # append-only registry instead of assuming this write won ownership.
+        self._registry_comments_cache = None
+        current = self.pull_request_thread_owner(record.pull_request)
+        if current is None:  # pragma: no cover - GitHub accepted the write.
+            raise QueueError("GitHub did not confirm the pull request thread owner")
+        return current
+
     def record_deployment_notification(
         self, record: DeploymentNotificationRecord
     ) -> None:
@@ -2384,7 +2420,19 @@ def integration_ci_active_gate(client: GitHub, entry: QueueEntry) -> str | None:
 def pipeline_status(client: GitHub) -> dict[str, Any]:
     queued = client.queue()
     queued_by_number = {entry.number: entry for entry in queued}
+    raw_thread_owners = client.pull_request_thread_owners()
+    thread_owners = raw_thread_owners if isinstance(raw_thread_owners, dict) else {}
+
+    def add_opening_thread(
+        number: int, value: dict[str, Any]
+    ) -> dict[str, Any]:
+        owner = thread_owners.get(number)
+        if owner is not None:
+            value["opening_thread"] = owner.as_dict()
+        return value
+
     open_numbers = client.open_pull_request_numbers()
+    open_number_set = set(open_numbers)
     inspect_numbers = [
         number for number in open_numbers if number not in queued_by_number
     ]
@@ -2425,7 +2473,9 @@ def pipeline_status(client: GitHub) -> dict[str, Any]:
     }
     for number in open_numbers:
         if number in queued_by_number:
-            value = entry_dict(queued_by_number[number])
+            value = add_opening_thread(
+                number, entry_dict(queued_by_number[number])
+            )
             value["pipeline_stage"] = "queued"
             stages["queued"].append(value)
             continue
@@ -2455,7 +2505,7 @@ def pipeline_status(client: GitHub) -> dict[str, Any]:
             stage = "reviewing"
         else:
             stage = "blocked"
-        value = entry_dict(entry)
+        value = add_opening_thread(number, entry_dict(entry))
         value["pipeline_stage"] = stage
         if client.config.pipeline.intent_label in labels:
             value["deploy_intent"] = (
@@ -2564,9 +2614,16 @@ def pipeline_status(client: GitHub) -> dict[str, Any]:
         "repository": client.repository,
         "control": client.pipeline_control(),
         "threads": client.thread_records(),
+        "pull_request_thread_owners": [
+            value.as_dict()
+            for _, value in sorted(thread_owners.items())
+            if value.pull_request in open_number_set
+        ],
         "notifications": client.deployment_notifications(),
         "pull_requests": stages,
-        "queue": [entry_dict(entry) for entry in queued],
+        "queue": [
+            add_opening_thread(entry.number, entry_dict(entry)) for entry in queued
+        ],
         "overlap_groups": overlap_groups(queued),
         "active_intent_overlap_groups": overlap_groups(
             [entry for entry, _, _ in active_intents]
@@ -2614,12 +2671,29 @@ def command_thread_update(
     pull_request: int | None,
     url: str | None,
 ) -> None:
+    updated_at = utc_now()
+    owner: PullRequestThreadOwnerRecord | None = None
+    if pull_request is not None and phase in PR_OPENING_PHASES:
+        pull = client.pull_head(pull_request)
+        if pull.get("state") != "OPEN":
+            raise QueueError(
+                f"PR #{pull_request} is not open; its opening thread cannot be claimed"
+            )
+        owner = client.claim_pull_request_thread_owner(
+            PullRequestThreadOwnerRecord(
+                provider=provider,
+                thread_id=thread_id,
+                pull_request=pull_request,
+                recorded_at=updated_at,
+                thread_url=url,
+            )
+        )
     client.record_thread(
         ThreadRecord(
             provider=provider,
             thread_id=thread_id,
             phase=phase,
-            updated_at=utc_now(),
+            updated_at=updated_at,
             title=title,
             branch=branch,
             pull_request=pull_request,
@@ -2627,6 +2701,13 @@ def command_thread_update(
         )
     )
     print(f"recorded {provider} thread {thread_id} as {phase}")
+    if owner is not None and (
+        owner.provider.lower() != provider.lower() or owner.thread_id != thread_id
+    ):
+        print(
+            f"PR #{pull_request} remains owned by its opening thread "
+            f"{owner.provider}/{owner.thread_id}"
+        )
 
 
 def thread_notification_id(
@@ -2771,6 +2852,17 @@ def command_request(
 ) -> dict[str, Any]:
     number = client.resolve_pr(selector)
     actor = client.require_actor(client.trusted_logins, "request deployment")
+    owner = client.pull_request_thread_owner(number)
+    if owner is None:
+        raise QueueError(
+            f"PR #{number} has no recorded opening thread; the thread that opened "
+            "the pull request must first run `deploybot thread update --provider "
+            "CLIENT --thread-id ID --phase pr-review --pr "
+            f"{number}`"
+        )
+    notification_provider = owner.provider if owner is not None else None
+    notification_thread_id = owner.thread_id if owner is not None else None
+    notification_thread_url = owner.thread_url if owner is not None else None
     client.ensure_labels_exist()
     entry = client.snapshot(
         number,
@@ -2790,23 +2882,23 @@ def command_request(
             state="requested",
             requested_at=requested_at,
             requested_head=entry.head_sha,
-            provider=provider,
-            thread_id=thread_id,
-            thread_url=thread_url,
+            provider=notification_provider,
+            thread_id=notification_thread_id,
+            thread_url=notification_thread_url,
         ),
     )
     if client.config.pipeline.intent_label not in entry.labels:
         client.add_label(number, client.config.pipeline.intent_label)
-    if provider and thread_id:
+    if notification_provider and notification_thread_id:
         client.record_thread(
             ThreadRecord(
-                provider=provider,
-                thread_id=thread_id,
+                provider=notification_provider,
+                thread_id=notification_thread_id,
                 phase="deploy-requested",
                 updated_at=requested_at,
                 branch=None,
                 pull_request=number,
-                url=thread_url,
+                url=notification_thread_url,
             )
         )
     notify(
@@ -2817,8 +2909,8 @@ def command_request(
             "pull_request": number,
             "head_sha": entry.head_sha,
             "intent_id": intent_id,
-            "provider": provider,
-            "thread_id": thread_id,
+            "provider": notification_provider,
+            "thread_id": notification_thread_id,
         },
     )
     promoted = False
@@ -2836,15 +2928,24 @@ def command_request(
         "state": "queued" if promoted else "deploy-requested",
         "waiting": [] if promoted else entry.reasons or [],
     }
-    if provider and thread_id:
+    if notification_provider and notification_thread_id:
         webhook_env = client.config.pipeline.webhook_url_env
         webhook_ready = bool(webhook_env and os.environ.get(webhook_env))
         result["notification_handoff"] = {
-            "owner": "webhook" if webhook_ready else "source-thread",
+            "owner": "webhook" if webhook_ready else "pr-opening-thread",
             "required_action": (
                 "none"
                 if webhook_ready
-                else "attach-native-follow-up-monitor-before-returning"
+                else "route-native-follow-up-monitor-to-pr-opening-thread"
+            ),
+        }
+        result["notification_thread"] = {
+            "provider": notification_provider,
+            "thread_id": notification_thread_id,
+            **(
+                {"thread_url": notification_thread_url}
+                if notification_thread_url
+                else {}
             ),
         }
     else:
