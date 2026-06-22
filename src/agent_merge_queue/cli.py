@@ -148,8 +148,15 @@ def normalize_check_state(check: dict[str, Any]) -> str:
     return "UNKNOWN"
 
 
+def check_identity(check: dict[str, Any], name: str) -> tuple[str, str]:
+    typename = str(check.get("__typename") or "")
+    if not typename:
+        typename = "StatusContext" if check.get("context") else "CheckRun"
+    return (typename, name)
+
+
 def check_states(checks: Iterable[dict[str, Any]]) -> dict[str, str]:
-    grouped: dict[str, tuple[str, int, str]] = {}
+    grouped: dict[tuple[str, tuple[str, str]], tuple[str, int, str]] = {}
     for index, check in enumerate(checks):
         name = str(check.get("name") or check.get("context") or "")
         if not name:
@@ -168,17 +175,23 @@ def check_states(checks: Iterable[dict[str, Any]]) -> dict[str, str]:
         state = normalize_check_state(check)
         # A newly queued run may not have a timestamp yet. Fail closed instead
         # of letting an older success hide that pending rerun.
-        order = "\uffff" if not timestamp and state not in PASSED_CHECK_STATES else timestamp
+        order = (
+            "\uffff" if not timestamp and state not in PASSED_CHECK_STATES else timestamp
+        )
         candidate = (order, index, state)
-        if name not in grouped or candidate[:2] > grouped[name][:2]:
-            grouped[name] = candidate
+        key = (name, check_identity(check, name))
+        if key not in grouped or candidate[:2] > grouped[key][:2]:
+            grouped[key] = candidate
+
+    states_by_name: dict[str, list[str]] = {}
+    for (name, _identity), value in grouped.items():
+        states_by_name.setdefault(name, []).append(value[2])
 
     result: dict[str, str] = {}
-    for name, value in grouped.items():
-        state = value[2]
-        if state in FAILED_CHECK_STATES:
+    for name, states in states_by_name.items():
+        if any(state in FAILED_CHECK_STATES for state in states):
             result[name] = "failed"
-        elif state in PASSED_CHECK_STATES:
+        elif all(state in PASSED_CHECK_STATES for state in states):
             result[name] = "passed"
         else:
             result[name] = "pending"
