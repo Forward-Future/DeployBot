@@ -10,6 +10,7 @@ from typing import Any, Iterable
 
 
 THREAD_PREFIX = "deploybot-thread:v1"
+PR_THREAD_OWNER_PREFIX = "deploybot-pr-thread-owner:v1"
 INTENT_PREFIX = "deploybot-intent:v1"
 REPAIR_PREFIX = "deploybot-repair:v1"
 RELEASE_REPAIR_PREFIX = "deploybot-release-repair:v1"
@@ -60,6 +61,9 @@ def _marker(prefix: str, prose: str) -> re.Pattern[str]:
 
 
 THREAD_MARKER = _marker(THREAD_PREFIX, "Recorded DeployBot thread metadata.")
+PR_THREAD_OWNER_MARKER = _marker(
+    PR_THREAD_OWNER_PREFIX, "Recorded DeployBot pull request thread owner."
+)
 INTENT_MARKER = _marker(INTENT_PREFIX, "Recorded DeployBot deploy intent.")
 REPAIR_MARKER = _marker(REPAIR_PREFIX, "Recorded DeployBot repair handoff.")
 RELEASE_REPAIR_MARKER = _marker(
@@ -197,6 +201,18 @@ class ThreadRecord:
 
 
 @dataclass(frozen=True)
+class PullRequestThreadOwnerRecord:
+    provider: str
+    thread_id: str
+    pull_request: int
+    recorded_at: str
+    thread_url: str | None = None
+
+    def as_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
 class DeploymentNotificationRecord:
     notification_id: str
     provider: str
@@ -230,6 +246,21 @@ def thread_record_body(record: ThreadRecord) -> str:
         raise ValueError("provider and thread_id are required")
     payload = {"schema": 1, **record.as_dict()}
     return marker_body(THREAD_PREFIX, payload, "Recorded DeployBot thread metadata.")
+
+
+def pull_request_thread_owner_body(record: PullRequestThreadOwnerRecord) -> str:
+    if not record.provider.strip() or not record.thread_id.strip():
+        raise ValueError("provider and thread_id are required")
+    if record.pull_request <= 0:
+        raise ValueError("pull_request must be positive")
+    if parse_time(record.recorded_at) is None:
+        raise ValueError("recorded_at must be an ISO-8601 timestamp")
+    payload = {"schema": 1, **record.as_dict()}
+    return marker_body(
+        PR_THREAD_OWNER_PREFIX,
+        payload,
+        "Recorded DeployBot pull request thread owner.",
+    )
 
 
 def deployment_notification_body(record: DeploymentNotificationRecord) -> str:
@@ -334,6 +365,49 @@ def latest_deployment_notifications(
     if not include_delivered:
         records = [record for record in records if record.state == "pending"]
     return sorted(records, key=lambda value: value.updated_at, reverse=True)
+
+
+def pull_request_thread_owners(
+    comments: Iterable[dict[str, Any]],
+    trusted_logins: Iterable[str],
+) -> dict[int, PullRequestThreadOwnerRecord]:
+    """Return the first trusted native thread bound to each pull request."""
+    trusted = {value.lower() for value in trusted_logins}
+    candidates: dict[
+        int, list[tuple[tuple[str, int, int], PullRequestThreadOwnerRecord]]
+    ] = {}
+    for index, comment in enumerate(comments):
+        if comment_login(comment) not in trusted:
+            continue
+        value = _payload(str(comment.get("body") or ""), PR_THREAD_OWNER_MARKER)
+        if value is None:
+            continue
+        try:
+            record = PullRequestThreadOwnerRecord(
+                provider=str(value["provider"]),
+                thread_id=str(value["thread_id"]),
+                pull_request=int(value["pull_request"]),
+                recorded_at=str(value["recorded_at"]),
+                thread_url=(
+                    str(value["thread_url"]) if value.get("thread_url") else None
+                ),
+            )
+        except (KeyError, TypeError, ValueError):
+            continue
+        if (
+            not record.provider.strip()
+            or not record.thread_id.strip()
+            or record.pull_request <= 0
+            or parse_time(record.recorded_at) is None
+        ):
+            continue
+        candidates.setdefault(record.pull_request, []).append(
+            (_comment_key(comment, index), record)
+        )
+    return {
+        pull_request: min(values, key=lambda item: item[0])[1]
+        for pull_request, values in candidates.items()
+    }
 
 
 def latest_thread_records(

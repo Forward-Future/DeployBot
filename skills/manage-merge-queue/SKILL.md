@@ -16,6 +16,9 @@ the repository's policy; never assume a particular review vendor.
 4. Wait for every configured exact-head check and review provider.
 5. Read all actionable review findings and fix valid issues. Return the PR to
    draft before any replacement push, then repeat the final review once.
+6. Immediately after opening the PR, call `update_agent_thread` in `pr-draft`,
+   `pr-review`, or `ready` phase with its number so this opening thread becomes
+   the immutable repair and deployment-receipt destination.
 
 Do not merge merely because review is complete.
 
@@ -23,7 +26,8 @@ Do not merge merely because review is complete.
 
 Treat the user's exact `deploy` instruction as authority for this thread's PR
 only. Call `request_deployment` through the DeployBot MCP server, or run
-`deploybot request <pr-number> --provider <client> --thread-id <stable-id>`.
+`deploybot request <pr-number>`. DeployBot uses the recorded PR-opening thread;
+a coordinator must never substitute its own thread ID.
 This records intent immediately. If review fixes change the head, call
 `refresh_deployment_request` only after its fresh checks and review pass; the
 event worker then promotes that exact head without another user instruction.

@@ -32,6 +32,7 @@ from agent_merge_queue.cli import (
     command_request,
     command_resume,
     command_thread_acknowledge,
+    command_thread_update,
     command_unblock,
     command_unpause,
     completed_batch_ids,
@@ -72,6 +73,7 @@ from agent_merge_queue.cli import (
 )
 from agent_merge_queue.config import parse_config
 from agent_merge_queue.records import (
+    PullRequestThreadOwnerRecord,
     ThreadRecord,
     control_body,
     integration_body,
@@ -424,6 +426,14 @@ class QueueCoreTest(unittest.TestCase):
         client.workflow_runs_for_workflows.return_value = []
         client.pipeline_control.return_value = {"state": "running"}
         client.thread_records.return_value = []
+        client.pull_request_thread_owners.return_value = {
+            1: PullRequestThreadOwnerRecord(
+                provider="codex",
+                thread_id="opening-thread",
+                pull_request=1,
+                recorded_at="2026-06-19T23:00:00Z",
+            )
+        }
         client.deployment_notifications.return_value = []
         client.registry_comments.return_value = []
 
@@ -448,6 +458,16 @@ class QueueCoreTest(unittest.TestCase):
         self.assertEqual({alert["pull_request"] for alert in result["alerts"]}, {1, 2})
         self.assertTrue(
             all(alert["stage"] == "request-to-ready" for alert in result["alerts"])
+        )
+        self.assertEqual(
+            result["pull_requests"]["deploy_requested"][0]["opening_thread"][
+                "thread_id"
+            ],
+            "opening-thread",
+        )
+        self.assertEqual(
+            result["pull_request_thread_owners"][0]["thread_id"],
+            "opening-thread",
         )
 
     def test_overlap_mode_holds_only_ready_members_of_near_ready_components(
@@ -3189,6 +3209,13 @@ class QueueCoreTest(unittest.TestCase):
         client.trusted_logins = {"trusted"}
         client.resolve_pr.return_value = 1
         client.require_actor.return_value = "trusted"
+        client.pull_request_thread_owner.return_value = PullRequestThreadOwnerRecord(
+            provider="cursor",
+            thread_id="opening-thread",
+            pull_request=1,
+            recorded_at="2026-06-19T23:00:00Z",
+            thread_url="https://example.test/opening-thread",
+        )
         client.snapshot.return_value = value
         with (
             patch("agent_merge_queue.cli.utc_now", return_value="2026-06-20T00:00:00Z"),
@@ -3198,22 +3225,108 @@ class QueueCoreTest(unittest.TestCase):
                 client,
                 "1",
                 provider="codex",
-                thread_id="thread-1",
+                thread_id="deploy-coordinator",
                 thread_url=None,
             )
         self.assertEqual(result["state"], "deploy-requested")
         self.assertEqual(
             result["notification_handoff"],
             {
-                "owner": "source-thread",
-                "required_action": (
-                    "attach-native-follow-up-monitor-before-returning"
-                ),
+                "owner": "pr-opening-thread",
+                "required_action": "route-native-follow-up-monitor-to-pr-opening-thread",
+            },
+        )
+        self.assertEqual(
+            result["notification_thread"],
+            {
+                "provider": "cursor",
+                "thread_id": "opening-thread",
+                "thread_url": "https://example.test/opening-thread",
             },
         )
         self.assertIn("deploybot-intent:v1", client.comment.call_args.args[1])
+        self.assertIn('"provider": "cursor"', client.comment.call_args.args[1])
+        self.assertIn('"thread_id": "opening-thread"', client.comment.call_args.args[1])
+        self.assertNotIn("deploy-coordinator", client.comment.call_args.args[1])
         client.add_label.assert_called_with(1, "deploy-requested")
         client.record_thread.assert_called_once()
+        record = client.record_thread.call_args.args[0]
+        self.assertEqual((record.provider, record.thread_id), ("cursor", "opening-thread"))
+
+    def test_request_rejects_pr_with_no_opening_thread(self) -> None:
+        client = Mock()
+        client.trusted_logins = {"trusted"}
+        client.resolve_pr.return_value = 1
+        client.require_actor.return_value = "trusted"
+        client.pull_request_thread_owner.return_value = None
+
+        with self.assertRaisesRegex(QueueError, "has no recorded opening thread"):
+            command_request(
+                client,
+                "1",
+                provider=None,
+                thread_id=None,
+                thread_url=None,
+            )
+
+        client.comment.assert_not_called()
+
+    def test_pr_review_update_claims_opening_thread_once(self) -> None:
+        client = Mock()
+        client.pull_head.return_value = {"state": "OPEN"}
+        client.claim_pull_request_thread_owner.side_effect = lambda record: record
+
+        with (
+            patch("agent_merge_queue.cli.utc_now", return_value="2026-06-20T00:00:00Z"),
+            redirect_stdout(io.StringIO()),
+        ):
+            command_thread_update(
+                client,
+                provider="codex",
+                thread_id="opening-thread",
+                phase="pr-review",
+                title="A useful change",
+                branch="codex/useful-change",
+                pull_request=42,
+                url="https://example.test/thread/42",
+            )
+
+        owner = client.claim_pull_request_thread_owner.call_args.args[0]
+        self.assertEqual(owner.pull_request, 42)
+        self.assertEqual(owner.thread_id, "opening-thread")
+        client.record_thread.assert_called_once()
+
+    def test_pr_thread_owner_claim_requires_an_open_pull_request(self) -> None:
+        client = Mock()
+        client.pull_head.return_value = {"state": "CLOSED"}
+
+        with self.assertRaisesRegex(QueueError, "PR #42 is not open"):
+            command_thread_update(
+                client,
+                provider="codex",
+                thread_id="opening-thread",
+                phase="pr-review",
+                title=None,
+                branch=None,
+                pull_request=42,
+                url=None,
+            )
+
+        client.claim_pull_request_thread_owner.assert_not_called()
+        client.record_thread.assert_not_called()
+
+    def test_pr_thread_owners_exclude_controller_only_actors(self) -> None:
+        client = object.__new__(GitHub)
+        client.trusted_logins = {"trusted-source"}
+        client.coordinator_logins = {"trusted-source", "actions-coordinator"}
+        client.registry_comments = Mock(return_value=[])
+
+        with patch(
+            "agent_merge_queue.cli.pull_request_thread_owners", return_value={}
+        ) as parse:
+            self.assertEqual(client.pull_request_thread_owners(), {})
+
+        parse.assert_called_once_with([], {"trusted-source"})
 
     def test_promote_queues_ready_intent_but_leaves_waiting_visible(self) -> None:
         ready = entry(1)
