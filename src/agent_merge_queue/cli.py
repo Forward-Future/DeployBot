@@ -103,6 +103,14 @@ FAILED_CHECK_STATES = {
 }
 PASSED_CHECK_STATES = {"NEUTRAL", "SKIPPED", "SUCCESS"}
 MERGEABILITY_RETRIES = 6
+SUPERSEDED_CONTROLLER_PAUSES = (
+    "ci-failed on ",
+    "deploy-failed on ",
+    "integration CI ownership failed: ",
+    "post-merge CI dispatch failed: ",
+    "release workflow dispatch failed: ",
+    "verify-failed on ",
+)
 REVIEW_THREADS_QUERY = """
 query($owner: String!, $name: String!, $number: Int!) {
   repository(owner: $owner, name: $name) {
@@ -3512,6 +3520,94 @@ def record_integration_conflict_repair(
     return repair
 
 
+def record_integration_ci_repair(
+    client: GitHub,
+    result: dict[str, Any],
+) -> dict[str, Any] | None:
+    """Block only one failed integration batch and elect its repair owner."""
+
+    integration_number = int(result["pull_request"])
+    integration = result.get("integration")
+    if not isinstance(integration, dict):
+        raise QueueError(
+            f"integration PR #{integration_number} CI repair is missing membership"
+        )
+    frozen_heads_value = integration.get("heads")
+    frozen_numbers_value = integration.get("pull_requests")
+    if not isinstance(frozen_heads_value, dict) or not isinstance(
+        frozen_numbers_value, list
+    ):
+        raise QueueError(
+            f"integration PR #{integration_number} CI repair is missing frozen membership"
+        )
+    frozen_heads = {
+        str(number): str(head_sha)
+        for number, head_sha in frozen_heads_value.items()
+    }
+    frozen_numbers = [int(number) for number in frozen_numbers_value]
+    if set(frozen_heads) != {str(number) for number in frozen_numbers}:
+        raise QueueError(
+            f"integration PR #{integration_number} CI repair has inconsistent frozen members"
+        )
+
+    reason = str(result.get("reason") or "integration CI failed")
+    owner: QueueEntry | None = None
+    owner_intent: dict[str, Any] | None = None
+    for number in frozen_numbers:
+        try:
+            candidate = client.snapshot(
+                number,
+                require_marker=False,
+                allow_blocked_label=True,
+            )
+        except QueueError:
+            continue
+        intent = latest_intent(client.comments(number), client.trusted_logins)
+        if (
+            intent
+            and intent.get("state") == "requested"
+            and intent.get("provider")
+            and intent.get("thread_id")
+        ):
+            owner = candidate
+            owner_intent = intent
+            break
+        if owner is None:
+            owner = candidate
+            owner_intent = intent
+    if owner is None:
+        return None
+
+    repair = record_repair(
+        client,
+        owner,
+        owner_intent,
+        reason,
+        resume_pull_request=integration_number,
+        source_heads=frozen_heads,
+        source_pull_requests=frozen_numbers,
+    )
+    # Publish the terminal integration marker only after the durable repair
+    # handoff exists. If source reads or notification writes fail, the clean
+    # marker remains retryable on the next reconciliation.
+    failed_marker = {key: value for key, value in integration.items() if key != "schema"}
+    failed_marker["conflict"] = {
+        "number": integration_number,
+        "reason": reason,
+    }
+    failed_marker["failed_at"] = utc_now()
+    client.comment(integration_number, integration_body(failed_marker))
+    integration_labels = client.labels(integration_number)
+    if client.config.blocked_label not in integration_labels:
+        client.add_label(integration_number, client.config.blocked_label)
+    result["repair_owner"] = {
+        "pull_request": owner.number,
+        "provider": repair.get("provider"),
+        "thread_id": repair.get("thread_id"),
+    }
+    return repair
+
+
 def reconcile_externally_merged_threads(client: GitHub) -> list[dict[str, Any]]:
     reconciled: list[dict[str, Any]] = []
     records = client.thread_records()
@@ -3850,6 +3946,7 @@ def settle_integration_checks(
         selected = [int(value) for value in numbers]
     configured = tuple(client.config.pipeline.ci_workflows)
     targets: dict[int, dict[str, Any]] = {}
+    results: list[dict[str, Any]] = []
     for number in selected:
         comments = client.comments(number)
         integration = latest_payload(
@@ -3862,16 +3959,39 @@ def settle_integration_checks(
         pull = client.pull_head(number)
         branch = str(pull.get("branch") or "")
         head_sha = str(pull.get("head_sha") or "")
+        if pull.get("state") == "MERGED":
+            results.append(
+                {
+                    "branch": branch,
+                    "dispatched_ci": [],
+                    "head_sha": head_sha,
+                    "integration": integration,
+                    "pull_request": number,
+                    "state": "merged",
+                }
+            )
+            continue
         if pull.get("state") != "OPEN" or not branch or not head_sha:
-            raise QueueError(f"integration PR #{number} is no longer open")
+            results.append(
+                {
+                    "branch": branch,
+                    "dispatched_ci": [],
+                    "head_sha": head_sha,
+                    "integration": integration,
+                    "pull_request": number,
+                    "reason": f"integration PR #{number} is no longer open",
+                    "state": "blocked",
+                }
+            )
+            continue
         targets[number] = {
             "branch": branch,
             "dispatched": [],
             "head_sha": head_sha,
+            "integration": integration,
             "requested": set(),
         }
 
-    results: list[dict[str, Any]] = []
     pending = dict(targets)
     deadline = time.monotonic() + timeout_seconds
     while pending:
@@ -3879,12 +3999,50 @@ def settle_integration_checks(
             branch = str(target["branch"])
             head_sha = str(target["head_sha"])
             current = client.pull_head(number)
-            if current.get("state") != "OPEN":
-                raise QueueError(f"integration PR #{number} is no longer open")
-            if current.get("head_sha") != head_sha:
-                raise QueueError(
-                    f"integration PR #{number} changed while CI ownership was active"
+            if current.get("state") == "MERGED":
+                results.append(
+                    {
+                        "branch": branch,
+                        "dispatched_ci": target["dispatched"],
+                        "head_sha": head_sha,
+                        "integration": target["integration"],
+                        "pull_request": number,
+                        "state": "merged",
+                    }
                 )
+                del pending[number]
+                continue
+            if current.get("state") != "OPEN":
+                results.append(
+                    {
+                        "branch": branch,
+                        "dispatched_ci": target["dispatched"],
+                        "head_sha": head_sha,
+                        "integration": target["integration"],
+                        "pull_request": number,
+                        "reason": f"integration PR #{number} is no longer open",
+                        "state": "blocked",
+                    }
+                )
+                del pending[number]
+                continue
+            if current.get("head_sha") != head_sha:
+                results.append(
+                    {
+                        "branch": branch,
+                        "dispatched_ci": target["dispatched"],
+                        "head_sha": head_sha,
+                        "integration": target["integration"],
+                        "pull_request": number,
+                        "reason": (
+                            f"integration PR #{number} changed while CI ownership "
+                            "was active"
+                        ),
+                        "state": "blocked",
+                    }
+                )
+                del pending[number]
+                continue
             runs = client.workflow_runs_for_branch(branch)
             latest = latest_exact_workflow_runs(
                 runs,
@@ -3898,9 +4056,22 @@ def settle_integration_checks(
                 and str(run.get("conclusion") or "") != "success"
             ]
             if failed:
-                raise QueueError(
-                    f"integration PR #{number} CI failed: " + ", ".join(failed)
+                results.append(
+                    {
+                        "branch": branch,
+                        "dispatched_ci": target["dispatched"],
+                        "head_sha": head_sha,
+                        "integration": target["integration"],
+                        "pull_request": number,
+                        "reason": (
+                            f"integration PR #{number} CI failed: "
+                            + ", ".join(failed)
+                        ),
+                        "state": "blocked",
+                    }
                 )
+                del pending[number]
+                continue
             missing = [name for name in configured if name not in latest]
             undispatched = [
                 name for name in missing if name not in target["requested"]
@@ -3943,16 +4114,39 @@ def settle_integration_checks(
                     del pending[number]
                     continue
                 if entry.state == "blocked":
-                    raise QueueError(
-                        f"integration PR #{number} is blocked: "
-                        + "; ".join(entry.reasons or ["unknown gate"])
+                    results.append(
+                        {
+                            "branch": branch,
+                            "dispatched_ci": target["dispatched"],
+                            "head_sha": head_sha,
+                            "integration": target["integration"],
+                            "pull_request": number,
+                            "reason": (
+                                f"integration PR #{number} is blocked: "
+                                + "; ".join(entry.reasons or ["unknown gate"])
+                            ),
+                            "state": "blocked",
+                        }
                     )
+                    del pending[number]
+                    continue
         if not pending:
             break
         if time.monotonic() >= deadline:
-            numbers = ", ".join(f"#{number}" for number in pending)
-            noun = "PR" if len(pending) == 1 else "PRs"
-            raise QueueError(f"integration {noun} {numbers} CI timed out")
+            for number, target in list(pending.items()):
+                results.append(
+                    {
+                        "branch": target["branch"],
+                        "dispatched_ci": target["dispatched"],
+                        "head_sha": target["head_sha"],
+                        "integration": target["integration"],
+                        "pull_request": number,
+                        "reason": f"integration PR #{number} CI timed out",
+                        "state": "pending",
+                    }
+                )
+                del pending[number]
+            break
         time.sleep(poll_seconds)
     return results
 
@@ -5505,9 +5699,30 @@ def command_react(
 ) -> dict[str, Any]:
     control = client.pipeline_control()
     if control.get("state") == "paused":
-        result = {"state": "paused", "reason": control.get("reason")}
-        print(json.dumps(result, indent=2, sort_keys=True))
-        return result
+        paused_main = str(control.get("main_sha") or "")
+        current_main = client.base_sha()
+        verified_main = client.verified_main_sha()
+        if (
+            paused_main
+            and str(control.get("reason") or "").startswith(
+                SUPERSEDED_CONTROLLER_PAUSES
+            )
+            and current_main != paused_main
+            and verified_main == current_main
+            and client.is_ancestor(paused_main, current_main)
+        ):
+            control_id = str(control.get("control_id") or "")
+            if control_id:
+                client.set_pipeline_control(
+                    "running",
+                    f"newer verified main {current_main} supersedes paused {paused_main}",
+                    resumes_control_id=control_id,
+                )
+                control = client.pipeline_control()
+        if control.get("state") == "paused":
+            result = {"state": "paused", "reason": control.get("reason")}
+            print(json.dumps(result, indent=2, sort_keys=True))
+            return result
 
     # An authorized PR may have landed outside the controller. Materialize its
     # durable release obligation before deciding whether an empty watermark
@@ -5655,18 +5870,25 @@ def command_react(
         numbers: Iterable[int] | None = None,
     ) -> list[dict[str, Any]]:
         try:
-            return settle_integration_checks(
+            results = settle_integration_checks(
                 client,
                 timeout_seconds=timeout_seconds,
                 poll_seconds=10,
                 numbers=numbers,
             )
         except QueueError as error:
+            # Ordinary integration gate failures are returned as batch-local
+            # results. Unexpected API, dispatch, or consistency failures still
+            # honor the configured fail-closed pipeline policy.
             if client.config.pipeline.pause_on_failure:
                 client.set_pipeline_control(
                     "paused", "integration CI ownership failed: " + str(error)
                 )
             raise
+        for result in results:
+            if result.get("state") == "blocked":
+                record_integration_ci_repair(client, result)
+        return results
 
     integration_checks = own_integration_checks()
     promoted_integrations = promote_integrations(

@@ -79,3 +79,8 @@ jobs:
           persist-credentials: false
       # v0.2.21 implementation; keep the full commit for privileged workflows.
       - uses: Forward-Future/DeployBot@ecc5f60e90d6201daddf3764be60cb7122360722
+        with:
+          # PR and review events reconcile quickly. Only release-owner events
+          # stay attached to cumulative main through CI and deployment.
+          follow: ${{ github.event_name == 'workflow_run' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
+          timeout: ${{ (github.event_name == 'workflow_run' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && '2400' || '600' }}

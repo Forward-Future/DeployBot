@@ -175,6 +175,8 @@ class DeployBotSkillTest(unittest.TestCase):
         self.assertIn("github.event.check_suite.app.slug != 'github-actions'", workflow)
         self.assertIn("github.event.check_suite.pull_requests[0].base.ref", workflow)
         self.assertIn("persist-credentials: false", workflow)
+        self.assertIn("follow: ${{ github.event_name == 'workflow_run'", workflow)
+        self.assertIn("&& '2400' || '600'", workflow)
 
     def test_workflows_pin_current_checkout_runtime(self) -> None:
         paths = [

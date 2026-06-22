@@ -2,13 +2,22 @@
 
 from __future__ import annotations
 
+import base64
 import json
+import re
 import shutil
 import subprocess
 from pathlib import Path
 from typing import Any
 
+from . import __version__
 from .config import ConfigError, QueueConfig, load_config
+
+
+DEPLOYBOT_ACTION = re.compile(
+    r"uses:\s*Forward-Future/DeployBot@([0-9a-f]{40})\b", re.IGNORECASE
+)
+PACKAGE_VERSION = re.compile(r'^version\s*=\s*"([^"]+)"', re.MULTILINE)
 
 
 def row(
@@ -37,6 +46,16 @@ def _json(*arguments: str, cwd: Path) -> tuple[int, Any, str]:
         return 0, json.loads(output), ""
     except json.JSONDecodeError:
         return 1, None, "GitHub returned invalid JSON"
+
+
+def _decoded_content(value: Any) -> str | None:
+    encoded = str((value or {}).get("content") or "")
+    if not encoded:
+        return None
+    try:
+        return base64.b64decode(encoded).decode("utf-8")
+    except (ValueError, UnicodeDecodeError):
+        return None
 
 
 def diagnose(
@@ -165,6 +184,48 @@ def diagnose(
                 else "Install examples/github-workflow.yml on the default branch.",
             )
         )
+        if installed:
+            workflow_path = str(installed[0].get("path") or "").lstrip("/")
+            code, workflow_file, _ = _json(
+                "api", f"repos/{repo}/contents/{workflow_path}", cwd=root
+            )
+            workflow_text = _decoded_content(workflow_file) if code == 0 else None
+            action_match = DEPLOYBOT_ACTION.search(workflow_text or "")
+            hosted_version: str | None = None
+            if action_match:
+                action_sha = action_match.group(1)
+                code, package_file, _ = _json(
+                    "api",
+                    "repos/Forward-Future/DeployBot/contents/pyproject.toml"
+                    f"?ref={action_sha}",
+                    cwd=root,
+                )
+                package_text = _decoded_content(package_file) if code == 0 else None
+                version_match = PACKAGE_VERSION.search(package_text or "")
+                hosted_version = version_match.group(1) if version_match else None
+            if hosted_version:
+                rows.append(
+                    row(
+                        "controller-version",
+                        "ok" if hosted_version == __version__ else "warn",
+                        f"Hosted workflow runs v{hosted_version}; local tool is "
+                        f"v{__version__}",
+                        (
+                            None
+                            if hosted_version == __version__
+                            else "Pin the reviewed current DeployBot action commit."
+                        ),
+                    )
+                )
+            else:
+                rows.append(
+                    row(
+                        "controller-version",
+                        "warn",
+                        "Could not identify the hosted DeployBot action version",
+                        "Use an immutable 40-character Forward-Future/DeployBot pin.",
+                    )
+                )
 
     if (
         config.integration.mode in {"overlap", "all"}
