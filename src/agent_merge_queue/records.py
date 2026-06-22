@@ -158,6 +158,13 @@ def latest_control(
                 and state.get("control_id") == requires_control_id
             ):
                 continue
+            if not requires_control_id and _restates_recovered_failure(state, value):
+                # A lagging worker (for example a workflow pinned to an older
+                # release) can reread the already-recovered failure and write a
+                # fresh unconditional pause for the same SHA. Preserve the active
+                # recovery so the elected repair can still merge instead of
+                # latching the pipeline back onto the failed release.
+                continue
             state = value
             continue
         if value.get("state") != "running":
@@ -177,8 +184,43 @@ def latest_control(
             state.get("state") == "paused"
             and state.get("control_id") == resumed_control_id
         ):
-            state = value
+            state = _resume_with_recovery_context(state, value)
     return state
+
+
+def _resume_with_recovery_context(
+    resumed_pause: dict[str, Any], resume: dict[str, Any]
+) -> dict[str, Any]:
+    """Record which failure a recovery resumed so a stale re-pause cannot win."""
+    recovery = dict(resume)
+    if "recovered_main_sha" not in recovery and resumed_pause.get("main_sha"):
+        recovery["recovered_main_sha"] = resumed_pause["main_sha"]
+    if "recovered_reason" not in recovery and resumed_pause.get("reason"):
+        recovery["recovered_reason"] = resumed_pause["reason"]
+    return recovery
+
+
+def _restates_recovered_failure(
+    state: dict[str, Any], pause: dict[str, Any]
+) -> bool:
+    """True when an unconditional pause merely repeats an already-recovered failure.
+
+    A recovery (the running record an unpause writes) records the exact SHA and
+    failure reason it resumed. The original failing CI result lingers until the
+    repair merges, so any worker that rereads it produces a byte-identical pause
+    for that same SHA and reason. That restatement is stale and must not clear
+    the recovery; a genuinely new failure (a different SHA or a different
+    reason such as a later deploy failure) still pauses normally.
+    """
+    recovered_main_sha = state.get("recovered_main_sha")
+    recovered_reason = state.get("recovered_reason")
+    return bool(
+        state.get("state") == "running"
+        and recovered_main_sha
+        and recovered_reason
+        and pause.get("main_sha") == recovered_main_sha
+        and pause.get("reason") == recovered_reason
+    )
 
 
 @dataclass(frozen=True)
