@@ -179,6 +179,34 @@ def check_states(checks: Iterable[dict[str, Any]]) -> dict[str, str]:
     return result
 
 
+def latest_exact_workflow_runs(
+    runs: Iterable[dict[str, Any]],
+    names: Iterable[str],
+    *,
+    head_sha: str,
+    event: str = "workflow_dispatch",
+) -> dict[str, dict[str, Any]]:
+    configured = set(names)
+    latest: dict[str, dict[str, Any]] = {}
+    for run in runs:
+        name = str(run.get("name") or "")
+        if (
+            name not in configured
+            or str(run.get("head_sha") or "") != head_sha
+            or str(run.get("event") or "") != event
+        ):
+            continue
+        previous = latest.get(name)
+        key = (str(run.get("created_at") or ""), int(run.get("id") or 0))
+        previous_key = (
+            str((previous or {}).get("created_at") or ""),
+            int((previous or {}).get("id") or 0),
+        )
+        if previous is None or key > previous_key:
+            latest[name] = run
+    return latest
+
+
 def trusted_comment(
     comment: dict[str, Any],
     trusted_logins: str | Iterable[str],
@@ -2312,6 +2340,37 @@ def command_inspect(
     return entry
 
 
+def integration_ci_active_gate(client: GitHub, entry: QueueEntry) -> str | None:
+    pull = client.pull_head(entry.number)
+    branch = str(pull.get("branch") or "")
+    head_sha = str(pull.get("head_sha") or "")
+    if pull.get("state") != "OPEN" or not branch:
+        return "integration pull request is no longer open"
+    if head_sha != entry.head_sha:
+        return "integration head changed while waiting for exact CI"
+    configured = tuple(client.config.pipeline.ci_workflows)
+    latest = latest_exact_workflow_runs(
+        client.workflow_runs_for_branch(branch),
+        configured,
+        head_sha=head_sha,
+    )
+    waiting: list[str] = []
+    for name in configured:
+        run = latest.get(name)
+        if run is None:
+            waiting.append(f"{name} has not been dispatched")
+            continue
+        status = str(run.get("status") or "pending")
+        conclusion = str(run.get("conclusion") or "")
+        if status != "completed":
+            waiting.append(f"{name} is {status.replace('_', ' ')}")
+        elif conclusion != "success":
+            waiting.append(f"{name} {conclusion or 'failed'}")
+    if waiting:
+        return "waiting for exact integration CI: " + "; ".join(waiting)
+    return None
+
+
 def pipeline_status(client: GitHub) -> dict[str, Any]:
     queued = client.queue()
     queued_by_number = {entry.number: entry for entry in queued}
@@ -2430,6 +2489,12 @@ def pipeline_status(client: GitHub) -> dict[str, Any]:
     now = datetime.now(timezone.utc)
     alerts: list[dict[str, Any]] = []
     queue_target = client.config.pipeline.ready_to_merge_target_minutes * 60
+    integration_values = client.integration_pull_request_numbers()
+    integration_numbers = (
+        {int(value) for value in integration_values}
+        if isinstance(integration_values, list)
+        else set()
+    )
     for entry, intent, value in active_intents:
         timestamp = parse_time(str(intent.get("requested_at") or ""))
         elapsed = (now - timestamp).total_seconds() if timestamp else None
@@ -2458,13 +2523,16 @@ def pipeline_status(client: GitHub) -> dict[str, Any]:
         timestamp = parse_time(entry.queued_at)
         elapsed = (now - timestamp).total_seconds() if timestamp else None
         if elapsed is not None and elapsed > queue_target:
+            active_gate = "; ".join(entry.reasons or []) or "merge worker"
+            if not entry.reasons and entry.number in integration_numbers:
+                active_gate = integration_ci_active_gate(client, entry) or active_gate
             alerts.append(
                 {
                     "stage": "queued-to-merge",
                     "pull_request": entry.number,
                     "elapsed_seconds": elapsed,
                     "target_seconds": queue_target,
-                    "active_gate": "; ".join(entry.reasons or []) or "merge worker",
+                    "active_gate": active_gate,
                 }
             )
     if delivery["state"] not in {"verified", "testing"}:
@@ -3210,8 +3278,8 @@ def settle_integration_checks(
         selected = [int(value) for value in values]
     else:
         selected = [int(value) for value in numbers]
-    results: list[dict[str, Any]] = []
     configured = tuple(client.config.pipeline.ci_workflows)
+    targets: dict[int, dict[str, Any]] = {}
     for number in selected:
         comments = client.comments(number)
         integration = latest_payload(
@@ -3226,9 +3294,20 @@ def settle_integration_checks(
         head_sha = str(pull.get("head_sha") or "")
         if pull.get("state") != "OPEN" or not branch or not head_sha:
             raise QueueError(f"integration PR #{number} is no longer open")
-        deadline = time.monotonic() + timeout_seconds
-        dispatched: list[dict[str, Any]] = []
-        while True:
+        targets[number] = {
+            "branch": branch,
+            "dispatched": [],
+            "head_sha": head_sha,
+            "requested": set(),
+        }
+
+    results: list[dict[str, Any]] = []
+    pending = dict(targets)
+    deadline = time.monotonic() + timeout_seconds
+    while pending:
+        for number, target in list(pending.items()):
+            branch = str(target["branch"])
+            head_sha = str(target["head_sha"])
             current = client.pull_head(number)
             if current.get("state") != "OPEN":
                 raise QueueError(f"integration PR #{number} is no longer open")
@@ -3237,71 +3316,69 @@ def settle_integration_checks(
                     f"integration PR #{number} changed while CI ownership was active"
                 )
             runs = client.workflow_runs_for_branch(branch)
-            latest: dict[str, dict[str, Any]] = {}
-            for run in runs:
-                name = str(run.get("name") or "")
-                if (
-                    name not in configured
-                    or str(run.get("head_sha") or "") != head_sha
-                    or str(run.get("event") or "") != "workflow_dispatch"
-                ):
-                    continue
-                previous = latest.get(name)
-                key = (str(run.get("created_at") or ""), int(run.get("id") or 0))
-                previous_key = (
-                    str((previous or {}).get("created_at") or ""),
-                    int((previous or {}).get("id") or 0),
+            latest = latest_exact_workflow_runs(
+                runs,
+                configured,
+                head_sha=head_sha,
+            )
+            failed = [
+                name
+                for name, run in latest.items()
+                if str(run.get("status") or "") == "completed"
+                and str(run.get("conclusion") or "") != "success"
+            ]
+            if failed:
+                raise QueueError(
+                    f"integration PR #{number} CI failed: " + ", ".join(failed)
                 )
-                if previous is None or key > previous_key:
-                    latest[name] = run
             missing = [name for name in configured if name not in latest]
-            if missing:
-                dispatched.extend(
-                    client.dispatch_ci_workflows(ref=branch, names=missing)
+            undispatched = [
+                name for name in missing if name not in target["requested"]
+            ]
+            if undispatched:
+                target["dispatched"].extend(
+                    client.dispatch_ci_workflows(ref=branch, names=undispatched)
                 )
-            else:
-                failed = [
-                    name
-                    for name, run in latest.items()
-                    if str(run.get("status") or "") == "completed"
-                    and str(run.get("conclusion") or "") != "success"
-                ]
-                if failed:
+                target["requested"].update(undispatched)
+            if missing:
+                continue
+            if all(
+                str(run.get("status") or "") == "completed"
+                and str(run.get("conclusion") or "") == "success"
+                for run in latest.values()
+            ):
+                exact_checks = check_states(client.commit_check_runs(head_sha))
+                entry = client.snapshot(
+                    number,
+                    require_marker=False,
+                    allow_blocked_label=True,
+                    known_checks=exact_checks,
+                )
+                if entry.state == "ready":
+                    results.append(
+                        {
+                            "branch": branch,
+                            "dispatched_ci": target["dispatched"],
+                            "checks": exact_checks,
+                            "head_sha": head_sha,
+                            "pull_request": number,
+                            "state": "ready",
+                        }
+                    )
+                    del pending[number]
+                    continue
+                if entry.state == "blocked":
                     raise QueueError(
-                        f"integration PR #{number} CI failed: " + ", ".join(failed)
+                        f"integration PR #{number} is blocked: "
+                        + "; ".join(entry.reasons or ["unknown gate"])
                     )
-                if all(
-                    str(run.get("status") or "") == "completed"
-                    and str(run.get("conclusion") or "") == "success"
-                    for run in latest.values()
-                ):
-                    exact_checks = check_states(client.commit_check_runs(head_sha))
-                    entry = client.snapshot(
-                        number,
-                        require_marker=False,
-                        allow_blocked_label=True,
-                        known_checks=exact_checks,
-                    )
-                    if entry.state == "ready":
-                        results.append(
-                            {
-                                "branch": branch,
-                                "dispatched_ci": dispatched,
-                                "checks": exact_checks,
-                                "head_sha": head_sha,
-                                "pull_request": number,
-                                "state": "ready",
-                            }
-                        )
-                        break
-                    if entry.state == "blocked":
-                        raise QueueError(
-                            f"integration PR #{number} is blocked: "
-                            + "; ".join(entry.reasons or ["unknown gate"])
-                        )
-            if time.monotonic() >= deadline:
-                raise QueueError(f"integration PR #{number} CI timed out")
-            time.sleep(poll_seconds)
+        if not pending:
+            break
+        if time.monotonic() >= deadline:
+            numbers = ", ".join(f"#{number}" for number in pending)
+            noun = "PR" if len(pending) == 1 else "PRs"
+            raise QueueError(f"integration {noun} {numbers} CI timed out")
+        time.sleep(poll_seconds)
     return results
 
 

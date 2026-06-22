@@ -5,6 +5,7 @@ import json
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from datetime import datetime, timezone
+from typing import Any
 from unittest.mock import Mock, call, patch
 
 from agent_merge_queue.cli import (
@@ -40,6 +41,7 @@ from agent_merge_queue.cli import (
     effective_queue_marker,
     freeze_queue,
     generated_only_change,
+    integration_ci_active_gate,
     latest_batch_marker,
     latest_marker,
     marker_queued_at,
@@ -4179,6 +4181,210 @@ class QueueCoreTest(unittest.TestCase):
             known_checks={"CI": "passed"},
         )
         self.assertEqual(result[0]["state"], "ready")
+
+    def test_integration_ci_dispatches_every_pr_before_waiting(self) -> None:
+        numbers = [38, 39]
+        heads = {38: "a" * 40, 39: "b" * 40}
+        branches = {
+            38: "deploybot/integration/first",
+            39: "deploybot/integration/second",
+        }
+        marker = {
+            "batch_id": "batch",
+            "conflict": None,
+            "heads": {"1": "1" * 40, "2": "2" * 40},
+            "pull_requests": [1, 2],
+        }
+        client = Mock()
+        client.config = CONFIG
+        client.coordinator_logins = {"coordinator"}
+        client.comments.return_value = [
+            {
+                "created_at": "2026-06-20T00:00:00Z",
+                "user": {"login": "coordinator"},
+                "body": integration_body(marker),
+            }
+        ]
+
+        def pull_head(number: int) -> dict[str, str]:
+            return {
+                "branch": branches[number],
+                "head_sha": heads[number],
+                "state": "OPEN",
+            }
+
+        events: list[str] = []
+        calls = {branch: 0 for branch in branches.values()}
+
+        def workflow_runs(branch: str) -> list[dict[str, Any]]:
+            calls[branch] += 1
+            events.append(f"query:{branch}:{calls[branch]}")
+            if calls[branch] == 1:
+                return []
+            number = next(key for key, value in branches.items() if value == branch)
+            return [
+                {
+                    "id": number,
+                    "name": "CI",
+                    "head_sha": heads[number],
+                    "event": "workflow_dispatch",
+                    "status": "completed",
+                    "conclusion": "success",
+                    "created_at": "2026-06-20T00:01:00Z",
+                }
+            ]
+
+        def dispatch(*, ref: str, names: list[str]) -> list[dict[str, Any]]:
+            events.append(f"dispatch:{ref}")
+            return [{"id": len(events), "name": names[0]}]
+
+        client.pull_head.side_effect = pull_head
+        client.workflow_runs_for_branch.side_effect = workflow_runs
+        client.dispatch_ci_workflows.side_effect = dispatch
+        client.commit_check_runs.return_value = [
+            {
+                "name": "CI",
+                "conclusion": "success",
+                "started_at": "2026-06-20T00:01:00Z",
+            }
+        ]
+
+        def snapshot(number: int, **_kwargs: Any) -> QueueEntry:
+            ready = entry(number, "combined.py")
+            ready.head_sha = heads[number]
+            return ready
+
+        client.snapshot.side_effect = snapshot
+
+        with (
+            patch("agent_merge_queue.cli.time.monotonic", return_value=0),
+            patch(
+                "agent_merge_queue.cli.time.sleep",
+                side_effect=lambda _seconds: events.append("sleep"),
+            ),
+        ):
+            result = settle_integration_checks(
+                client,
+                timeout_seconds=10,
+                poll_seconds=1,
+                numbers=numbers,
+            )
+
+        self.assertEqual(
+            events[:5],
+            [
+                f"query:{branches[38]}:1",
+                f"dispatch:{branches[38]}",
+                f"query:{branches[39]}:1",
+                f"dispatch:{branches[39]}",
+                "sleep",
+            ],
+        )
+        self.assertEqual(
+            [value["pull_request"] for value in result],
+            numbers,
+        )
+
+    def test_integration_ci_does_not_repeat_dispatch_before_run_appears(
+        self,
+    ) -> None:
+        number = 38
+        head_sha = "a" * 40
+        branch = "deploybot/integration/batch"
+        marker = {
+            "batch_id": "batch",
+            "conflict": None,
+            "heads": {"1": "1" * 40, "2": "2" * 40},
+            "pull_requests": [1, 2],
+        }
+        client = Mock()
+        client.config = CONFIG
+        client.coordinator_logins = {"coordinator"}
+        client.comments.return_value = [
+            {
+                "created_at": "2026-06-20T00:00:00Z",
+                "user": {"login": "coordinator"},
+                "body": integration_body(marker),
+            }
+        ]
+        client.pull_head.return_value = {
+            "branch": branch,
+            "head_sha": head_sha,
+            "state": "OPEN",
+        }
+        successful = {
+            "id": 7,
+            "name": "CI",
+            "head_sha": head_sha,
+            "event": "workflow_dispatch",
+            "status": "completed",
+            "conclusion": "success",
+            "created_at": "2026-06-20T00:01:00Z",
+        }
+        client.workflow_runs_for_branch.side_effect = [[], [], [successful]]
+        client.dispatch_ci_workflows.return_value = [{"id": 7, "name": "CI"}]
+        client.commit_check_runs.return_value = [
+            {
+                "name": "CI",
+                "conclusion": "success",
+                "started_at": "2026-06-20T00:01:00Z",
+            }
+        ]
+        ready = entry(number, "combined.py")
+        ready.head_sha = head_sha
+        client.snapshot.return_value = ready
+
+        with (
+            patch("agent_merge_queue.cli.time.monotonic", return_value=0),
+            patch("agent_merge_queue.cli.time.sleep"),
+        ):
+            settle_integration_checks(
+                client,
+                timeout_seconds=10,
+                poll_seconds=0,
+                numbers=[number],
+            )
+
+        client.dispatch_ci_workflows.assert_called_once_with(
+            ref=branch,
+            names=["CI"],
+        )
+
+    def test_integration_ci_gate_names_the_exact_wait(self) -> None:
+        number = 38
+        head_sha = "a" * 40
+        branch = "deploybot/integration/batch"
+        client = Mock()
+        client.config = CONFIG
+        client.pull_head.return_value = {
+            "branch": branch,
+            "head_sha": head_sha,
+            "state": "OPEN",
+        }
+        client.workflow_runs_for_branch.return_value = []
+        queued = entry(number, "combined.py")
+        queued.head_sha = head_sha
+
+        self.assertEqual(
+            integration_ci_active_gate(client, queued),
+            "waiting for exact integration CI: CI has not been dispatched",
+        )
+
+        client.workflow_runs_for_branch.return_value = [
+            {
+                "id": 7,
+                "name": "CI",
+                "head_sha": head_sha,
+                "event": "workflow_dispatch",
+                "status": "queued",
+                "conclusion": None,
+                "created_at": "2026-06-20T00:01:00Z",
+            }
+        ]
+        self.assertEqual(
+            integration_ci_active_gate(client, queued),
+            "waiting for exact integration CI: CI is queued",
+        )
 
     def test_integration_promotion_reuses_owned_exact_checks(self) -> None:
         number = 38

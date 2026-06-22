@@ -181,6 +181,11 @@ controller recognizes them:
 In `overlap` mode, a ready source waits when another active, near-ready intent
 belongs to the same source-overlap component. Unrelated ready work still drains,
 and the held component freezes together once its remaining gates pass.
+When more than one cumulative integration pull request needs controller-owned
+exact-head CI, DeployBot dispatches every missing workflow before it waits. The
+workflows then run in parallel instead of making later batches wait for an
+earlier runner delay. Slow-queue status names the missing, queued, or failed
+exact integration workflow instead of reporting only a generic merge worker.
 
 ```bash
 deploybot resume <pr-number>
