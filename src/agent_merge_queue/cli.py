@@ -179,6 +179,18 @@ def check_states(checks: Iterable[dict[str, Any]]) -> dict[str, str]:
     return result
 
 
+def merge_known_check_states(
+    observed: dict[str, str],
+    known: dict[str, str] | None,
+) -> dict[str, str]:
+    result = dict(observed)
+    for name, state in (known or {}).items():
+        if result.get(name) == "failed" and state != "failed":
+            continue
+        result[name] = state
+    return result
+
+
 def latest_exact_workflow_runs(
     runs: Iterable[dict[str, Any]],
     names: Iterable[str],
@@ -1999,8 +2011,7 @@ class GitHub:
         marker = queue_marker_for_client(self, comments)
         head_sha = str(pull["headRefOid"])
         check_rollup = list(pull.get("statusCheckRollup") or [])
-        checks = check_states(check_rollup)
-        checks.update(known_checks or {})
+        checks = merge_known_check_states(check_states(check_rollup), known_checks)
         integration = latest_payload(
             comments,
             INTEGRATION_MARKER,
@@ -2009,8 +2020,10 @@ class GitHub:
         if integration and any(
             checks.get(name) != "passed" for name in self.config.required_checks
         ):
-            checks = check_states(check_rollup + self.commit_check_runs(head_sha))
-            checks.update(known_checks or {})
+            checks = merge_known_check_states(
+                check_states(check_rollup + self.commit_check_runs(head_sha)),
+                known_checks,
+            )
         source_paths = list(known_source_paths or [])
         generated_paths = list(known_generated_paths or [])
         paths_are_known = (
@@ -3414,13 +3427,18 @@ def settle_integration_checks(
                 and str(run.get("conclusion") or "") == "success"
                 for run in latest.values()
             ):
-                exact_checks = check_states(client.commit_check_runs(head_sha))
+                exact_checks = integration_owned_check_states(client, head_sha)
                 entry = client.snapshot(
                     number,
                     require_marker=False,
                     allow_blocked_label=True,
                     known_checks=exact_checks,
                 )
+                if entry.head_sha != head_sha:
+                    raise QueueError(
+                        f"integration PR #{number} changed while CI evidence "
+                        "was being applied"
+                    )
                 if entry.state == "ready":
                     results.append(
                         {
@@ -3449,6 +3467,44 @@ def settle_integration_checks(
     return results
 
 
+def integration_owned_check_states(client: GitHub, head_sha: str) -> dict[str, str]:
+    """Use successful exact integration CI as the required-check aggregate."""
+
+    checks = check_states(client.commit_check_runs(head_sha))
+    # Token-authored integration PRs do not emit every pull_request-only wrapper
+    # check. The configured workflow's exact-head success is the aggregate proof
+    # for those required checks; review providers remain separate and unchanged.
+    for name in client.config.integration.ci_satisfies_checks:
+        if checks.get(name) != "failed":
+            checks[name] = "passed"
+    return checks
+
+
+def completed_integration_ci_checks(
+    client: GitHub,
+    *,
+    branch: str,
+    head_sha: str,
+) -> dict[str, str] | None:
+    configured = tuple(client.config.pipeline.ci_workflows)
+    if not configured:
+        return None
+    latest = latest_exact_workflow_runs(
+        client.workflow_runs_for_branch(branch),
+        configured,
+        head_sha=head_sha,
+    )
+    if any(name not in latest for name in configured):
+        return None
+    if not all(
+        str(run.get("status") or "") == "completed"
+        and str(run.get("conclusion") or "") == "success"
+        for run in latest.values()
+    ):
+        return None
+    return integration_owned_check_states(client, head_sha)
+
+
 def command_resume(client: GitHub, selector: str | None) -> None:
     number = client.resolve_pr(selector)
     comments = client.comments(number)
@@ -3458,7 +3514,24 @@ def command_resume(client: GitHub, selector: str | None) -> None:
         coordinator_logins(client),
     )
     if integration:
-        entry = client.snapshot(number, require_marker=False, allow_blocked_label=True)
+        pull = client.pull_head(number)
+        branch = str(pull.get("branch") or "")
+        head_sha = str(pull.get("head_sha") or "")
+        known_checks = completed_integration_ci_checks(
+            client,
+            branch=branch,
+            head_sha=head_sha,
+        )
+        entry = client.snapshot(
+            number,
+            require_marker=False,
+            allow_blocked_label=True,
+            known_checks=known_checks,
+        )
+        if entry.head_sha != head_sha:
+            raise QueueError(
+                f"integration PR #{number} changed while CI evidence was being applied"
+            )
         for source_number, source_head in (integration.get("heads") or {}).items():
             if not client.is_ancestor(str(source_head), entry.head_sha):
                 raise QueueError(

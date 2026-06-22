@@ -66,6 +66,7 @@ class IntegrationConfig:
     title_prefix: str
     max_batch_size: int
     require_non_actions_author: bool
+    ci_satisfies_checks: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -146,6 +147,8 @@ branch_prefix = "deploybot/integration"
 title_prefix = "DeployBot integration"
 max_batch_size = 3
 require_non_actions_author = false
+# Exact integration CI may replace only these pull_request-only wrapper checks.
+ci_satisfies_checks = []
 """
 
 
@@ -328,6 +331,10 @@ def parse_config(payload: dict[str, Any]) -> QueueConfig:
         raise ConfigError("review must be a table")
     if not isinstance(pipeline, dict) or not isinstance(integration, dict):
         raise ConfigError("pipeline and integration must be tables")
+    ci_workflows = _string_tuple(
+        pipeline.get("ci_workflows", ["CI"]),
+        "pipeline.ci_workflows",
+    )
 
     merge_method = _require_string(
         queue.get("merge_method"), "queue.merge_method", "merge"
@@ -386,6 +393,21 @@ def parse_config(payload: dict[str, Any]) -> QueueConfig:
     if integration_mode not in ALLOWED_INTEGRATION_MODES:
         allowed = ", ".join(sorted(ALLOWED_INTEGRATION_MODES))
         raise ConfigError(f"integration.mode must be one of: {allowed}")
+    ci_satisfies_checks = _string_tuple(
+        integration.get("ci_satisfies_checks"),
+        "integration.ci_satisfies_checks",
+    )
+    unknown_ci_checks = sorted(set(ci_satisfies_checks) - set(required_checks))
+    if unknown_ci_checks:
+        raise ConfigError(
+            "integration.ci_satisfies_checks must be a subset of "
+            "queue.required_checks: " + ", ".join(unknown_ci_checks)
+        )
+    if ci_satisfies_checks and not ci_workflows:
+        raise ConfigError(
+            "integration.ci_satisfies_checks requires at least one "
+            "pipeline.ci_workflows entry"
+        )
     webhook_url_env = pipeline.get("webhook_url_env")
     if webhook_url_env is not None:
         webhook_url_env = _require_string(webhook_url_env, "pipeline.webhook_url_env")
@@ -454,10 +476,7 @@ def parse_config(payload: dict[str, Any]) -> QueueConfig:
                 "pipeline.thread_active_hours",
                 72,
             ),
-            ci_workflows=_string_tuple(
-                pipeline.get("ci_workflows", ["CI"]),
-                "pipeline.ci_workflows",
-            ),
+            ci_workflows=ci_workflows,
             deploy_workflows=_string_tuple(
                 pipeline.get("deploy_workflows", ["Deploy"]),
                 "pipeline.deploy_workflows",
@@ -536,6 +555,7 @@ def parse_config(payload: dict[str, Any]) -> QueueConfig:
                 "integration.require_non_actions_author",
                 False,
             ),
+            ci_satisfies_checks=ci_satisfies_checks,
         ),
     )
 

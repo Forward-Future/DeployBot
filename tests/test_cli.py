@@ -42,10 +42,12 @@ from agent_merge_queue.cli import (
     freeze_queue,
     generated_only_change,
     integration_ci_active_gate,
+    integration_owned_check_states,
     latest_batch_marker,
     latest_marker,
     marker_queued_at,
     marker_priority_at,
+    merge_known_check_states,
     main,
     near_ready_overlap_holds,
     new_batch,
@@ -3807,6 +3809,29 @@ class QueueCoreTest(unittest.TestCase):
         client.coordinator_logins = {"coordinator"}
         client.resolve_pr.return_value = 99
         client.comments.return_value = comments
+        client.pull_head.return_value = {
+            "branch": "deploybot/integration/batch-1",
+            "head_sha": integration_head,
+            "state": "OPEN",
+        }
+        client.workflow_runs_for_branch.return_value = [
+            {
+                "id": 7,
+                "name": "CI",
+                "head_sha": integration_head,
+                "event": "workflow_dispatch",
+                "status": "completed",
+                "conclusion": "success",
+                "created_at": "2026-06-20T00:01:00Z",
+            }
+        ]
+        client.commit_check_runs.return_value = [
+            {
+                "name": "CI",
+                "conclusion": "success",
+                "started_at": "2026-06-20T00:01:00Z",
+            }
+        ]
         client.snapshot.return_value = integration
         client.is_ancestor.return_value = True
         source_labels = {
@@ -4512,6 +4537,60 @@ class QueueCoreTest(unittest.TestCase):
             [value["pull_request"] for value in result],
             numbers,
         )
+
+    def test_exact_integration_ci_satisfies_pr_only_required_wrappers(self) -> None:
+        client = Mock()
+        client.config = parse_config(
+            {
+                "queue": {
+                    "required_checks": [
+                        "Static checks",
+                        "Stable PR head",
+                        "Full test suite",
+                    ],
+                    "trusted_actors": ["trusted"],
+                },
+                "integration": {
+                    "ci_satisfies_checks": [
+                        "Stable PR head",
+                        "Full test suite",
+                    ]
+                },
+            }
+        )
+        client.commit_check_runs.return_value = [
+            {
+                "name": "Static checks",
+                "conclusion": "success",
+                "started_at": "2026-06-20T00:01:00Z",
+            },
+            {
+                "name": "Stable PR head",
+                "conclusion": "skipped",
+                "started_at": "2026-06-20T00:01:00Z",
+            },
+            {
+                "name": "Greptile Review",
+                "status": "in_progress",
+                "started_at": "2026-06-20T00:01:00Z",
+            },
+        ]
+
+        checks = integration_owned_check_states(client, "a" * 40)
+
+        self.assertEqual(checks["Static checks"], "passed")
+        self.assertEqual(checks["Stable PR head"], "passed")
+        self.assertEqual(checks["Full test suite"], "passed")
+        self.assertEqual(checks["Greptile Review"], "pending")
+
+    def test_owned_integration_checks_never_replace_observed_failure(self) -> None:
+        checks = merge_known_check_states(
+            {"Stable PR head": "failed"},
+            {"Stable PR head": "passed", "Full test suite": "passed"},
+        )
+
+        self.assertEqual(checks["Stable PR head"], "failed")
+        self.assertEqual(checks["Full test suite"], "passed")
 
     def test_integration_ci_does_not_repeat_dispatch_before_run_appears(
         self,

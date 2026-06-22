@@ -1,7 +1,7 @@
 # DeployBot reference
 
 This reference describes the CLI, MCP server, policy file, and GitHub Action in
-DeployBot v0.2.16. GitHub labels and authenticated comments are the durable state;
+DeployBot v0.2.17. GitHub labels and authenticated comments are the durable state;
 the CLI and MCP tools are two interfaces to the same operations.
 
 ## CLI
@@ -191,6 +191,7 @@ Provider fields are:
 | `title_prefix` | `"DeployBot integration"` |
 | `max_batch_size` | Positive maximum frozen batch size; default 3. Later FIFO entries remain in the next batch. A larger indivisible source-overlap or dependency closure ships alone rather than being split or deadlocked. |
 | `require_non_actions_author` | Default `false`; when `true`, integration creation requires the Action `token` input and an App bot author listed in `queue.coordinator_actors`. |
+| `ci_satisfies_checks` | Default `[]`; explicit pull-request-only wrapper checks already proved by successful exact-head `pipeline.ci_workflows`. Must be a subset of `queue.required_checks` and never overrides a failed check. |
 
 ## GitHub Action
 

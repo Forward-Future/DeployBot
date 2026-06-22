@@ -67,3 +67,6 @@ branch_prefix = "deploybot/integration"
 title_prefix = "DeployBot integration"
 max_batch_size = 3
 require_non_actions_author = false
+# Name only pull_request-only wrapper checks that the successful exact-head
+# pipeline.ci_workflows run already proves. Independent checks stay mandatory.
+ci_satisfies_checks = []
