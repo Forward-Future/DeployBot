@@ -78,7 +78,7 @@ jobs:
           ref: ${{ github.event.repository.default_branch }}
           persist-credentials: false
       # v0.2.25 implementation; keep the full commit for privileged workflows.
-      - uses: Forward-Future/DeployBot@57eab6540143cac9aa1243c8905cccc30004ca29
+      - uses: Forward-Future/DeployBot@521b1a209c08a2386408b0cf3515a5107cf36c77
         with:
           # PR and review events reconcile immediately. Release-owner events
           # advance to the configured admission gate; "merged" observations

@@ -15,7 +15,7 @@ Install the reviewed `v0.2.25` source commit directly from GitHub:
 
 ```bash
 python3 -m pip install \
-  'deploybot-merge-queue[mcp] @ git+https://github.com/Forward-Future/DeployBot.git@57eab6540143cac9aa1243c8905cccc30004ca29'
+  'deploybot-merge-queue[mcp] @ git+https://github.com/Forward-Future/DeployBot.git@521b1a209c08a2386408b0cf3515a5107cf36c77'
 deploybot init
 ```
 
@@ -98,7 +98,7 @@ worker free. It can still dispatch deployment when GitHub suppresses the
 release commit:
 
 ```yaml
-- uses: Forward-Future/DeployBot@57eab6540143cac9aa1243c8905cccc30004ca29
+- uses: Forward-Future/DeployBot@521b1a209c08a2386408b0cf3515a5107cf36c77
 ```
 
 The Action uses GitHub's built-in workflow token. GitHub intentionally does not
