@@ -15,7 +15,7 @@ Install the reviewed `v0.2.25` source commit directly from GitHub:
 
 ```bash
 python3 -m pip install \
-  'deploybot-merge-queue[mcp] @ git+https://github.com/Forward-Future/DeployBot.git@e9ceb594a9a108b3f5ea4e82f164aed9d42b2501'
+  'deploybot-merge-queue[mcp] @ git+https://github.com/Forward-Future/DeployBot.git@3fb42e2e3cf3a6f21cddf43e3d06deaa24a3ac80'
 deploybot init
 ```
 
@@ -99,7 +99,7 @@ out or executes pull-request code. Pin the Action to the full reviewed release
 commit:
 
 ```yaml
-- uses: Forward-Future/DeployBot@e9ceb594a9a108b3f5ea4e82f164aed9d42b2501
+- uses: Forward-Future/DeployBot@3fb42e2e3cf3a6f21cddf43e3d06deaa24a3ac80
 ```
 
 The Action uses GitHub's built-in workflow token. GitHub intentionally does not

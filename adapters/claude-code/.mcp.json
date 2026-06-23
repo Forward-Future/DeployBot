@@ -4,7 +4,7 @@
       "command": "uvx",
       "args": [
         "--from",
-        "deploybot-merge-queue[mcp] @ git+https://github.com/Forward-Future/DeployBot.git@e9ceb594a9a108b3f5ea4e82f164aed9d42b2501",
+        "deploybot-merge-queue[mcp] @ git+https://github.com/Forward-Future/DeployBot.git@3fb42e2e3cf3a6f21cddf43e3d06deaa24a3ac80",
         "deploybot-mcp"
       ]
     }

@@ -78,7 +78,7 @@ jobs:
           persist-credentials: false
       # Reviewed split-coordinator implementation; keep the full commit for
       # privileged workflows.
-      - uses: Forward-Future/DeployBot@e9ceb594a9a108b3f5ea4e82f164aed9d42b2501
+      - uses: Forward-Future/DeployBot@3fb42e2e3cf3a6f21cddf43e3d06deaa24a3ac80
         with:
           # Keep queue admission independent from release ownership so merged
           # mode can continue admitting ready work while CI and Deploy run.
@@ -101,7 +101,7 @@ jobs:
           persist-credentials: false
       # Release-only ownership never promotes or drains pull requests. It
       # exits immediately when no exact-main release needs work.
-      - uses: Forward-Future/DeployBot@e9ceb594a9a108b3f5ea4e82f164aed9d42b2501
+      - uses: Forward-Future/DeployBot@3fb42e2e3cf3a6f21cddf43e3d06deaa24a3ac80
         with:
           mode: follow
           timeout: "2400"
