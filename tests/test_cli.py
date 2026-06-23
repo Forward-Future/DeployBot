@@ -2367,7 +2367,15 @@ class QueueCoreTest(unittest.TestCase):
     def test_reactor_seeds_first_install_despite_historical_runs(self) -> None:
         sha = "a" * 40
         client = Mock()
-        client.config = CONFIG
+        client.config = parse_config(
+            {
+                "queue": {
+                    "required_checks": ["CI"],
+                    "trusted_actors": ["trusted"],
+                },
+                "pipeline": {"release_admission": "merged"},
+            }
+        )
         client.pipeline_control.return_value = {"state": "running"}
         client.base_sha.return_value = sha
         client.workflow_runs.return_value = [
@@ -2375,13 +2383,16 @@ class QueueCoreTest(unittest.TestCase):
                 "id": 99,
                 "name": "CI",
                 "head_sha": "b" * 40,
+                "head_branch": "main",
+                "event": "workflow_dispatch",
                 "status": "completed",
-                "conclusion": "success",
+                "conclusion": "failure",
             }
         ]
         client.verified_main_sha.return_value = None
         client.thread_records.return_value = []
         client.deployment_notifications.return_value = []
+        client.is_ancestor.return_value = True
         frozen = FreezeResult(None, [], [], [], [])
         with (
             patch("agent_merge_queue.cli.settle_integration_checks", return_value=[]),
@@ -2833,9 +2844,9 @@ class QueueCoreTest(unittest.TestCase):
         client.config = config
         client.pipeline_control.return_value = {"state": "running"}
         client.base_sha.return_value = current
-        client.verified_main_sha.return_value = None
+        client.verified_main_sha.return_value = "f" * 40
         client.thread_records.return_value = []
-        client.is_ancestor.return_value = True
+        client.is_ancestor.side_effect = lambda _left, right: right == current
         client.workflow_runs.return_value = [
             {
                 "id": 1,
@@ -2889,10 +2900,10 @@ class QueueCoreTest(unittest.TestCase):
         client.config = config
         client.pipeline_control.return_value = {"state": "running"}
         client.base_sha.return_value = current
-        client.verified_main_sha.return_value = None
+        client.verified_main_sha.return_value = "f" * 40
         client.thread_records.return_value = []
         client.deployment_notifications.return_value = []
-        client.is_ancestor.return_value = True
+        client.is_ancestor.side_effect = lambda _left, right: right == current
         client.workflow_runs.return_value = [
             {
                 "id": 1,
@@ -2946,9 +2957,9 @@ class QueueCoreTest(unittest.TestCase):
         client.config = config
         client.pipeline_control.return_value = {"state": "running"}
         client.base_sha.return_value = current
-        client.verified_main_sha.return_value = None
+        client.verified_main_sha.return_value = "f" * 40
         client.thread_records.return_value = []
-        client.is_ancestor.return_value = True
+        client.is_ancestor.side_effect = lambda _left, right: right == current
         client.workflow_runs.return_value = [
             {
                 "id": 1,

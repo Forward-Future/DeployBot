@@ -5884,42 +5884,6 @@ def command_react(
             runs=workflow_runs,
             config=client.config.pipeline,
         )
-        if (
-            admission_gate == "merged"
-            and release_before_merge.get("state") != "verified"
-        ):
-            failed_release = superseded_release_failure(
-                client,
-                current_main_sha=current_main_sha,
-                verified_main_sha=(
-                    str(raw_watermark) if isinstance(raw_watermark, str) else None
-                ),
-                workflow_runs=workflow_runs,
-                recovered_main_sha=(
-                    str(control.get("recovered_main_sha") or "") or None
-                ),
-                timeout_seconds=timeout_seconds,
-            )
-            if failed_release is not None:
-                if client.config.pipeline.pause_on_failure:
-                    client.set_pipeline_control(
-                        "paused",
-                        f"{failed_release['state']} on {failed_release['main_sha']}",
-                        main_sha=str(failed_release["main_sha"]),
-                    )
-                result = {
-                    "state": "release-held",
-                    "release": failed_release,
-                    "promoted": {},
-                    "promoted_integrations": [],
-                    "drain": {},
-                    "dispatched_ci": [],
-                    "integrations": [],
-                    "integration_checks": [],
-                    "reconciled_merges": reconciled_merges,
-                }
-                print(json.dumps(result, indent=2, sort_keys=True))
-                return result
         release_already_verified = raw_watermark == current_main_sha
         has_release_owner = (
             not release_already_verified
@@ -5964,6 +5928,43 @@ def command_react(
             # durable merged obligation owns it; historical runs for older
             # SHAs cannot make an unobservable release finish.
             client.record_verified_main(current_main_sha)
+        if (
+            admission_gate == "merged"
+            and release_before_merge.get("state") != "verified"
+            and (raw_watermark is not None or has_release_owner)
+        ):
+            failed_release = superseded_release_failure(
+                client,
+                current_main_sha=current_main_sha,
+                verified_main_sha=(
+                    str(raw_watermark) if isinstance(raw_watermark, str) else None
+                ),
+                workflow_runs=workflow_runs,
+                recovered_main_sha=(
+                    str(control.get("recovered_main_sha") or "") or None
+                ),
+                timeout_seconds=timeout_seconds,
+            )
+            if failed_release is not None:
+                if client.config.pipeline.pause_on_failure:
+                    client.set_pipeline_control(
+                        "paused",
+                        f"{failed_release['state']} on {failed_release['main_sha']}",
+                        main_sha=str(failed_release["main_sha"]),
+                    )
+                result = {
+                    "state": "release-held",
+                    "release": failed_release,
+                    "promoted": {},
+                    "promoted_integrations": [],
+                    "drain": {},
+                    "dispatched_ci": [],
+                    "integrations": [],
+                    "integration_checks": [],
+                    "reconciled_merges": reconciled_merges,
+                }
+                print(json.dumps(result, indent=2, sort_keys=True))
+                return result
         if admission_gate == "merged" and release_before_merge.get("state") == (
             "awaiting-deploy"
         ):
