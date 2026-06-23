@@ -3993,7 +3993,7 @@ class QueueCoreTest(unittest.TestCase):
         self.assertEqual(refreshed["source_heads"]["8"], "8" * 40)
         client.comment.assert_called_once_with(7, repair_body(refreshed))
 
-    def test_promote_recovers_owner_after_conflicted_integration_closes(self) -> None:
+    def test_promote_keeps_owner_blocked_if_integration_closes(self) -> None:
         ready = entry(1)
         ready.labels = ["deploy-requested", "merge-queue-blocked"]
         intent_comment = {
@@ -4036,9 +4036,11 @@ class QueueCoreTest(unittest.TestCase):
         with redirect_stdout(io.StringIO()):
             result = command_promote(client)
 
-        self.assertEqual(result["promoted"], [1])
-        client.remove_label.assert_any_call(1, "merge-queue-blocked")
-        client.add_label.assert_called_with(1, "merge-queue")
+        self.assertEqual(result["promoted"], [])
+        self.assertEqual(result["waiting"][0]["number"], 1)
+        self.assertIn("cumulative integration repair", result["waiting"][0]["reasons"][0])
+        client.remove_label.assert_not_called()
+        client.add_label.assert_not_called()
 
     def test_promote_does_not_hold_resumed_repair_against_itself(self) -> None:
         ready = entry(1)
@@ -4799,7 +4801,10 @@ class QueueCoreTest(unittest.TestCase):
             repair["source_heads"],
             {"1": first.head_sha, "2": second.head_sha},
         )
-        client.add_label.assert_called_once_with(1, CONFIG.blocked_label)
+        self.assertEqual(
+            [value.args for value in client.add_label.call_args_list],
+            [(1, CONFIG.blocked_label), (2, CONFIG.blocked_label)],
+        )
         self.assertTrue(
             any(
                 "deploybot resume 99" in value.args[1]
@@ -4942,6 +4947,52 @@ class QueueCoreTest(unittest.TestCase):
         client.comment.assert_not_called()
         client.add_label.assert_not_called()
 
+    def test_failed_integration_blocks_every_frozen_source(self) -> None:
+        owner = entry(1, "shared.py")
+        peer = entry(2, "shared.py")
+        intent = {
+            "id": 1,
+            "created_at": "2026-06-20T00:00:00Z",
+            "user": {"login": "trusted"},
+            "body": intent_body(
+                intent_id="intent-1",
+                state="requested",
+                requested_at="2026-06-20T00:00:00Z",
+                requested_head=owner.head_sha,
+                provider="codex",
+                thread_id="thread-1",
+            ),
+        }
+        result = {
+            "pull_request": 99,
+            "integration": {
+                "batch_id": "batch-1",
+                "conflict": None,
+                "heads": {"1": owner.head_sha, "2": peer.head_sha},
+                "pull_requests": [1, 2],
+            },
+            "reason": "integration PR #99 CI failed: CI",
+            "state": "blocked",
+        }
+        client = Mock()
+        client.config = CONFIG
+        client.trusted_logins = {"trusted"}
+        client.snapshot.side_effect = [owner]
+        client.comments.return_value = [intent]
+        client.labels.return_value = set()
+        client.base_sha.return_value = "b" * 40
+
+        record_integration_ci_repair(client, result)
+
+        self.assertEqual(
+            [value.args for value in client.add_label.call_args_list],
+            [
+                (1, CONFIG.blocked_label),
+                (2, CONFIG.blocked_label),
+                (99, CONFIG.blocked_label),
+            ],
+        )
+
     def test_resumed_integration_finishes_source_label_delegation(self) -> None:
         integration_head = "9" * 40
         marker = {
@@ -4965,11 +5016,18 @@ class QueueCoreTest(unittest.TestCase):
         client.coordinator_logins = {"coordinator"}
         client.resolve_pr.return_value = 99
         client.comments.return_value = comments
-        client.pull_head.return_value = {
-            "branch": "deploybot/integration/batch-1",
-            "head_sha": integration_head,
-            "state": "OPEN",
-        }
+        client.pull_head.side_effect = [
+            {
+                "branch": "deploybot/integration/batch-1",
+                "head_sha": integration_head,
+                "state": "CLOSED",
+            },
+            {
+                "branch": "deploybot/integration/batch-1",
+                "head_sha": integration_head,
+                "state": "OPEN",
+            },
+        ]
         client.workflow_runs_for_branch.return_value = [
             {
                 "id": 7,
@@ -5000,6 +5058,7 @@ class QueueCoreTest(unittest.TestCase):
         with redirect_stdout(io.StringIO()):
             command_resume(client, "99")
 
+        client.reopen_pull_request.assert_called_once_with(99)
         client.add_label.assert_called_once_with(99, CONFIG.queue_label)
         self.assertEqual(
             [value.args for value in client.remove_label.call_args_list],

@@ -1199,6 +1199,16 @@ class GitHub:
             "state": str(value.get("state") or ""),
         }
 
+    def reopen_pull_request(self, number: int) -> None:
+        self._json(
+            "api",
+            "--method",
+            "PATCH",
+            f"repos/{self.repository}/pulls/{number}",
+            "-f",
+            "state=open",
+        )
+
     def source_deploy_authorized(self, number: int, expected_head: str) -> bool:
         source = self._json(
             "pr",
@@ -3512,6 +3522,12 @@ def record_integration_conflict_repair(
         source_heads=frozen_heads,
         source_pull_requests=frozen_numbers,
     )
+    for source_number in frozen_numbers:
+        if source_number == owner.number:
+            continue
+        source_labels = client.labels(source_number)
+        if client.config.blocked_label not in source_labels:
+            client.add_label(source_number, client.config.blocked_label)
     result["repair_owner"] = {
         "pull_request": owner.number,
         "provider": repair.get("provider"),
@@ -3587,6 +3603,12 @@ def record_integration_ci_repair(
         source_heads=frozen_heads,
         source_pull_requests=frozen_numbers,
     )
+    for source_number in frozen_numbers:
+        if source_number == owner.number:
+            continue
+        source_labels = client.labels(source_number)
+        if client.config.blocked_label not in source_labels:
+            client.add_label(source_number, client.config.blocked_label)
     # Publish the terminal integration marker only after the durable repair
     # handoff exists. If source reads or notification writes fail, the clean
     # marker remains retryable on the next reconciliation.
@@ -3750,14 +3772,19 @@ def command_promote(
             )
             return "blocked", {"number": number, "reason": reason}, entry
         if client.config.blocked_label in entry.labels:
-            # A conflict repair targets the cumulative PR while it is open.
-            # If that integration disappears, active_integration_sources() no
-            # longer suppresses this source, so release the integration-owned
-            # hold and let the original exact-head intent recover normally.
-            integration_repair_abandoned = bool(
-                repair and repair.get("repair_pull_request")
-            )
-            if repair_marker_is_transitional(repair) or integration_repair_abandoned:
+            if repair and repair.get("repair_pull_request"):
+                return (
+                    "waiting",
+                    {
+                        "number": number,
+                        "reasons": [
+                            "cumulative integration repair must resume before any "
+                            "frozen source can merge"
+                        ],
+                    },
+                    entry,
+                )
+            if repair_marker_is_transitional(repair):
                 if deployment_repair_required(entry):
                     reason = "; ".join(entry.reasons or ["blocked"])
                     repair = record_repair(client, entry, intent, reason)
@@ -4199,6 +4226,9 @@ def command_resume(client: GitHub, selector: str | None) -> None:
     )
     if integration:
         pull = client.pull_head(number)
+        if pull.get("state") == "CLOSED":
+            client.reopen_pull_request(number)
+            pull = client.pull_head(number)
         branch = str(pull.get("branch") or "")
         head_sha = str(pull.get("head_sha") or "")
         known_checks = completed_integration_ci_checks(
