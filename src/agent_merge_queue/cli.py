@@ -5626,6 +5626,8 @@ def superseded_release_failure(
     verified_main_sha: str | None,
     workflow_runs: list[dict[str, Any]],
     recovered_main_sha: str | None,
+    timeout_seconds: int,
+    poll_seconds: int = 10,
 ) -> dict[str, Any] | None:
     """Find a failed admitted release that a newer merge moved past."""
     records = client.thread_records(include_terminal=True)
@@ -5664,6 +5666,20 @@ def superseded_release_failure(
             runs=workflow_runs,
             config=client.config.pipeline,
         )
+        if value["state"] == "verified" and client.config.pipeline.verifications:
+            deadline = time.monotonic() + timeout_seconds
+            while True:
+                checks = http_verifications(client.config.pipeline)
+                if all(item["passed"] for item in checks):
+                    break
+                if time.monotonic() >= deadline:
+                    return {
+                        **value,
+                        "state": "verify-failed",
+                        "verifications": checks,
+                    }
+                time.sleep(poll_seconds)
+            continue
         if value["state"] == "deploy-failed":
             if str((value.get("latest_deploy") or {}).get("conclusion") or "") == (
                 "cancelled"
@@ -5882,6 +5898,7 @@ def command_react(
                 recovered_main_sha=(
                     str(control.get("recovered_main_sha") or "") or None
                 ),
+                timeout_seconds=timeout_seconds,
             )
             if failed_release is not None:
                 if client.config.pipeline.pause_on_failure:
