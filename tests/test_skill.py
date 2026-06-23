@@ -8,7 +8,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 CANONICAL = ROOT / "skills" / "deploybot" / "SKILL.md"
-RELEASE_COMMIT = "12c6c03aa76a553fa4068279baa29e90a30bbeb1"
+RELEASE_COMMIT = "3fb42e2e3cf3a6f21cddf43e3d06deaa24a3ac80"
 CHECKOUT_COMMIT = "9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0"
 
 
@@ -129,6 +129,42 @@ class DeployBotSkillTest(unittest.TestCase):
                 self.assertIn("original", text.lower())
                 self.assertIn("unpause", text)
 
+    def test_every_operator_surface_distinguishes_follow_from_queue_work(self) -> None:
+        paths = [
+            ROOT / "skills" / "deploybot" / "SKILL.md",
+            ROOT / "skills" / "manage-merge-queue" / "SKILL.md",
+            ROOT / "adapters" / "claude-code" / "skills" / "deploybot" / "SKILL.md",
+            ROOT
+            / "adapters"
+            / "claude-code"
+            / "skills"
+            / "manage-merge-queue"
+            / "SKILL.md",
+            ROOT
+            / "adapters"
+            / "codex"
+            / "agent-merge-queue"
+            / "skills"
+            / "deploybot"
+            / "SKILL.md",
+            ROOT
+            / "adapters"
+            / "codex"
+            / "agent-merge-queue"
+            / "skills"
+            / "manage-merge-queue"
+            / "SKILL.md",
+            ROOT / "adapters" / "cursor" / ".cursor" / "rules" / "deploybot.mdc",
+            ROOT / "adapters" / "cursor" / "AGENTS.md",
+        ]
+        for path in paths:
+            text = " ".join(path.read_text(encoding="utf-8").split())
+            with self.subTest(path=path):
+                self.assertIn("release-only", text)
+                self.assertIn("never promotes or drains", text)
+                self.assertIn("all open PRs", text)
+                self.assertIn("same fresh boundary", text)
+
     def test_cursor_adapter_exposes_status_workflow(self) -> None:
         rule = (
             ROOT / "adapters" / "cursor" / ".cursor" / "rules" / "deploybot.mdc"
@@ -175,7 +211,13 @@ class DeployBotSkillTest(unittest.TestCase):
         self.assertIn("github.event.check_suite.app.slug != 'github-actions'", workflow)
         self.assertIn("github.event.check_suite.pull_requests[0].base.ref", workflow)
         self.assertIn("persist-credentials: false", workflow)
-        self.assertIn("follow: ${{ github.event_name == 'workflow_run'", workflow)
+        self.assertIn('follow: "false"', workflow)
+        self.assertIn("mode: follow", workflow)
+        self.assertIn("deploybot-queue-${{ github.repository }}", workflow)
+        self.assertIn("deploybot-release-${{ github.repository }}", workflow)
+        self.assertIn("Release-only ownership never promotes or drains", workflow)
+        self.assertIn("always()", workflow)
+        self.assertIn("needs.react.result == 'failure'", workflow)
         self.assertIn("&& '2400' || '600'", workflow)
 
     def test_workflows_pin_current_checkout_runtime(self) -> None:
@@ -206,11 +248,13 @@ class DeployBotSkillTest(unittest.TestCase):
         self.assertIn("actions: write", example)
         self.assertIn("workflow_dispatch:", workflow)
 
-    def test_action_follows_release_when_workflow_run_is_suppressed(self) -> None:
+    def test_action_has_independent_release_only_mode(self) -> None:
         action = (ROOT / "action.yml").read_text(encoding="utf-8")
         follow_input = action.split("  follow:\n", 1)[1].split("  dispatch_ci:\n", 1)[0]
         self.assertIn('default: "true"', follow_input)
         self.assertIn("args+=(--follow)", action)
+        self.assertIn('default: react', action)
+        self.assertIn('args=(follow --timeout "$DEPLOYBOT_TIMEOUT" --if-needed)', action)
 
     def test_clients_pin_the_immutable_status_release(self) -> None:
         paths = [

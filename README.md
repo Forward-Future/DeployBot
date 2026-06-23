@@ -15,7 +15,7 @@ Install the reviewed `v0.2.25` source commit directly from GitHub:
 
 ```bash
 python3 -m pip install \
-  'deploybot-merge-queue[mcp] @ git+https://github.com/Forward-Future/DeployBot.git@12c6c03aa76a553fa4068279baa29e90a30bbeb1'
+  'deploybot-merge-queue[mcp] @ git+https://github.com/Forward-Future/DeployBot.git@3fb42e2e3cf3a6f21cddf43e3d06deaa24a3ac80'
 deploybot init
 ```
 
@@ -87,18 +87,19 @@ the user does not repeat `deploy`. No polling timer is involved.
 Install `examples/github-workflow.yml` on the default branch. It reacts to
 deploy labels, ready/synchronize events, reviews, named CI `workflow_run`
 completions, and completed external check suites. Keep its `workflows` list
-aligned with `pipeline.ci_workflows`. A five-minute scheduled reconciliation
-rereads all durable state in case GitHub concurrency coalesces the last pending
-event in a burst. The privileged worker never checks out or executes
-pull-request code. The Action advances releases to the configured admission
-gate. In the default `merged` mode it returns after each healthy observation,
-leaving completion to later release events and keeping the serialized merge
-worker free. It can still dispatch deployment when GitHub suppresses the
-`workflow_run` event for token-dispatched CI. Pin the Action to the full reviewed
-release commit:
+aligned with `pipeline.ci_workflows`. Each wake runs two independently
+serialized jobs: the queue reactor can admit more ready work immediately, while
+the release-only follower owns cumulative exact `main` through CI, deployment,
+and verification. The follower exits immediately when no release needs work and
+dispatches deployment when GitHub suppresses the `workflow_run` handoff for
+token-dispatched CI, avoiding a wait for the five-minute scheduled
+reconciliation. The schedule still rereads all durable state if GitHub
+concurrency coalesces the last event in a burst. Neither privileged job checks
+out or executes pull-request code. Pin the Action to the full reviewed release
+commit:
 
 ```yaml
-- uses: Forward-Future/DeployBot@12c6c03aa76a553fa4068279baa29e90a30bbeb1
+- uses: Forward-Future/DeployBot@3fb42e2e3cf3a6f21cddf43e3d06deaa24a3ac80
 ```
 
 The Action uses GitHub's built-in workflow token. GitHub intentionally does not

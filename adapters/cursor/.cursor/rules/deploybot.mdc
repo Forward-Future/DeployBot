@@ -15,6 +15,15 @@ the stable Cursor thread ID, never prompts or transcripts. Refresh intent only
 after replacement-head review. Only the coordinator may react, integrate,
 drain, follow, pause, or resume repaired work.
 
+Use the reaction path for queue-changing coordination. `follow_release` is
+release-only: it observes the current base revision and never promotes or
+drains queued pull requests. For a queue-wide request such as "all open PRs,"
+refresh `pipeline_status`, `queue_plan`, and the provider's open pull-request
+list after the verified release. Stop only when the queue, unbound PRs, and
+provider list are all empty at that same fresh boundary.
+In GitHub Actions, keep queue reaction and release-only follow in separate
+concurrency groups so release ownership never holds up merged-mode admission.
+
 Honor `pipeline.release_admission`. In `merged` mode, admit the next independent
 ready PR immediately after a healthy merge while release events continue CI,
 deployment, and health tracking. A later failure pauses future merges normally.

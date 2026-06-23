@@ -5404,6 +5404,39 @@ def record_pending_deployment_notification(
     return record
 
 
+def emit_follow_result(
+    client: GitHub,
+    result: dict[str, Any],
+    *,
+    json_output: bool,
+) -> dict[str, Any]:
+    queued_numbers = client.queued_numbers()
+    if queued_numbers:
+        result = {
+            **result,
+            "queue_handoff": {
+                "state": "queued-work-remains",
+                "pull_requests": queued_numbers,
+                "reason": (
+                    "follow is release-only and does not promote or drain queued "
+                    "pull requests"
+                ),
+                "required_command": "deploybot react --follow --dispatch-ci",
+            },
+        }
+    if json_output:
+        print(json.dumps(result, indent=2, sort_keys=True))
+    else:
+        print(f"release {result['state']} on {result['main_sha']}")
+        if queued_numbers:
+            pulls = ", ".join(f"#{number}" for number in queued_numbers)
+            print(
+                f"queued pull requests remain ({pulls}); run "
+                "deploybot react --follow --dispatch-ci"
+            )
+    return result
+
+
 def command_follow(
     client: GitHub,
     *,
@@ -5412,7 +5445,19 @@ def command_follow(
     json_output: bool,
     emit: bool = True,
     admit_gate: str = "verified",
+    if_needed: bool = False,
 ) -> dict[str, Any]:
+    if if_needed and not release_follow_needed(client):
+        result = {
+            "state": "idle",
+            "main_sha": client.base_sha(),
+            "reason": "no unfinished exact-main release needs a follower",
+        }
+        return (
+            emit_follow_result(client, result, json_output=json_output)
+            if emit
+            else result
+        )
     try:
         result = follow_release(
             client,
@@ -5580,24 +5625,33 @@ def command_follow(
         )
     if not emit:
         return result
-    if json_output:
-        print(json.dumps(result, indent=2, sort_keys=True))
-    else:
-        print(f"release {result['state']} on {result['main_sha']}")
-    return result
+    return emit_follow_result(client, result, json_output=json_output)
 
 
 def release_follow_needed(client: GitHub) -> bool:
+    main_sha = client.base_sha()
     current = release_state(
-        main_sha=client.base_sha(),
+        main_sha=main_sha,
         runs=client.workflow_runs(),
         config=client.config.pipeline,
     )
     if current["state"] == "testing":
-        # A repository with no current main CI has no release to follow. An
-        # active or queued run is returned as latest_ci and should keep its
-        # release owner.
-        return current.get("latest_ci") is not None
+        # CI registration can lag immediately after a merge. Preserve the
+        # release owner when a durable merged thread reaches current main,
+        # even before the workflow run appears in GitHub's list endpoint.
+        if current.get("latest_ci") is not None:
+            return True
+        if client.verified_main_sha() == main_sha:
+            return False
+        records = client.thread_records(include_terminal=True)
+        if not isinstance(records, list):
+            records = []
+        return any(
+            record.get("phase") == "merged"
+            and bool(record.get("merge_sha"))
+            and client.is_ancestor(str(record["merge_sha"]), main_sha)
+            for record in records
+        )
     if current["state"] == "verified":
         # Verification can finish just before the original worker is replaced.
         # Revisit it while a merge still needs an outbox entry. A pending
@@ -6597,6 +6651,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     follow.add_argument("--timeout", type=int, default=1800)
     follow.add_argument("--poll", type=int, default=10)
+    follow.add_argument(
+        "--if-needed",
+        action="store_true",
+        help="return immediately when no unfinished exact-main release exists",
+    )
     follow.add_argument("--json", action="store_true", dest="json_output")
     pause = subparsers.add_parser(
         "pause", help="pause merging after a delivery failure"
@@ -6746,7 +6805,8 @@ def main(argv: list[str] | None = None) -> int:
                 timeout_seconds=arguments.timeout,
                 poll_seconds=arguments.poll,
                 json_output=arguments.json_output,
-                admit_gate=client.config.pipeline.release_admission,
+                admit_gate="verified",
+                if_needed=arguments.if_needed,
             )
         elif arguments.command == "pause":
             command_control(client, state="paused", reason=arguments.reason)

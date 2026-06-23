@@ -59,7 +59,7 @@ never substitute its own thread ID.
 | `deploybot drain [--json]` | Freeze as needed and merge independent ready entries in the active batch. |
 | `deploybot react [--follow] [--dispatch-ci] [--timeout SECONDS]` | Run the event-driven promotion, batching, merge, and optional release-follow flow. The timeout defaults to 1800 seconds. |
 | `deploybot integrate [--all]` | Scaffold a cumulative integration PR for overlap groups, or the whole frozen batch with `--all`. |
-| `deploybot follow [--timeout SECONDS] [--poll SECONDS] [--json]` | Follow the newest exact base-branch head through CI, deployment, and HTTP verification. Defaults: 1800-second timeout and 10-second poll. |
+| `deploybot follow [--if-needed] [--timeout SECONDS] [--poll SECONDS] [--json]` | Follow the newest exact base-branch head through CI, deployment, and HTTP verification. `--if-needed` exits immediately when no unfinished release exists. This command never promotes or drains queued PRs; when queue work remains its output includes a `queue_handoff` naming `deploybot react --follow --dispatch-ci`. Defaults: 1800-second timeout and 10-second poll. |
 | `deploybot pause --reason TEXT` | Pause merging after a delivery failure. |
 | `deploybot unpause --sha SHA --control-id ID [--follow] [--dispatch-ci] [--timeout SECONDS] [--no-wake]` | Conditionally resume the matching failed release after fresh status revalidation and verified repair; a running record can clear only that unique pause, so changed control or advanced main fails closed. The recovery records the exact SHA and reason it resumed so a stale reread of the same failure cannot re-pause it. After recording the recovery, DeployBot immediately reacts so the elected repair merges without waiting for the next event or the five-minute sweep; `--no-wake` records the recovery only, and `--follow`/`--dispatch-ci`/`--timeout` shape that wake-up reaction. The original deploy instruction remains sufficient unless rollback, bypass, or mismatched recovery expands authority. |
 | `deploybot claim-release-repair --provider CLIENT --thread-id ID [--thread-url URL] [--sha SHA]` | Atomically claim the owner-encoded deterministic repair branch for the current failed exact-main release. Other threads recover the same owner from the ref instead of creating duplicate repair PRs. |
@@ -200,19 +200,23 @@ Provider fields are:
 
 ## GitHub Action
 
-The composite Action runs `deploybot react` from the checked-out default branch.
+The composite Action runs either queue reaction or release-only follow from the
+checked-out default branch. The example workflow uses separate job concurrency
+groups so `release_admission = "merged"` can keep admitting ready work while one
+cumulative release follower owns CI and deployment.
 
 | Input | Default | Purpose |
 | --- | --- | --- |
+| `mode` | `react` | Run `react` for queue work or `follow` for release-only ownership. Follow mode uses `--if-needed` and always continues through verified deployment. |
 | `config` | `.mergequeue.toml` | Repository-relative policy path. |
-| `follow` | `"true"` | Add `--follow` to the event worker. |
+| `follow` | `"true"` | In `react` mode, add `--follow` to advance only to the configured merge-admission gate. The split example workflow sets this to `"false"` because its independent release job owns completion. |
 | `dispatch_ci` | `"true"` | Dispatch configured CI after a merge made with `github.token`. |
 | `timeout` | `"1800"` | Release-follow timeout in seconds. |
 | `token` | `""` | GitHub App installation token used to author integration PRs so normal PR checks and events run; empty falls back to `github.token`. |
 
 The workflow needs `contents: write`, `pull-requests: write`, `checks: read`,
 `issues: write`, and `actions: write`. Use the event filters, concurrency group,
-and scheduled full-state reconciliation in
+separate queue/release concurrency groups, and scheduled full-state reconciliation in
 [`examples/github-workflow.yml`](../examples/github-workflow.yml), pin the Action
 to a reviewed full commit SHA, and keep its `workflow_run.workflows` list aligned
 with `pipeline.ci_workflows`.
