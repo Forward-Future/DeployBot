@@ -313,17 +313,6 @@ def follow_release(
                     "dispatched_deployments": dispatched_deployments,
                     "verifications": checks,
                 }
-            if admit_gate == "merged":
-                # Minimum-latency mode is event-driven rather than a long-lived
-                # release poller. A completed deploy with a failing configured
-                # health check is actionable evidence, so let command_follow
-                # record the pause immediately.
-                return {
-                    **value,
-                    "state": "verify-failed",
-                    "dispatched_deployments": dispatched_deployments,
-                    "verifications": checks,
-                }
         if (clock if clock is not None else time.monotonic()) >= deadline:
             state = (
                 "verify-failed"

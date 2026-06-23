@@ -5619,6 +5619,55 @@ def release_follow_needed(client: GitHub) -> bool:
     return True
 
 
+def superseded_release_failure(
+    client: GitHub,
+    *,
+    current_main_sha: str,
+    verified_main_sha: str | None,
+    workflow_runs: list[dict[str, Any]],
+    recovered_main_sha: str | None,
+) -> dict[str, Any] | None:
+    """Find a failed admitted release that a newer merge moved past."""
+    records = client.thread_records(include_terminal=True)
+    if not isinstance(records, list):
+        return None
+    candidates = {
+        str(record.get("merge_sha") or "")
+        for record in records
+        if record.get("phase") == "merged" and record.get("merge_sha")
+    }
+    for main_sha in sorted(candidates):
+        if main_sha in {current_main_sha, recovered_main_sha}:
+            continue
+        if not client.is_ancestor(main_sha, current_main_sha):
+            continue
+        if verified_main_sha and client.is_ancestor(main_sha, verified_main_sha):
+            continue
+        value = release_state(
+            main_sha=main_sha,
+            runs=workflow_runs,
+            config=client.config.pipeline,
+        )
+        if value["state"] == "deploy-failed":
+            return value
+        if value["state"] != "ci-failed":
+            continue
+        grace = client.config.pipeline.ci_failure_grace_seconds
+        latest_ci = value.get("latest_ci") or {}
+        failed_at = parse_time(
+            str(latest_ci.get("updated_at") or latest_ci.get("created_at") or "")
+        )
+        now = parse_time(utc_now())
+        if (
+            not grace
+            or failed_at is None
+            or now is None
+            or (now - failed_at).total_seconds() >= grace
+        ):
+            return value
+    return None
+
+
 def should_settle_batch(client: GitHub, entries: list[QueueEntry]) -> bool:
     has_ready = any(
         client.config.queue_label in entry.labels and entry.state == "ready"
@@ -5784,12 +5833,48 @@ def command_react(
             and bool(control.get("recovered_main_sha"))
             and control.get("recovered_main_sha") == current_main_sha
         )
+        raw_watermark = client.verified_main_sha()
+        admission_gate = client.config.pipeline.release_admission
         release_before_merge = release_state(
             main_sha=current_main_sha,
             runs=workflow_runs,
             config=client.config.pipeline,
         )
-        raw_watermark = client.verified_main_sha()
+        if (
+            admission_gate == "merged"
+            and release_before_merge.get("state") != "verified"
+        ):
+            failed_release = superseded_release_failure(
+                client,
+                current_main_sha=current_main_sha,
+                verified_main_sha=(
+                    str(raw_watermark) if isinstance(raw_watermark, str) else None
+                ),
+                workflow_runs=workflow_runs,
+                recovered_main_sha=(
+                    str(control.get("recovered_main_sha") or "") or None
+                ),
+            )
+            if failed_release is not None:
+                if client.config.pipeline.pause_on_failure:
+                    client.set_pipeline_control(
+                        "paused",
+                        f"{failed_release['state']} on {failed_release['main_sha']}",
+                        main_sha=str(failed_release["main_sha"]),
+                    )
+                result = {
+                    "state": "release-held",
+                    "release": failed_release,
+                    "promoted": {},
+                    "promoted_integrations": [],
+                    "drain": {},
+                    "dispatched_ci": [],
+                    "integrations": [],
+                    "integration_checks": [],
+                    "reconciled_merges": reconciled_merges,
+                }
+                print(json.dumps(result, indent=2, sort_keys=True))
+                return result
         release_already_verified = raw_watermark == current_main_sha
         has_release_owner = (
             not release_already_verified
@@ -5834,6 +5919,21 @@ def command_react(
             # durable merged obligation owns it; historical runs for older
             # SHAs cannot make an unobservable release finish.
             client.record_verified_main(current_main_sha)
+        if admission_gate == "merged" and release_before_merge.get("state") == (
+            "awaiting-deploy"
+        ):
+            # Token-dispatched CI may not emit its workflow_run handoff. Start
+            # the exact authorized deployment before another merge can
+            # supersede this SHA; the deployment's own freshness check then
+            # safely coalesces it if main advances before the lock is acquired.
+            release_before_merge = command_follow(
+                client,
+                timeout_seconds=timeout_seconds,
+                poll_seconds=10,
+                json_output=False,
+                emit=False,
+                admit_gate=admission_gate,
+            )
         release_is_verified = release_already_verified or (
             release_before_merge.get("state") == "verified"
         )
@@ -5859,7 +5959,6 @@ def command_react(
         # reopens immediately for healthy in-flight releases, "ci-passed"
         # waits for exact-main CI, and "verified" waits until production is
         # live. Every mode still stops on an observed release failure.
-        admission_gate = client.config.pipeline.release_admission
         is_release_admitted = (
             release_already_verified
             or release_is_verified

@@ -2708,6 +2708,115 @@ class QueueCoreTest(unittest.TestCase):
         )
         promote.assert_not_called()
 
+    def test_reactor_dispatches_pending_release_before_next_merged_mode_pr(
+        self,
+    ) -> None:
+        sha = "a" * 40
+        config = parse_config(
+            {
+                "queue": {
+                    "required_checks": ["CI"],
+                    "trusted_actors": ["trusted"],
+                },
+                "pipeline": {"release_admission": "merged"},
+            }
+        )
+        client = Mock()
+        client.config = config
+        client.pipeline_control.return_value = {"state": "running"}
+        client.base_sha.return_value = sha
+        client.verified_main_sha.return_value = None
+        client.workflow_runs.return_value = [
+            {
+                "id": 1,
+                "name": "CI",
+                "head_sha": sha,
+                "status": "completed",
+                "conclusion": "success",
+                "event": "workflow_dispatch",
+            }
+        ]
+        client.dispatch_deploy_workflows.return_value = [
+            {"id": 9, "name": "Deploy", "ci_sha": sha, "ci_run_id": 1}
+        ]
+        frozen = FreezeResult(None, [], [], [], [])
+        with (
+            patch(
+                "agent_merge_queue.cli.reconcile_externally_merged_threads",
+                return_value=[],
+            ),
+            patch("agent_merge_queue.cli.settle_integration_checks", return_value=[]),
+            patch("agent_merge_queue.cli.promote_integrations", return_value=[]),
+            patch(
+                "agent_merge_queue.cli.command_promote",
+                return_value={"promoted": [2], "waiting": [], "blocked": []},
+            ),
+            patch("agent_merge_queue.cli.freeze_queue", return_value=frozen),
+            patch(
+                "agent_merge_queue.cli.command_drain",
+                return_value={"merged": [{"number": 2}]},
+            ),
+            redirect_stdout(io.StringIO()),
+        ):
+            result = command_react(client, follow=False, timeout_seconds=10)
+
+        self.assertEqual(result["drain"]["merged"], [{"number": 2}])
+        client.dispatch_deploy_workflows.assert_called_once()
+
+    def test_reactor_pauses_for_failed_superseded_merged_mode_release(self) -> None:
+        old = "a" * 40
+        current = "b" * 40
+        config = parse_config(
+            {
+                "queue": {
+                    "required_checks": ["CI"],
+                    "trusted_actors": ["trusted"],
+                },
+                "pipeline": {"release_admission": "merged"},
+            }
+        )
+        client = Mock()
+        client.config = config
+        client.pipeline_control.return_value = {"state": "running"}
+        client.base_sha.return_value = current
+        client.verified_main_sha.return_value = None
+        client.thread_records.return_value = [
+            {"phase": "merged", "merge_sha": old, "pull_request": 1}
+        ]
+        client.is_ancestor.return_value = True
+        client.workflow_runs.return_value = [
+            {
+                "id": 1,
+                "name": "CI",
+                "head_sha": old,
+                "status": "completed",
+                "conclusion": "success",
+            },
+            {
+                "id": 2,
+                "name": "Deploy",
+                "head_sha": old,
+                "status": "completed",
+                "conclusion": "failure",
+            },
+        ]
+        with (
+            patch(
+                "agent_merge_queue.cli.reconcile_externally_merged_threads",
+                return_value=[],
+            ),
+            patch("agent_merge_queue.cli.command_promote") as promote,
+            redirect_stdout(io.StringIO()),
+        ):
+            result = command_react(client, follow=False, timeout_seconds=10)
+
+        self.assertEqual(result["state"], "release-held")
+        self.assertEqual(result["release"]["main_sha"], old)
+        client.set_pipeline_control.assert_called_once_with(
+            "paused", f"deploy-failed on {old}", main_sha=old
+        )
+        promote.assert_not_called()
+
     def test_release_repair_claim_creates_one_deterministic_lease(self) -> None:
         sha = "a" * 40
         client = object.__new__(GitHub)

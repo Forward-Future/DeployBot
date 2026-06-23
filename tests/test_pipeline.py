@@ -348,6 +348,64 @@ class PipelineTest(unittest.TestCase):
         self.assertEqual(dispatched_ci["id"], newest_ci["id"])
         self.assertEqual(dispatched_ci["head_sha"], newest)
 
+    def test_merged_mode_retries_health_before_reporting_failure(self) -> None:
+        sha = "a" * 40
+        config = parse_config(
+            {
+                "queue": {
+                    "required_checks": ["CI"],
+                    "trusted_actors": ["trusted"],
+                },
+                "pipeline": {
+                    "verifications": [
+                        {"name": "Login", "url": "https://example.test/login"}
+                    ]
+                },
+            }
+        )
+        client = Mock()
+        client.config = config
+        client.base_sha.return_value = sha
+        client.workflow_runs.return_value = [
+            {
+                "id": 1,
+                "name": "CI",
+                "head_sha": sha,
+                "status": "completed",
+                "conclusion": "success",
+            },
+            {
+                "id": 2,
+                "name": "Deploy",
+                "head_sha": sha,
+                "status": "completed",
+                "conclusion": "success",
+            },
+        ]
+        with (
+            patch(
+                "agent_merge_queue.pipeline.http_verifications",
+                side_effect=[
+                    [{"name": "Login", "passed": False}],
+                    [{"name": "Login", "passed": True}],
+                ],
+            ),
+            patch("agent_merge_queue.pipeline.time.sleep") as sleep,
+            patch(
+                "agent_merge_queue.pipeline.time.monotonic",
+                side_effect=[0, 1, 2],
+            ),
+        ):
+            result = follow_release(
+                client,
+                timeout_seconds=10,
+                poll_seconds=1,
+                admit_gate="merged",
+            )
+
+        self.assertEqual(result["state"], "verified")
+        sleep.assert_called_once_with(1)
+
     def test_follow_absorbs_a_ci_rerun_during_failure_grace(self) -> None:
         sha = "a" * 40
         failed = {
