@@ -57,26 +57,46 @@ def release_state(
     ci_fence = parse_time(
         str((ci or {}).get("updated_at") or (ci or {}).get("created_at") or "")
     )
+    eligible_deploys = [
+        run
+        for run in runs
+        if not (
+            str(run.get("status") or "") == "completed"
+            and str(run.get("conclusion") or "") == "skipped"
+        )
+        and (
+            ci_fence is None
+            or (
+                (created_at := parse_time(str(run.get("created_at") or "")))
+                is not None
+                and created_at >= ci_fence
+            )
+        )
+    ]
     deploy = latest_run(
+        eligible_deploys,
+        config.deploy_workflows,
+        main_sha,
+    )
+    successful_deploy = latest_run(
         [
             run
-            for run in runs
-            if not (
-                str(run.get("status") or "") == "completed"
-                and str(run.get("conclusion") or "") == "skipped"
-            )
-            and (
-                ci_fence is None
-                or (
-                    (created_at := parse_time(str(run.get("created_at") or "")))
-                    is not None
-                    and created_at >= ci_fence
-                )
-            )
+            for run in eligible_deploys
+            if str(run.get("status") or "") == "completed"
+            and str(run.get("conclusion") or "") == "success"
         ],
         config.deploy_workflows,
         main_sha,
     )
+    # Successful exact-main release evidence is durable. A later duplicate
+    # dispatch may be cancelled by workflow concurrency, but it cannot make an
+    # already verified revision become undeployed.
+    if (
+        successful_deploy is not None
+        and str((deploy or {}).get("status") or "") == "completed"
+        and str((deploy or {}).get("conclusion") or "") == "cancelled"
+    ):
+        deploy = successful_deploy
     active_ci = [
         workflow_run(run)
         for run in runs
