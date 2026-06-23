@@ -5404,6 +5404,39 @@ def record_pending_deployment_notification(
     return record
 
 
+def emit_follow_result(
+    client: GitHub,
+    result: dict[str, Any],
+    *,
+    json_output: bool,
+) -> dict[str, Any]:
+    queued_numbers = client.queued_numbers()
+    if queued_numbers:
+        result = {
+            **result,
+            "queue_handoff": {
+                "state": "queued-work-remains",
+                "pull_requests": queued_numbers,
+                "reason": (
+                    "follow is release-only and does not promote or drain queued "
+                    "pull requests"
+                ),
+                "required_command": "deploybot react --follow --dispatch-ci",
+            },
+        }
+    if json_output:
+        print(json.dumps(result, indent=2, sort_keys=True))
+    else:
+        print(f"release {result['state']} on {result['main_sha']}")
+        if queued_numbers:
+            pulls = ", ".join(f"#{number}" for number in queued_numbers)
+            print(
+                f"queued pull requests remain ({pulls}); run "
+                "deploybot react --follow --dispatch-ci"
+            )
+    return result
+
+
 def command_follow(
     client: GitHub,
     *,
@@ -5420,12 +5453,11 @@ def command_follow(
             "main_sha": client.base_sha(),
             "reason": "no unfinished exact-main release needs a follower",
         }
-        if emit:
-            if json_output:
-                print(json.dumps(result, indent=2, sort_keys=True))
-            else:
-                print(f"release idle on {result['main_sha']}")
-        return result
+        return (
+            emit_follow_result(client, result, json_output=json_output)
+            if emit
+            else result
+        )
     try:
         result = follow_release(
             client,
@@ -5593,31 +5625,7 @@ def command_follow(
         )
     if not emit:
         return result
-    queued_numbers = client.queued_numbers()
-    if queued_numbers:
-        result = {
-            **result,
-            "queue_handoff": {
-                "state": "queued-work-remains",
-                "pull_requests": queued_numbers,
-                "reason": (
-                    "follow is release-only and does not promote or drain queued "
-                    "pull requests"
-                ),
-                "required_command": "deploybot react --follow --dispatch-ci",
-            },
-        }
-    if json_output:
-        print(json.dumps(result, indent=2, sort_keys=True))
-    else:
-        print(f"release {result['state']} on {result['main_sha']}")
-        if queued_numbers:
-            pulls = ", ".join(f"#{number}" for number in queued_numbers)
-            print(
-                f"queued pull requests remain ({pulls}); run "
-                "deploybot react --follow --dispatch-ci"
-            )
-    return result
+    return emit_follow_result(client, result, json_output=json_output)
 
 
 def release_follow_needed(client: GitHub) -> bool:

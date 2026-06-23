@@ -239,6 +239,7 @@ class QueueCoreTest(unittest.TestCase):
         sha = "a" * 40
         client = Mock()
         client.base_sha.return_value = sha
+        client.queued_numbers.return_value = []
 
         with (
             patch("agent_merge_queue.cli.release_follow_needed", return_value=False),
@@ -255,6 +256,29 @@ class QueueCoreTest(unittest.TestCase):
 
         self.assertEqual(result["state"], "idle")
         self.assertEqual(result["main_sha"], sha)
+        follow.assert_not_called()
+
+    def test_idle_if_needed_follow_still_reports_queued_work(self) -> None:
+        sha = "a" * 40
+        client = Mock()
+        client.base_sha.return_value = sha
+        client.queued_numbers.return_value = [42]
+
+        with (
+            patch("agent_merge_queue.cli.release_follow_needed", return_value=False),
+            patch("agent_merge_queue.cli.follow_release") as follow,
+            redirect_stdout(io.StringIO()),
+        ):
+            result = command_follow(
+                client,
+                timeout_seconds=10,
+                poll_seconds=1,
+                json_output=True,
+                if_needed=True,
+            )
+
+        self.assertEqual(result["state"], "idle")
+        self.assertEqual(result["queue_handoff"]["pull_requests"], [42])
         follow.assert_not_called()
 
     def test_pull_release_details_reads_human_facing_metadata(self) -> None:
