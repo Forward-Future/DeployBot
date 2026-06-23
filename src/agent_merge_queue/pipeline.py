@@ -73,16 +73,35 @@ def release_state(
     )
     # CI triggered by a merge and CI explicitly dispatched by DeployBot can
     # race on the same commit. Workflow concurrency may cancel whichever run
-    # GitHub created last, but that duplicate cancellation cannot invalidate a
-    # completed substantive run for the identical source tree. Preserve the
-    # newest non-cancelled result so real later failures and active reruns stay
-    # authoritative.
+    # GitHub created last, but that concurrent, different-trigger duplicate
+    # cannot invalidate a completed success for the identical source tree. A
+    # later cancelled rerun remains authoritative. A substantive failure or
+    # active run is always more useful and at least as conservative.
     if (
         substantive_ci is not None
         and str((ci or {}).get("status") or "") == "completed"
         and str((ci or {}).get("conclusion") or "") == "cancelled"
     ):
-        ci = substantive_ci
+        substantive_conclusion = str(substantive_ci.get("conclusion") or "")
+        cancelled_created = parse_time(str((ci or {}).get("created_at") or ""))
+        substantive_finished = parse_time(
+            str(
+                substantive_ci.get("updated_at")
+                or substantive_ci.get("created_at")
+                or ""
+            )
+        )
+        concurrent_duplicate_success = (
+            substantive_conclusion == "success"
+            and bool((ci or {}).get("event"))
+            and bool(substantive_ci.get("event"))
+            and (ci or {}).get("event") != substantive_ci.get("event")
+            and cancelled_created is not None
+            and substantive_finished is not None
+            and cancelled_created <= substantive_finished
+        )
+        if substantive_conclusion != "success" or concurrent_duplicate_success:
+            ci = substantive_ci
     # A workflow_run deployment commonly starts for pull-request CI and then
     # skips itself because the upstream run was not exact main. GitHub reports
     # the downstream run against the default-branch SHA, so it can otherwise

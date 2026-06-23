@@ -87,7 +87,9 @@ jobs:
 
   release:
     needs: react
-    if: ${{ needs.react.result == 'success' }}
+    # Release progress is independent from a queue-specific failure, but an
+    # intentionally cancelled or policy-skipped reaction starts no follower.
+    if: ${{ always() && (needs.react.result == 'success' || needs.react.result == 'failure') }}
     runs-on: ubuntu-latest
     concurrency:
       group: deploybot-release-${{ github.repository }}

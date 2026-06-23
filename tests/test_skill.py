@@ -216,6 +216,8 @@ class DeployBotSkillTest(unittest.TestCase):
         self.assertIn("deploybot-queue-${{ github.repository }}", workflow)
         self.assertIn("deploybot-release-${{ github.repository }}", workflow)
         self.assertIn("Release-only ownership never promotes or drains", workflow)
+        self.assertIn("always()", workflow)
+        self.assertIn("needs.react.result == 'failure'", workflow)
         self.assertIn("&& '2400' || '600'", workflow)
 
     def test_workflows_pin_current_checkout_runtime(self) -> None:

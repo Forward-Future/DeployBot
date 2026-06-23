@@ -205,6 +205,36 @@ class PipelineTest(unittest.TestCase):
         self.assertEqual(value["state"], "ci-failed")
         self.assertEqual(value["latest_ci"]["id"], 2)
 
+    def test_later_cancelled_rerun_remains_authoritative(self) -> None:
+        sha = "a" * 40
+        runs = [
+            {
+                "id": 1,
+                "name": "CI",
+                "head_sha": sha,
+                "status": "completed",
+                "conclusion": "success",
+                "event": "workflow_dispatch",
+                "created_at": "2026-06-20T00:00:00Z",
+                "updated_at": "2026-06-20T00:01:00Z",
+            },
+            {
+                "id": 2,
+                "name": "CI",
+                "head_sha": sha,
+                "status": "completed",
+                "conclusion": "cancelled",
+                "event": "push",
+                "created_at": "2026-06-20T00:02:00Z",
+                "updated_at": "2026-06-20T00:03:00Z",
+            },
+        ]
+
+        value = release_state(main_sha=sha, runs=runs, config=CONFIG.pipeline)
+
+        self.assertEqual(value["state"], "ci-failed")
+        self.assertEqual(value["latest_ci"]["id"], 2)
+
     def test_later_failed_deploy_is_not_hidden_by_older_success(self) -> None:
         sha = "a" * 40
         runs = [
