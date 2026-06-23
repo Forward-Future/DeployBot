@@ -31,6 +31,15 @@ fresh review, and follow cumulative `main` through verified deployment. When
 `release_admission = "merged"`, admit independent ready work immediately after
 merge while release events continue asynchronously; later failures still pause.
 
+Use the reaction path for queue-changing coordination. `follow_release` is
+release-only: it observes the current base revision and never promotes or
+drains queued pull requests. For a queue-wide request such as "all open PRs,"
+refresh `pipeline_status`, `queue_plan`, and the provider's open pull-request
+list after the verified release. Stop only when the queue, unbound PRs, and
+provider list are all empty at that same fresh boundary.
+In GitHub Actions, keep queue reaction and release-only follow in separate
+concurrency groups so release ownership never holds up merged-mode admission.
+
 For each verified `thread_notifications` entry, post its message back to the
 native PR-opening thread and only then call `acknowledge_thread_deployment`. Leave
 failed notifications `pending` for a later retry, and pass the matching

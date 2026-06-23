@@ -44,6 +44,14 @@ Use `pipeline_status`, then `react_to_delivery_event` or the narrower queue
 tools. Preserve first-in order unless dependencies require another order. Merge
 independent ready PRs back-to-back without rebasing merely because `main` moved.
 
+Use the reaction path for queue work. `follow_release` / `deploybot follow` is
+release-only and never promotes or drains queued pull requests. For an
+"all open PRs" request, refresh status, the plan, and the provider's open list
+after the verified release; react again for newly opened authorized work and
+stop only when all three are empty at the same fresh boundary.
+In GitHub Actions, keep queue reaction and release-only follow in separate
+concurrency groups so release ownership never holds up merged-mode admission.
+
 Skip blocked or waiting PRs so they do not stop independent work. A blocker
 creates a structured repair handoff to the source thread. After the repair has
 fresh checks and review, call `resume_pull_request` once. If policy requests an

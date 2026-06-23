@@ -1,6 +1,10 @@
 name: DeployBot
 description: Promote, batch, merge, and follow agent-authored pull requests
 inputs:
+  mode:
+    description: Run queue reaction or release-only follow
+    required: false
+    default: react
   config:
     description: Repository-relative merge queue policy path
     required: false
@@ -32,16 +36,28 @@ runs:
     - shell: bash
       env:
         DEPLOYBOT_CONFIG: ${{ inputs.config }}
+        DEPLOYBOT_MODE: ${{ inputs.mode }}
         GH_TOKEN: ${{ inputs.token || github.token }}
         DEPLOYBOT_FOLLOW: ${{ inputs.follow }}
         DEPLOYBOT_DISPATCH_CI: ${{ inputs.dispatch_ci }}
         DEPLOYBOT_TIMEOUT: ${{ inputs.timeout }}
       run: |
-        args=(react --timeout "$DEPLOYBOT_TIMEOUT")
-        if [[ "$DEPLOYBOT_DISPATCH_CI" == "true" ]]; then
-          args+=(--dispatch-ci)
-        fi
-        if [[ "$DEPLOYBOT_FOLLOW" == "true" ]]; then
-          args+=(--follow)
-        fi
+        case "$DEPLOYBOT_MODE" in
+          react)
+            args=(react --timeout "$DEPLOYBOT_TIMEOUT")
+            if [[ "$DEPLOYBOT_DISPATCH_CI" == "true" ]]; then
+              args+=(--dispatch-ci)
+            fi
+            if [[ "$DEPLOYBOT_FOLLOW" == "true" ]]; then
+              args+=(--follow)
+            fi
+            ;;
+          follow)
+            args=(follow --timeout "$DEPLOYBOT_TIMEOUT" --if-needed)
+            ;;
+          *)
+            echo "mode must be react or follow" >&2
+            exit 2
+            ;;
+        esac
         deploybot --config "$DEPLOYBOT_CONFIG" "${args[@]}"

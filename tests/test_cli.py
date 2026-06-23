@@ -201,6 +201,62 @@ class QueueCoreTest(unittest.TestCase):
             "paused", f"ci-failed on {sha}", main_sha=sha
         )
 
+    def test_direct_follow_reports_queued_work_handoff(self) -> None:
+        sha = "a" * 40
+        client = Mock()
+        client.config = CONFIG
+        client.queued_numbers.return_value = [42, 43]
+        release = {
+            "state": "testing",
+            "main_sha": sha,
+            "latest_ci": None,
+            "latest_deploy": None,
+            "verifications": [],
+        }
+
+        output = io.StringIO()
+        with (
+            patch("agent_merge_queue.cli.follow_release", return_value=release),
+            redirect_stdout(output),
+        ):
+            result = command_follow(
+                client,
+                timeout_seconds=10,
+                poll_seconds=1,
+                json_output=True,
+            )
+
+        handoff = result["queue_handoff"]
+        self.assertEqual(handoff["pull_requests"], [42, 43])
+        self.assertEqual(
+            handoff["required_command"],
+            "deploybot react --follow --dispatch-ci",
+        )
+        self.assertIn("release-only", handoff["reason"])
+        self.assertEqual(json.loads(output.getvalue()), result)
+
+    def test_if_needed_follow_returns_immediately_without_release_work(self) -> None:
+        sha = "a" * 40
+        client = Mock()
+        client.base_sha.return_value = sha
+
+        with (
+            patch("agent_merge_queue.cli.release_follow_needed", return_value=False),
+            patch("agent_merge_queue.cli.follow_release") as follow,
+        ):
+            result = command_follow(
+                client,
+                timeout_seconds=10,
+                poll_seconds=1,
+                json_output=False,
+                emit=False,
+                if_needed=True,
+            )
+
+        self.assertEqual(result["state"], "idle")
+        self.assertEqual(result["main_sha"], sha)
+        follow.assert_not_called()
+
     def test_pull_release_details_reads_human_facing_metadata(self) -> None:
         client = object.__new__(GitHub)
         client.repository = "example/repo"
@@ -308,6 +364,33 @@ class QueueCoreTest(unittest.TestCase):
 
         self.assertEqual(result, 0)
         print_status.assert_called_once_with(status, json_output=True)
+
+    def test_direct_follow_owns_verified_release_independent_of_admission(self) -> None:
+        config = parse_config(
+            {
+                "queue": {
+                    "required_checks": ["CI"],
+                    "trusted_actors": ["trusted"],
+                },
+                "pipeline": {"release_admission": "merged"},
+            }
+        )
+        with (
+            patch("agent_merge_queue.cli.load_config", return_value=config),
+            patch("agent_merge_queue.cli.GitHub") as github,
+            patch("agent_merge_queue.cli.command_follow") as follow,
+        ):
+            result = main(["follow", "--if-needed", "--timeout", "10"])
+
+        self.assertEqual(result, 0)
+        follow.assert_called_once_with(
+            github.return_value,
+            timeout_seconds=10,
+            poll_seconds=10,
+            json_output=False,
+            admit_gate="verified",
+            if_needed=True,
+        )
 
     def test_dependency_directive_is_configurable(self) -> None:
         body = "Queue-after: #12, #14\nBlocked by #99"
@@ -7986,6 +8069,22 @@ class QueueCoreTest(unittest.TestCase):
             return_value={"state": "verified"},
         ):
             self.assertFalse(release_follow_needed(client))
+
+    def test_release_follower_survives_ci_registration_lag_after_merge(self) -> None:
+        sha = "a" * 40
+        client = Mock()
+        client.config = CONFIG
+        client.base_sha.return_value = sha
+        client.workflow_runs.return_value = []
+        client.verified_main_sha.return_value = "f" * 40
+        client.thread_records.return_value = [
+            {"phase": "merged", "merge_sha": sha, "pull_request": 42}
+        ]
+        client.is_ancestor.return_value = True
+
+        self.assertTrue(release_follow_needed(client))
+
+        client.is_ancestor.assert_called_once_with(sha, sha)
 
     def test_verified_release_retries_receipt_when_webhook_is_ready(self) -> None:
         config = parse_config(

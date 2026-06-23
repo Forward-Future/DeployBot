@@ -31,6 +31,14 @@ after fresh review. In `release_admission = "merged"` mode, admit independent
 ready work immediately after merge while later events track CI and deployment;
 a later failure pauses the pipeline.
 
+Use `deploybot react --follow --dispatch-ci` for queue work. `deploybot follow`
+is release-only and never promotes or drains queued pull requests. For an
+"all open PRs" request, refresh status, the plan, and the provider's open list
+after the verified release; react again for newly opened authorized work and
+stop only when all three are empty at the same fresh boundary.
+In GitHub Actions, keep queue reaction and release-only follow in separate
+concurrency groups so release ownership never holds up merged-mode admission.
+
 A genuine repair remains merge-ineligible, but DeployBot may temporarily hold
 overlapping ready work for the configured bounded repair window so concurrent
 merges do not repeatedly invalidate the replacement head.

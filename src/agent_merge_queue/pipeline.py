@@ -59,6 +59,30 @@ def release_state(
     *, main_sha: str, runs: list[dict[str, Any]], config: PipelineConfig
 ) -> dict[str, Any]:
     ci = latest_run(runs, config.ci_workflows, main_sha)
+    substantive_ci = latest_run(
+        [
+            run
+            for run in runs
+            if not (
+                str(run.get("status") or "") == "completed"
+                and str(run.get("conclusion") or "") == "cancelled"
+            )
+        ],
+        config.ci_workflows,
+        main_sha,
+    )
+    # CI triggered by a merge and CI explicitly dispatched by DeployBot can
+    # race on the same commit. Workflow concurrency may cancel whichever run
+    # GitHub created last, but that duplicate cancellation cannot invalidate a
+    # completed substantive run for the identical source tree. Preserve the
+    # newest non-cancelled result so real later failures and active reruns stay
+    # authoritative.
+    if (
+        substantive_ci is not None
+        and str((ci or {}).get("status") or "") == "completed"
+        and str((ci or {}).get("conclusion") or "") == "cancelled"
+    ):
+        ci = substantive_ci
     # A workflow_run deployment commonly starts for pull-request CI and then
     # skips itself because the upstream run was not exact main. GitHub reports
     # the downstream run against the default-branch SHA, so it can otherwise

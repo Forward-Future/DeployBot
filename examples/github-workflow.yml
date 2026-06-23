@@ -24,10 +24,6 @@ permissions:
   issues: write
   actions: write # required for post-merge workflow_dispatch with github.token
 
-concurrency:
-  group: deploybot-${{ github.repository }}
-  cancel-in-progress: false
-
 jobs:
   react:
     # If CI intentionally hands off from a protected release branch, replace
@@ -72,6 +68,9 @@ jobs:
         )
       )
     runs-on: ubuntu-latest
+    concurrency:
+      group: deploybot-queue-${{ github.repository }}
+      cancel-in-progress: false
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
         with:
@@ -80,8 +79,26 @@ jobs:
       # v0.2.25 implementation; keep the full commit for privileged workflows.
       - uses: Forward-Future/DeployBot@12c6c03aa76a553fa4068279baa29e90a30bbeb1
         with:
-          # PR and review events reconcile immediately. Release-owner events
-          # advance to the configured admission gate; "merged" observations
-          # return quickly, while the schedule remains a fallback reconciliation.
-          follow: ${{ github.event_name == 'workflow_run' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
+          # Keep queue admission independent from release ownership so merged
+          # mode can continue admitting ready work while CI and Deploy run.
+          follow: "false"
           timeout: ${{ (github.event_name == 'workflow_run' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && '2400' || '600' }}
+
+  release:
+    needs: react
+    if: ${{ needs.react.result == 'success' }}
+    runs-on: ubuntu-latest
+    concurrency:
+      group: deploybot-release-${{ github.repository }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+      # Release-only ownership never promotes or drains pull requests. It
+      # exits immediately when no exact-main release needs work.
+      - uses: Forward-Future/DeployBot@12c6c03aa76a553fa4068279baa29e90a30bbeb1
+        with:
+          mode: follow
+          timeout: "2400"

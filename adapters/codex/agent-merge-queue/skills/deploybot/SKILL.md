@@ -77,6 +77,14 @@ Only the designated coordinator may run `deploybot promote`, `deploybot react`,
 pause, freeze one exact batch, preserve first-in order unless dependencies
 require otherwise, and skip blocked items that do not block independent work.
 
+Use `deploybot react --follow --dispatch-ci` for queue-changing coordination.
+`deploybot follow` is release-only: it follows the current `main` revision but
+never promotes or drains queued pull requests. Do not substitute it for
+`react` when work is queued.
+In GitHub Actions, keep queue reaction and release-only follow in separate
+concurrency groups so `release_admission = "merged"` can admit more work while
+one follower owns cumulative exact-main CI and deployment.
+
 Merge independent ready pull requests back-to-back. Route source-overlap groups
 through `deploybot integrate`; when policy mode is `all`, validate the entire
 frozen batch through that cumulative PR. Never invent a conflict resolution.
@@ -85,6 +93,13 @@ its new exact head passes. Keep release tracking event-driven: in
 `release_admission = "merged"` mode, admit independent ready work immediately
 after a healthy merge while later events continue CI, deployment, and health
 tracking. Scheduled reconciliation is a fallback, not the normal promotion path.
+
+For queue-wide requests such as "all open PRs," treat the target set as live,
+not as the first snapshot. After each verified cumulative release, refresh
+`deploybot status --json`, `deploybot plan --json`, and the provider's open-PR
+list once more. Admit newly opened authorized work and react again. Stop only
+when the queue, unbound list, and provider open-PR list are all empty at the
+same fresh boundary; do not leave a tight idle polling loop behind.
 
 Genuine repair blocks may hold overlapping ready work for the configured bounded
 repair window, but they remain merge-ineligible until the trusted source agent
