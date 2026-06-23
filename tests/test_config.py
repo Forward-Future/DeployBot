@@ -115,7 +115,8 @@ class ConfigTest(unittest.TestCase):
 
         self.assertEqual(path.name, ".mergequeue.toml")
         self.assertEqual(config.required_checks, ("CI",))
-        self.assertEqual(config.pipeline.release_admission, "verified")
+        self.assertEqual(config.pipeline.release_admission, "merged")
+        self.assertEqual(config.pipeline.batch_settle_seconds, 0)
         self.assertEqual(
             config.trusted_actors,
             ("@repository-owner",),

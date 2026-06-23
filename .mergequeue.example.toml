@@ -44,6 +44,7 @@ registry_title = "DeployBot delivery registry"
 thread_active_hours = 72
 ci_workflows = ["CI"]
 deploy_workflows = ["Deploy"]
+batch_settle_seconds = 0
 repair_hold_minutes = 60
 hold_merges_while_releasing = true
 repair_branch_prefix = "deploybot/repair"
@@ -52,10 +53,10 @@ merge_to_live_target_minutes = 10
 auto_promote = true
 intent_scope = "head" # safest: a trusted source agent refreshes replacement heads
 pause_on_failure = true
-# verified (default, safest) holds new merges until the cumulative release is
-# live. ci-passed admits the next batch as soon as exact-main CI passes and lets
-# deploy and health checks keep following, trading blast radius for throughput.
-release_admission = "verified"
+# merged (default) admits independent ready work immediately after the previous
+# merge. ci-passed waits for exact-main CI; verified waits until production is
+# live. Every mode pauses future merges when a later release failure is observed.
+release_admission = "merged"
 # Receives best-effort events, including retryable thread-deployed messages.
 # webhook_url_env = "DEPLOYBOT_WEBHOOK_URL"
 

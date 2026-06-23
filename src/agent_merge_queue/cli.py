@@ -28,6 +28,7 @@ from .pipeline import (
     follow_release,
     http_verifications,
     notify,
+    release_admitted,
     release_state,
     seconds_between,
     summarize_metrics,
@@ -5092,9 +5093,13 @@ def command_drain(
             key = tuple(int(value) for value in group["pull_requests"])
             integration_by_members[key] = group
         next_batch = list(batch_result["next_batch"])
-        if batch_result["merged"]:
-            # One reaction owns one bounded release batch. Leave the FIFO
-            # remainder for the event that runs after exact-main verification.
+        if (
+            batch_result["merged"]
+            and client.config.pipeline.release_admission != "merged"
+        ):
+            # Stricter admission modes own one bounded release batch at a time.
+            # Minimum-latency mode keeps draining independent FIFO batches in
+            # this same event, before CI or deployment begins.
             break
         if not next_batch:
             break
@@ -5850,22 +5855,21 @@ def command_react(
             release_is_verified = release_before_merge["state"] == "verified"
         if release_is_verified:
             client.record_verified_main(current_main_sha)
-        # In "verified" mode the next batch waits for the cumulative release to
-        # be fully live. In "ci-passed" mode admission reopens as soon as
-        # exact-main CI is green (deploy in flight), so merges stop waiting on
-        # deploy and health-check time.
+        # Release admission is independent from release tracking. "merged"
+        # reopens immediately for healthy in-flight releases, "ci-passed"
+        # waits for exact-main CI, and "verified" waits until production is
+        # live. Every mode still stops on an observed release failure.
         admission_gate = client.config.pipeline.release_admission
-        admitted_states = {"verified"}
-        if admission_gate == "ci-passed":
-            admitted_states |= {"awaiting-deploy", "deploying"}
-        release_admitted = (
+        is_release_admitted = (
             release_already_verified
             or release_is_verified
-            or release_before_merge.get("state") in admitted_states
+            or release_admitted(
+                str(release_before_merge.get("state") or ""), admission_gate
+            )
         )
         if (
             has_release_owner
-            and not release_admitted
+            and not is_release_admitted
             and not recovering_current_main
         ):
             release = release_before_merge
@@ -5878,7 +5882,9 @@ def command_react(
                     emit=False,
                     admit_gate=admission_gate,
                 )
-            if release.get("state") not in admitted_states:
+            if not release_admitted(
+                str(release.get("state") or ""), admission_gate
+            ):
                 result = {
                     "state": "release-held",
                     "release": release,
@@ -6528,6 +6534,7 @@ def main(argv: list[str] | None = None) -> int:
                 timeout_seconds=arguments.timeout,
                 poll_seconds=arguments.poll,
                 json_output=arguments.json_output,
+                admit_gate=client.config.pipeline.release_admission,
             )
         elif arguments.command == "pause":
             command_control(client, state="paused", reason=arguments.reason)

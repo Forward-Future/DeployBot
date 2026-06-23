@@ -27,8 +27,9 @@ Run `deploybot status --json` before a burst and `deploybot react` to coordinate
 it. Merge independent ready PRs back-to-back, skip blocked work, honor explicit
 dependencies, and use `deploybot integrate` for overlaps or a cumulative batch
 gate. Return repair packets to their source thread and run `deploybot resume`
-after fresh review. Finish with `deploybot follow --json`; a failed CI or
-deployment pauses the pipeline until verified recovery.
+after fresh review. In `release_admission = "merged"` mode, admit independent
+ready work immediately after merge while later events track CI and deployment;
+a later failure pauses the pipeline.
 
 A genuine repair remains merge-ineligible, but DeployBot may temporarily hold
 overlapping ready work for the configured bounded repair window so concurrent
@@ -36,8 +37,8 @@ merges do not repeatedly invalidate the replacement head.
 
 Before creating an exact-main recovery, run `deploybot claim-release-repair`;
 only the returned `owned` thread may use the deterministic repair branch. Respect the
-maximum batch size and keep new merges closed while an earlier release is
-unfinished.
+maximum batch size and the selected `merged`, `ci-passed`, or `verified`
+release-admission fence.
 
 Immediately before asking the user to `unpause` or take another repair action,
 run `deploybot status --json` again. Never show a stale pause prompt when

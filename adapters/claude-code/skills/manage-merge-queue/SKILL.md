@@ -26,8 +26,9 @@ poll or merge an unlabeled PR.
 Use `pipeline_status` and `react_to_delivery_event` for bursts. Skip blockers,
 honor dependencies, route overlap or cumulative validation through
 `create_integration_pull_request`, return repair packets to the source thread,
-and use `resume_pull_request` after fresh review. Finish with `follow_release`;
-a failed CI or deployment pauses the pipeline until verified recovery.
+and use `resume_pull_request` after fresh review. In `release_admission =
+"merged"` mode, admit independent ready work immediately after merge while
+later events track CI and deployment; a later failure pauses the pipeline.
 
 A genuine repair remains merge-ineligible, but DeployBot may temporarily hold
 overlapping ready work for the configured bounded repair window so concurrent
@@ -35,8 +36,8 @@ merges do not repeatedly invalidate the replacement head.
 
 Before creating an exact-main recovery, call `claim_release_repair`; only the
 returned `owned` thread may use the deterministic repair branch. Respect the
-maximum batch size and keep new merges closed while an earlier release is
-unfinished.
+maximum batch size and the selected `merged`, `ci-passed`, or `verified`
+release-admission fence.
 
 Immediately before asking the user to `unpause` or take another repair action,
 call `pipeline_status` again. Never show a stale pause prompt when durable state

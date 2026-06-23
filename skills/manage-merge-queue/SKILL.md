@@ -54,12 +54,14 @@ A genuine repair remains merge-ineligible, but DeployBot may temporarily hold
 overlapping ready work for the configured bounded repair window so concurrent
 merges do not repeatedly invalidate the replacement head.
 
-Finish with `follow_release`, tracking newer cumulative base heads through CI,
-deployment, and configured health checks. A failure pauses further merges until
+Track newer cumulative base heads through CI, deployment, and configured health
+checks from release events. With `release_admission = "merged"`, immediately
+admit the next independent ready batch after merge instead of occupying the merge
+worker while production catches up. A later failure pauses further merges until
 the coordinator verifies recovery and unpauses. Before creating that recovery,
 call `claim_release_repair`; only the returned `owned` thread may use the
-deterministic repair branch. Respect the configured maximum batch size and keep
-new merges closed while an earlier exact-main release is unfinished. Record
+deterministic repair branch. Respect the configured maximum batch size and the
+selected `merged`, `ci-passed`, or `verified` release-admission fence. Record
 exact heads, review
 verdicts, merged commits, waiting items, repair packets, integration groups, and
 delivery timing.

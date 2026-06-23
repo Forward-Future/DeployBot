@@ -14,6 +14,16 @@ from .config import PipelineConfig
 from .records import parse_time
 
 
+def release_admitted(state: str, admit_gate: str) -> bool:
+    """Return whether a healthy release state permits another merge."""
+    admitted = {"verified"}
+    if admit_gate == "ci-passed":
+        admitted.update({"awaiting-deploy", "deploying"})
+    elif admit_gate == "merged":
+        admitted.update({"testing", "awaiting-deploy", "deploying"})
+    return state in admitted
+
+
 def workflow_run(run: dict[str, Any]) -> dict[str, Any]:
     return {
         "id": run.get("id"),
@@ -283,14 +293,12 @@ def follow_release(
                     client.dispatch_deploy_workflows(ci_run=ci)
                 )
                 dispatched_for.add(key)
-        if admit_gate == "ci-passed" and value["state"] in {
-            "awaiting-deploy",
-            "deploying",
-        }:
-            # Exact-main CI already passed and the deployment is in flight. Hand
-            # control back so the next batch can merge; a later reaction (or the
-            # scheduled reconciliation) follows this deployment through to
-            # verification, records the watermark, and emits notifications.
+        if value["state"] != "verified" and release_admitted(
+            str(value["state"]), admit_gate
+        ):
+            # The configured admission milestone has passed. Hand control back
+            # so independent ready work can merge; later release events (or the
+            # scheduled fallback) continue from durable GitHub state.
             return {
                 **value,
                 "dispatched_deployments": dispatched_deployments,
@@ -302,6 +310,17 @@ def follow_release(
             if all(item["passed"] for item in checks):
                 return {
                     **value,
+                    "dispatched_deployments": dispatched_deployments,
+                    "verifications": checks,
+                }
+            if admit_gate == "merged":
+                # Minimum-latency mode is event-driven rather than a long-lived
+                # release poller. A completed deploy with a failing configured
+                # health check is actionable evidence, so let command_follow
+                # record the pause immediately.
+                return {
+                    **value,
+                    "state": "verify-failed",
                     "dispatched_deployments": dispatched_deployments,
                     "verifications": checks,
                 }

@@ -175,7 +175,7 @@ def follow_release(
     repository: str | None = None,
     config: str | None = None,
 ) -> str:
-    """Follow newest exact main through CI, deployment, and health verification."""
+    """Advance the newest exact-main release to its configured admission gate."""
     return _run(
         "follow",
         "--timeout",

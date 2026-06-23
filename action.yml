@@ -6,7 +6,7 @@ inputs:
     required: false
     default: .mergequeue.toml
   follow:
-    description: Follow cumulative main through CI and deployment
+    description: Advance cumulative main to the configured release-admission gate
     required: false
     default: "true"
   dispatch_ci:

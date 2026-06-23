@@ -14,7 +14,10 @@ from agent_merge_queue.pipeline import (
 
 
 CONFIG = parse_config(
-    {"queue": {"required_checks": ["CI"], "trusted_actors": ["trusted"]}}
+    {
+        "queue": {"required_checks": ["CI"], "trusted_actors": ["trusted"]},
+        "pipeline": {"release_admission": "verified"},
+    }
 )
 
 
@@ -276,6 +279,74 @@ class PipelineTest(unittest.TestCase):
         self.assertEqual(result["state"], "awaiting-deploy")
         self.assertEqual(result["dispatched_deployments"][0]["id"], 9)
         sleep.assert_not_called()
+
+    def test_follow_admits_at_merged_while_ci_is_still_running(self) -> None:
+        sha = "a" * 40
+        client = Mock()
+        client.config = CONFIG
+        client.base_sha.return_value = sha
+        client.workflow_runs.return_value = [
+            {
+                "id": 1,
+                "name": "CI",
+                "head_sha": sha,
+                "status": "in_progress",
+                "conclusion": None,
+            }
+        ]
+        with (
+            patch("agent_merge_queue.pipeline.time.sleep") as sleep,
+            patch("agent_merge_queue.pipeline.time.monotonic", return_value=0),
+        ):
+            result = follow_release(
+                client,
+                timeout_seconds=10,
+                poll_seconds=1,
+                admit_gate="merged",
+            )
+
+        self.assertEqual(result["state"], "testing")
+        sleep.assert_not_called()
+
+    def test_merged_mode_dispatches_only_newest_main_deployment(self) -> None:
+        old = "a" * 40
+        newest = "b" * 40
+        old_ci = {
+            "id": 1,
+            "name": "CI",
+            "head_sha": old,
+            "status": "completed",
+            "conclusion": "success",
+            "event": "workflow_dispatch",
+        }
+        newest_ci = {
+            "id": 2,
+            "name": "CI",
+            "head_sha": newest,
+            "status": "completed",
+            "conclusion": "success",
+            "event": "workflow_dispatch",
+        }
+        client = Mock()
+        client.config = CONFIG
+        client.base_sha.return_value = newest
+        client.workflow_runs.return_value = [old_ci, newest_ci]
+        client.dispatch_deploy_workflows.return_value = [
+            {"id": 9, "name": "Deploy", "ci_sha": newest, "ci_run_id": 2}
+        ]
+
+        result = follow_release(
+            client,
+            timeout_seconds=10,
+            poll_seconds=1,
+            admit_gate="merged",
+        )
+
+        self.assertEqual(result["main_sha"], newest)
+        client.dispatch_deploy_workflows.assert_called_once()
+        dispatched_ci = client.dispatch_deploy_workflows.call_args.kwargs["ci_run"]
+        self.assertEqual(dispatched_ci["id"], newest_ci["id"])
+        self.assertEqual(dispatched_ci["head_sha"], newest)
 
     def test_follow_absorbs_a_ci_rerun_during_failure_grace(self) -> None:
         sha = "a" * 40
