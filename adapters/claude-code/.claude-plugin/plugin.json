@@ -1,6 +1,6 @@
 {
   "name": "deploybot",
-  "version": "0.2.24",
+  "version": "0.2.25",
   "description": "DeployBot: a provider-neutral GitHub merge queue for coding agents",
   "author": {
     "name": "DeployBot contributors"
