@@ -77,6 +77,75 @@ class PipelineTest(unittest.TestCase):
         self.assertEqual(value["state"], "awaiting-deploy")
         self.assertIsNone(value["latest_deploy"])
 
+    def test_successful_deploy_survives_later_cancelled_duplicate(self) -> None:
+        sha = "a" * 40
+        runs = [
+            {
+                "id": 1,
+                "name": "CI",
+                "head_sha": sha,
+                "status": "completed",
+                "conclusion": "success",
+                "created_at": "2026-06-20T00:00:00Z",
+                "updated_at": "2026-06-20T00:00:30Z",
+            },
+            {
+                "id": 2,
+                "name": "Deploy",
+                "head_sha": sha,
+                "status": "completed",
+                "conclusion": "success",
+                "created_at": "2026-06-20T00:01:00Z",
+            },
+            {
+                "id": 3,
+                "name": "Deploy",
+                "head_sha": sha,
+                "status": "completed",
+                "conclusion": "cancelled",
+                "created_at": "2026-06-20T00:02:00Z",
+            },
+        ]
+
+        value = release_state(main_sha=sha, runs=runs, config=CONFIG.pipeline)
+
+        self.assertEqual(value["state"], "verified")
+        self.assertEqual(value["latest_deploy"]["id"], 2)
+
+    def test_later_failed_deploy_is_not_hidden_by_older_success(self) -> None:
+        sha = "a" * 40
+        runs = [
+            {
+                "id": 1,
+                "name": "CI",
+                "head_sha": sha,
+                "status": "completed",
+                "conclusion": "success",
+                "created_at": "2026-06-20T00:00:00Z",
+            },
+            {
+                "id": 2,
+                "name": "Deploy",
+                "head_sha": sha,
+                "status": "completed",
+                "conclusion": "success",
+                "created_at": "2026-06-20T00:01:00Z",
+            },
+            {
+                "id": 3,
+                "name": "Deploy",
+                "head_sha": sha,
+                "status": "completed",
+                "conclusion": "failure",
+                "created_at": "2026-06-20T00:02:00Z",
+            },
+        ]
+
+        value = release_state(main_sha=sha, runs=runs, config=CONFIG.pipeline)
+
+        self.assertEqual(value["state"], "deploy-failed")
+        self.assertEqual(value["latest_deploy"]["id"], 3)
+
     def test_new_successful_ci_supersedes_an_older_failed_deploy(self) -> None:
         sha = "a" * 40
         runs = [
