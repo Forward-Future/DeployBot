@@ -5979,12 +5979,31 @@ def command_react(
                 emit=False,
                 admit_gate=admission_gate,
             )
+        finalized_release = False
+        if (
+            admission_gate == "merged"
+            and not release_already_verified
+            and release_before_merge.get("state") == "verified"
+        ):
+            # Complete durable watermark, thread-state, and notification
+            # bookkeeping before a new merge changes base_sha. Otherwise a busy
+            # merged-mode queue can keep overtaking already-live receipts.
+            release_before_merge = command_follow(
+                client,
+                timeout_seconds=timeout_seconds,
+                poll_seconds=10,
+                json_output=False,
+                emit=False,
+                admit_gate=admission_gate,
+            )
+            finalized_release = release_before_merge.get("state") == "verified"
         release_is_verified = release_already_verified or (
             release_before_merge.get("state") == "verified"
         )
         if (
             not release_already_verified
             and release_is_verified
+            and admission_gate != "merged"
             and client.config.pipeline.verifications
         ):
             health = http_verifications(client.config.pipeline)
@@ -5998,7 +6017,7 @@ def command_react(
                 "verifications": health,
             }
             release_is_verified = release_before_merge["state"] == "verified"
-        if release_is_verified:
+        if release_is_verified and not finalized_release:
             client.record_verified_main(current_main_sha)
         # Release admission is independent from release tracking. "merged"
         # reopens immediately for healthy in-flight releases, "ci-passed"

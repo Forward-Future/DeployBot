@@ -2993,6 +2993,80 @@ class QueueCoreTest(unittest.TestCase):
         sleep.assert_not_called()
         promote.assert_not_called()
 
+    def test_reactor_finalizes_verified_release_before_merged_mode_drain(
+        self,
+    ) -> None:
+        sha = "a" * 40
+        config = parse_config(
+            {
+                "queue": {
+                    "required_checks": ["CI"],
+                    "trusted_actors": ["trusted"],
+                },
+                "pipeline": {"release_admission": "merged"},
+            }
+        )
+        client = Mock()
+        client.config = config
+        client.pipeline_control.return_value = {"state": "running"}
+        client.base_sha.return_value = sha
+        client.verified_main_sha.return_value = None
+        client.thread_records.return_value = [
+            {"phase": "merged", "merge_sha": sha, "pull_request": 1}
+        ]
+        client.is_ancestor.return_value = True
+        client.workflow_runs.return_value = [
+            {
+                "id": 1,
+                "name": "CI",
+                "head_sha": sha,
+                "status": "completed",
+                "conclusion": "success",
+            },
+            {
+                "id": 2,
+                "name": "Deploy",
+                "head_sha": sha,
+                "status": "completed",
+                "conclusion": "success",
+            },
+        ]
+        frozen = FreezeResult(None, [], [], [], [])
+        with (
+            patch(
+                "agent_merge_queue.cli.reconcile_externally_merged_threads",
+                return_value=[],
+            ),
+            patch(
+                "agent_merge_queue.cli.command_follow",
+                return_value={
+                    "state": "verified",
+                    "main_sha": sha,
+                    "thread_notifications": [{"notification_id": "receipt"}],
+                },
+            ) as follow,
+            patch("agent_merge_queue.cli.settle_integration_checks", return_value=[]),
+            patch("agent_merge_queue.cli.promote_integrations", return_value=[]),
+            patch(
+                "agent_merge_queue.cli.command_promote",
+                return_value={"promoted": [], "waiting": [], "blocked": []},
+            ),
+            patch("agent_merge_queue.cli.freeze_queue", return_value=frozen),
+            redirect_stdout(io.StringIO()),
+        ):
+            result = command_react(client, follow=False, timeout_seconds=10)
+
+        self.assertEqual(result["state"], "complete")
+        follow.assert_called_once_with(
+            client,
+            timeout_seconds=10,
+            poll_seconds=10,
+            json_output=False,
+            emit=False,
+            admit_gate="merged",
+        )
+        client.record_verified_main.assert_not_called()
+
     def test_release_repair_claim_creates_one_deterministic_lease(self) -> None:
         sha = "a" * 40
         client = object.__new__(GitHub)
@@ -6537,6 +6611,7 @@ class QueueCoreTest(unittest.TestCase):
                     "trusted_actors": ["trusted"],
                     "coordinator_actors": ["coordinator"],
                 },
+                "pipeline": {"release_admission": "verified"},
                 "integration": {"mode": "all"},
             }
         )
