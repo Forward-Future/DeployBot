@@ -5665,8 +5665,20 @@ def superseded_release_failure(
             config=client.config.pipeline,
         )
         if value["state"] == "deploy-failed":
+            if str((value.get("latest_deploy") or {}).get("conclusion") or "") == (
+                "cancelled"
+            ):
+                # A newer cumulative main normally cancels a superseded deploy.
+                # That is release coalescing, not production failure evidence.
+                continue
             return value
         if value["state"] != "ci-failed":
+            continue
+        if str((value.get("latest_ci") or {}).get("conclusion") or "") == (
+            "cancelled"
+        ):
+            # Main moving again can cancel obsolete exact-main CI. The newest
+            # cumulative revision owns the release instead.
             continue
         grace = client.config.pipeline.ci_failure_grace_seconds
         latest_ci = value.get("latest_ci") or {}

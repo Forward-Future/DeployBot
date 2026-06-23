@@ -2873,6 +2873,58 @@ class QueueCoreTest(unittest.TestCase):
         )
         promote.assert_not_called()
 
+    def test_reactor_ignores_expected_superseded_ci_cancellation(self) -> None:
+        old = "a" * 40
+        current = "b" * 40
+        config = parse_config(
+            {
+                "queue": {
+                    "required_checks": ["CI"],
+                    "trusted_actors": ["trusted"],
+                },
+                "pipeline": {"release_admission": "merged"},
+            }
+        )
+        client = Mock()
+        client.config = config
+        client.pipeline_control.return_value = {"state": "running"}
+        client.base_sha.return_value = current
+        client.verified_main_sha.return_value = None
+        client.thread_records.return_value = []
+        client.deployment_notifications.return_value = []
+        client.is_ancestor.return_value = True
+        client.workflow_runs.return_value = [
+            {
+                "id": 1,
+                "name": "CI",
+                "head_sha": old,
+                "head_branch": "main",
+                "event": "workflow_dispatch",
+                "status": "completed",
+                "conclusion": "cancelled",
+            }
+        ]
+        frozen = FreezeResult(None, [], [], [], [])
+        with (
+            patch(
+                "agent_merge_queue.cli.reconcile_externally_merged_threads",
+                return_value=[],
+            ),
+            patch("agent_merge_queue.cli.settle_integration_checks", return_value=[]),
+            patch("agent_merge_queue.cli.promote_integrations", return_value=[]),
+            patch(
+                "agent_merge_queue.cli.command_promote",
+                return_value={"promoted": [], "waiting": [], "blocked": []},
+            ) as promote,
+            patch("agent_merge_queue.cli.freeze_queue", return_value=frozen),
+            redirect_stdout(io.StringIO()),
+        ):
+            result = command_react(client, follow=False, timeout_seconds=10)
+
+        self.assertEqual(result["state"], "complete")
+        client.set_pipeline_control.assert_not_called()
+        promote.assert_called_once()
+
     def test_release_repair_claim_creates_one_deterministic_lease(self) -> None:
         sha = "a" * 40
         client = object.__new__(GitHub)
