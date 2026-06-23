@@ -2817,6 +2817,62 @@ class QueueCoreTest(unittest.TestCase):
         )
         promote.assert_not_called()
 
+    def test_reactor_tracks_superseded_failure_without_thread_metadata(self) -> None:
+        old = "a" * 40
+        current = "b" * 40
+        config = parse_config(
+            {
+                "queue": {
+                    "required_checks": ["CI"],
+                    "trusted_actors": ["trusted"],
+                },
+                "pipeline": {"release_admission": "merged"},
+            }
+        )
+        client = Mock()
+        client.config = config
+        client.pipeline_control.return_value = {"state": "running"}
+        client.base_sha.return_value = current
+        client.verified_main_sha.return_value = None
+        client.thread_records.return_value = []
+        client.is_ancestor.return_value = True
+        client.workflow_runs.return_value = [
+            {
+                "id": 1,
+                "name": "CI",
+                "head_sha": old,
+                "head_branch": "main",
+                "event": "workflow_dispatch",
+                "status": "completed",
+                "conclusion": "success",
+            },
+            {
+                "id": 2,
+                "name": "Deploy",
+                "head_sha": old,
+                "head_branch": "main",
+                "event": "workflow_dispatch",
+                "status": "completed",
+                "conclusion": "failure",
+            },
+        ]
+        with (
+            patch(
+                "agent_merge_queue.cli.reconcile_externally_merged_threads",
+                return_value=[],
+            ),
+            patch("agent_merge_queue.cli.command_promote") as promote,
+            redirect_stdout(io.StringIO()),
+        ):
+            result = command_react(client, follow=False, timeout_seconds=10)
+
+        self.assertEqual(result["state"], "release-held")
+        self.assertEqual(result["release"]["main_sha"], old)
+        client.set_pipeline_control.assert_called_once_with(
+            "paused", f"deploy-failed on {old}", main_sha=old
+        )
+        promote.assert_not_called()
+
     def test_release_repair_claim_creates_one_deterministic_lease(self) -> None:
         sha = "a" * 40
         client = object.__new__(GitHub)

@@ -5630,12 +5630,28 @@ def superseded_release_failure(
     """Find a failed admitted release that a newer merge moved past."""
     records = client.thread_records(include_terminal=True)
     if not isinstance(records, list):
-        return None
+        records = []
     candidates = {
         str(record.get("merge_sha") or "")
         for record in records
         if record.get("phase") == "merged" and record.get("merge_sha")
     }
+    release_workflows = {
+        *client.config.pipeline.ci_workflows,
+        *client.config.pipeline.deploy_workflows,
+    }
+    candidates.update(
+        str(run.get("head_sha") or "")
+        for run in workflow_runs
+        if run.get("head_sha")
+        and str(run.get("name") or "") in release_workflows
+        and str(run.get("event") or "")
+        in {"push", "workflow_dispatch", "workflow_run", "schedule"}
+        and (
+            not run.get("head_branch")
+            or str(run.get("head_branch")) == client.config.base_branch
+        )
+    )
     for main_sha in sorted(candidates):
         if main_sha in {current_main_sha, recovered_main_sha}:
             continue
