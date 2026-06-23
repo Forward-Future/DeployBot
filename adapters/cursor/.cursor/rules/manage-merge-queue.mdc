@@ -13,4 +13,6 @@ wakes GitHub and promotes only after fresh exact-head gates; never poll or merge
 an unlabeled PR. Use `pipeline_status` and `react_to_delivery_event`, skip
 blockers, honor dependencies, route overlaps or cumulative validation through
 one integration PR, return repair packets to their source thread, atomically
-resume after fresh review, and follow cumulative `main` through deployment.
+resume after fresh review, and follow cumulative `main` through deployment. In
+`release_admission = "merged"` mode, admit independent ready work immediately
+after merge while later events continue release tracking.

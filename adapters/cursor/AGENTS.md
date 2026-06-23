@@ -27,7 +27,9 @@ branch is itself a merge and is forbidden outside DeployBot.
 Never poll, merge an unlabeled PR, or absorb unrelated work. Let the event worker
 promote fresh exact heads, use one integration PR for overlaps or cumulative
 validation, return repair packets to the source thread, atomically resume after
-fresh review, and follow cumulative `main` through verified deployment.
+fresh review, and follow cumulative `main` through verified deployment. When
+`release_admission = "merged"`, admit independent ready work immediately after
+merge while release events continue asynchronously; later failures still pause.
 
 For each verified `thread_notifications` entry, post its message back to the
 native PR-opening thread and only then call `acknowledge_thread_deployment`. Leave

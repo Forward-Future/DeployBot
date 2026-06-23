@@ -81,9 +81,10 @@ Merge independent ready pull requests back-to-back. Route source-overlap groups
 through `deploybot integrate`; when policy mode is `all`, validate the entire
 frozen batch through that cumulative PR. Never invent a conflict resolution.
 Return the repair packet to its source thread, then run `deploybot resume` after
-its new exact head passes. Finish with `deploybot follow --json`, following
-newer cumulative base heads until CI, deployment, and configured health checks
-verify.
+its new exact head passes. Keep release tracking event-driven: in
+`release_admission = "merged"` mode, admit independent ready work immediately
+after a healthy merge while later events continue CI, deployment, and health
+tracking. Scheduled reconciliation is a fallback, not the normal promotion path.
 
 Genuine repair blocks may hold overlapping ready work for the configured bounded
 repair window, but they remain merge-ineligible until the trusted source agent
@@ -118,9 +119,10 @@ named thread already owns that failed SHA; wait for that repair and never create
 a competing PR. The owner is encoded in the atomic branch ref, so a registry
 write failure is recovered by calling the same tool again.
 
-New batches are FIFO-bounded by `integration.max_batch_size`, and a merged batch
-closes admission until its cumulative main revision is verified live. Do not
-override either boundary for later work. Never execute merged PR code inside
+New batches are FIFO-bounded by `integration.max_batch_size`. Honor the configured
+release-admission gate: `merged` permits the next independent batch immediately,
+while `ci-passed` and `verified` impose stricter release fences. A later observed
+release failure pauses future merges in every mode. Never execute merged PR code inside
 the privileged coordinator; generated-artifact conflicts go to the elected
 repair owner for a normal reviewed rebuild. When PR-authored checks are
 required, use a GitHub App installation token, list its bot login in

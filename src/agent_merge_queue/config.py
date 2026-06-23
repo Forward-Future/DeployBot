@@ -92,7 +92,7 @@ ALLOWED_REVIEW_PROVIDERS = {"bot", "check", "github-approvals"}
 ALLOWED_MERGE_METHODS = {"merge", "squash", "rebase"}
 ALLOWED_INTEGRATION_MODES = {"manual", "overlap", "all"}
 ALLOWED_INTENT_SCOPES = {"head"}
-ALLOWED_RELEASE_ADMISSION = {"verified", "ci-passed"}
+ALLOWED_RELEASE_ADMISSION = {"verified", "ci-passed", "merged"}
 DEFAULT_CONFIG = """\
 [queue]
 base_branch = "main"
@@ -127,7 +127,7 @@ registry_title = "DeployBot delivery registry"
 thread_active_hours = 72
 ci_workflows = ["CI"]
 deploy_workflows = ["Deploy"]
-batch_settle_seconds = 15
+batch_settle_seconds = 0
 ci_failure_grace_seconds = 90
 promotion_workers = 4
 repair_hold_minutes = 60
@@ -138,11 +138,11 @@ merge_to_live_target_minutes = 10
 auto_promote = true
 intent_scope = "head"
 pause_on_failure = true
-# verified (safest): hold new merges until the cumulative release is live.
-# ci-passed: admit the next batch once exact-main CI passes; deploy and health
-# checks keep following in the background, trading a larger failure blast radius
-# for higher merge throughput.
-release_admission = "verified"
+# merged (default): admit independent ready work immediately after the previous
+# merge while CI, deployment, and health checks continue asynchronously.
+# ci-passed: wait for exact-main CI; verified: wait until the release is live.
+# Any later release failure pauses future merges in every mode.
+release_admission = "merged"
 # Receives best-effort events, including retryable thread-deployed messages.
 # webhook_url_env = "DEPLOYBOT_WEBHOOK_URL"
 
@@ -425,7 +425,7 @@ def parse_config(payload: dict[str, Any]) -> QueueConfig:
         allowed = ", ".join(sorted(ALLOWED_INTENT_SCOPES))
         raise ConfigError(f"pipeline.intent_scope must be one of: {allowed}")
     release_admission = _require_string(
-        pipeline.get("release_admission"), "pipeline.release_admission", "verified"
+        pipeline.get("release_admission"), "pipeline.release_admission", "merged"
     )
     if release_admission not in ALLOWED_RELEASE_ADMISSION:
         allowed = ", ".join(sorted(ALLOWED_RELEASE_ADMISSION))
@@ -497,7 +497,7 @@ def parse_config(payload: dict[str, Any]) -> QueueConfig:
             batch_settle_seconds=_non_negative_int(
                 pipeline.get("batch_settle_seconds"),
                 "pipeline.batch_settle_seconds",
-                15,
+                0,
             ),
             ci_failure_grace_seconds=_non_negative_int(
                 pipeline.get("ci_failure_grace_seconds"),

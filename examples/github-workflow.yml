@@ -77,10 +77,11 @@ jobs:
         with:
           ref: ${{ github.event.repository.default_branch }}
           persist-credentials: false
-      # v0.2.24 implementation; keep the full commit for privileged workflows.
-      - uses: Forward-Future/DeployBot@73004ea7c9dcb81e7f1281c0687aea0897d1571d
+      # v0.2.25 implementation; keep the full commit for privileged workflows.
+      - uses: Forward-Future/DeployBot@12c6c03aa76a553fa4068279baa29e90a30bbeb1
         with:
-          # PR and review events reconcile quickly. Only release-owner events
-          # stay attached to cumulative main through CI and deployment.
+          # PR and review events reconcile immediately. Release-owner events
+          # advance to the configured admission gate; "merged" observations
+          # return quickly, while the schedule remains a fallback reconciliation.
           follow: ${{ github.event_name == 'workflow_run' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
           timeout: ${{ (github.event_name == 'workflow_run' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && '2400' || '600' }}

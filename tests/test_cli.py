@@ -95,7 +95,8 @@ CONFIG = parse_config(
             "required_checks": ["CI"],
             "dependency_directive": "Queue-after",
             "trusted_actors": ["trusted"],
-        }
+        },
+        "pipeline": {"release_admission": "verified"},
     }
 )
 
@@ -2366,7 +2367,15 @@ class QueueCoreTest(unittest.TestCase):
     def test_reactor_seeds_first_install_despite_historical_runs(self) -> None:
         sha = "a" * 40
         client = Mock()
-        client.config = CONFIG
+        client.config = parse_config(
+            {
+                "queue": {
+                    "required_checks": ["CI"],
+                    "trusted_actors": ["trusted"],
+                },
+                "pipeline": {"release_admission": "merged"},
+            }
+        )
         client.pipeline_control.return_value = {"state": "running"}
         client.base_sha.return_value = sha
         client.workflow_runs.return_value = [
@@ -2374,13 +2383,16 @@ class QueueCoreTest(unittest.TestCase):
                 "id": 99,
                 "name": "CI",
                 "head_sha": "b" * 40,
+                "head_branch": "main",
+                "event": "workflow_dispatch",
                 "status": "completed",
-                "conclusion": "success",
+                "conclusion": "failure",
             }
         ]
         client.verified_main_sha.return_value = None
         client.thread_records.return_value = []
         client.deployment_notifications.return_value = []
+        client.is_ancestor.return_value = True
         frozen = FreezeResult(None, [], [], [], [])
         with (
             patch("agent_merge_queue.cli.settle_integration_checks", return_value=[]),
@@ -2556,6 +2568,605 @@ class QueueCoreTest(unittest.TestCase):
         # waiting for the deploy to finish.
         self.assertNotEqual(result.get("state"), "release-held")
         promote.assert_called_once()
+        client.record_verified_main.assert_not_called()
+
+    def test_reactor_merges_next_pr_while_previous_release_is_in_ci(self) -> None:
+        sha = "a" * 40
+        config = parse_config(
+            {
+                "queue": {
+                    "required_checks": ["CI"],
+                    "trusted_actors": ["trusted"],
+                },
+                "pipeline": {"release_admission": "merged"},
+            }
+        )
+        client = Mock()
+        client.config = config
+        client.pipeline_control.return_value = {"state": "running"}
+        client.base_sha.return_value = sha
+        client.verified_main_sha.return_value = None
+        client.workflow_runs.return_value = [
+            {
+                "id": 1,
+                "name": "CI",
+                "head_sha": sha,
+                "status": "in_progress",
+                "conclusion": None,
+            }
+        ]
+        frozen = FreezeResult(None, [], [], [], [])
+        with (
+            patch(
+                "agent_merge_queue.cli.reconcile_externally_merged_threads",
+                return_value=[],
+            ),
+            patch("agent_merge_queue.cli.settle_integration_checks", return_value=[]),
+            patch("agent_merge_queue.cli.promote_integrations", return_value=[]),
+            patch(
+                "agent_merge_queue.cli.command_promote",
+                return_value={"promoted": [2], "waiting": [], "blocked": []},
+            ),
+            patch("agent_merge_queue.cli.freeze_queue", return_value=frozen),
+            patch(
+                "agent_merge_queue.cli.command_drain",
+                return_value={"merged": [{"number": 2}]},
+            ),
+            redirect_stdout(io.StringIO()),
+        ):
+            result = command_react(client, follow=False, timeout_seconds=10)
+
+        self.assertEqual(result["state"], "complete")
+        self.assertEqual(result["drain"]["merged"], [{"number": 2}])
+
+    def test_reactor_merged_mode_does_not_wait_for_pending_deployment(self) -> None:
+        sha = "a" * 40
+        config = parse_config(
+            {
+                "queue": {
+                    "required_checks": ["CI"],
+                    "trusted_actors": ["trusted"],
+                },
+                "pipeline": {"release_admission": "merged"},
+            }
+        )
+        client = Mock()
+        client.config = config
+        client.pipeline_control.return_value = {"state": "running"}
+        client.base_sha.return_value = sha
+        client.verified_main_sha.return_value = None
+        client.workflow_runs.return_value = [
+            {
+                "id": 1,
+                "name": "CI",
+                "head_sha": sha,
+                "status": "completed",
+                "conclusion": "success",
+            },
+            {
+                "id": 2,
+                "name": "Deploy",
+                "head_sha": sha,
+                "status": "in_progress",
+                "conclusion": None,
+            },
+        ]
+        frozen = FreezeResult(None, [], [], [], [])
+        with (
+            patch(
+                "agent_merge_queue.cli.reconcile_externally_merged_threads",
+                return_value=[],
+            ),
+            patch("agent_merge_queue.cli.settle_integration_checks", return_value=[]),
+            patch("agent_merge_queue.cli.promote_integrations", return_value=[]),
+            patch(
+                "agent_merge_queue.cli.command_promote",
+                return_value={"promoted": [], "waiting": [], "blocked": []},
+            ) as promote,
+            patch("agent_merge_queue.cli.freeze_queue", return_value=frozen),
+            redirect_stdout(io.StringIO()),
+        ):
+            result = command_react(client, follow=False, timeout_seconds=10)
+
+        self.assertNotEqual(result.get("state"), "release-held")
+        promote.assert_called_once()
+
+    def test_reactor_merged_mode_pauses_after_later_deploy_failure(self) -> None:
+        sha = "a" * 40
+        config = parse_config(
+            {
+                "queue": {
+                    "required_checks": ["CI"],
+                    "trusted_actors": ["trusted"],
+                },
+                "pipeline": {"release_admission": "merged"},
+            }
+        )
+        client = Mock()
+        client.config = config
+        client.pipeline_control.return_value = {"state": "running"}
+        client.base_sha.return_value = sha
+        client.verified_main_sha.return_value = None
+        client.workflow_runs.return_value = [
+            {
+                "id": 1,
+                "name": "CI",
+                "head_sha": sha,
+                "status": "completed",
+                "conclusion": "success",
+            },
+            {
+                "id": 2,
+                "name": "Deploy",
+                "head_sha": sha,
+                "status": "completed",
+                "conclusion": "failure",
+            },
+        ]
+        with (
+            patch(
+                "agent_merge_queue.cli.reconcile_externally_merged_threads",
+                return_value=[],
+            ),
+            patch("agent_merge_queue.cli.command_promote") as promote,
+            redirect_stdout(io.StringIO()),
+        ):
+            result = command_react(client, follow=True, timeout_seconds=10)
+
+        self.assertEqual(result["state"], "release-held")
+        client.set_pipeline_control.assert_called_once_with(
+            "paused", f"deploy-failed on {sha}", main_sha=sha
+        )
+        promote.assert_not_called()
+
+    def test_reactor_dispatches_pending_release_before_next_merged_mode_pr(
+        self,
+    ) -> None:
+        sha = "a" * 40
+        config = parse_config(
+            {
+                "queue": {
+                    "required_checks": ["CI"],
+                    "trusted_actors": ["trusted"],
+                },
+                "pipeline": {"release_admission": "merged"},
+            }
+        )
+        client = Mock()
+        client.config = config
+        client.pipeline_control.return_value = {"state": "running"}
+        client.base_sha.return_value = sha
+        client.verified_main_sha.return_value = None
+        client.workflow_runs.return_value = [
+            {
+                "id": 1,
+                "name": "CI",
+                "head_sha": sha,
+                "status": "completed",
+                "conclusion": "success",
+                "event": "workflow_dispatch",
+            }
+        ]
+        client.dispatch_deploy_workflows.return_value = [
+            {"id": 9, "name": "Deploy", "ci_sha": sha, "ci_run_id": 1}
+        ]
+        frozen = FreezeResult(None, [], [], [], [])
+        with (
+            patch(
+                "agent_merge_queue.cli.reconcile_externally_merged_threads",
+                return_value=[],
+            ),
+            patch("agent_merge_queue.cli.settle_integration_checks", return_value=[]),
+            patch("agent_merge_queue.cli.promote_integrations", return_value=[]),
+            patch(
+                "agent_merge_queue.cli.command_promote",
+                return_value={"promoted": [2], "waiting": [], "blocked": []},
+            ),
+            patch("agent_merge_queue.cli.freeze_queue", return_value=frozen),
+            patch(
+                "agent_merge_queue.cli.command_drain",
+                return_value={"merged": [{"number": 2}]},
+            ),
+            redirect_stdout(io.StringIO()),
+        ):
+            result = command_react(client, follow=False, timeout_seconds=10)
+
+        self.assertEqual(result["drain"]["merged"], [{"number": 2}])
+        client.dispatch_deploy_workflows.assert_called_once()
+
+    def test_reactor_pauses_for_failed_superseded_merged_mode_release(self) -> None:
+        old = "a" * 40
+        current = "b" * 40
+        config = parse_config(
+            {
+                "queue": {
+                    "required_checks": ["CI"],
+                    "trusted_actors": ["trusted"],
+                },
+                "pipeline": {"release_admission": "merged"},
+            }
+        )
+        client = Mock()
+        client.config = config
+        client.pipeline_control.return_value = {"state": "running"}
+        client.base_sha.return_value = current
+        client.verified_main_sha.return_value = None
+        client.thread_records.return_value = [
+            {"phase": "merged", "merge_sha": old, "pull_request": 1}
+        ]
+        client.is_ancestor.return_value = True
+        client.workflow_runs.return_value = [
+            {
+                "id": 1,
+                "name": "CI",
+                "head_sha": old,
+                "status": "completed",
+                "conclusion": "success",
+            },
+            {
+                "id": 2,
+                "name": "Deploy",
+                "head_sha": old,
+                "status": "completed",
+                "conclusion": "failure",
+            },
+        ]
+        with (
+            patch(
+                "agent_merge_queue.cli.reconcile_externally_merged_threads",
+                return_value=[],
+            ),
+            patch("agent_merge_queue.cli.command_promote") as promote,
+            redirect_stdout(io.StringIO()),
+        ):
+            result = command_react(client, follow=False, timeout_seconds=10)
+
+        self.assertEqual(result["state"], "release-held")
+        self.assertEqual(result["release"]["main_sha"], old)
+        client.set_pipeline_control.assert_called_once_with(
+            "paused", f"deploy-failed on {old}", main_sha=old
+        )
+        promote.assert_not_called()
+
+    def test_reactor_tracks_superseded_failure_without_thread_metadata(self) -> None:
+        old = "a" * 40
+        current = "b" * 40
+        config = parse_config(
+            {
+                "queue": {
+                    "required_checks": ["CI"],
+                    "trusted_actors": ["trusted"],
+                },
+                "pipeline": {"release_admission": "merged"},
+            }
+        )
+        client = Mock()
+        client.config = config
+        client.pipeline_control.return_value = {"state": "running"}
+        client.base_sha.return_value = current
+        client.verified_main_sha.return_value = "f" * 40
+        client.thread_records.return_value = []
+        client.is_ancestor.side_effect = lambda _left, right: right == current
+        client.workflow_runs.return_value = [
+            {
+                "id": 1,
+                "name": "CI",
+                "head_sha": old,
+                "head_branch": "main",
+                "event": "workflow_dispatch",
+                "status": "completed",
+                "conclusion": "success",
+            },
+            {
+                "id": 2,
+                "name": "Deploy",
+                "head_sha": old,
+                "head_branch": "main",
+                "event": "workflow_dispatch",
+                "status": "completed",
+                "conclusion": "failure",
+            },
+        ]
+        with (
+            patch(
+                "agent_merge_queue.cli.reconcile_externally_merged_threads",
+                return_value=[],
+            ),
+            patch("agent_merge_queue.cli.command_promote") as promote,
+            redirect_stdout(io.StringIO()),
+        ):
+            result = command_react(client, follow=False, timeout_seconds=10)
+
+        self.assertEqual(result["state"], "release-held")
+        self.assertEqual(result["release"]["main_sha"], old)
+        client.set_pipeline_control.assert_called_once_with(
+            "paused", f"deploy-failed on {old}", main_sha=old
+        )
+        promote.assert_not_called()
+
+    def test_reactor_ignores_expected_superseded_ci_cancellation(self) -> None:
+        old = "a" * 40
+        current = "b" * 40
+        config = parse_config(
+            {
+                "queue": {
+                    "required_checks": ["CI"],
+                    "trusted_actors": ["trusted"],
+                },
+                "pipeline": {"release_admission": "merged"},
+            }
+        )
+        client = Mock()
+        client.config = config
+        client.pipeline_control.return_value = {"state": "running"}
+        client.base_sha.return_value = current
+        client.verified_main_sha.return_value = "f" * 40
+        client.thread_records.return_value = []
+        client.deployment_notifications.return_value = []
+        client.is_ancestor.side_effect = lambda _left, right: right == current
+        client.workflow_runs.return_value = [
+            {
+                "id": 1,
+                "name": "CI",
+                "head_sha": old,
+                "head_branch": "main",
+                "event": "workflow_dispatch",
+                "status": "completed",
+                "conclusion": "cancelled",
+            }
+        ]
+        frozen = FreezeResult(None, [], [], [], [])
+        with (
+            patch(
+                "agent_merge_queue.cli.reconcile_externally_merged_threads",
+                return_value=[],
+            ),
+            patch("agent_merge_queue.cli.settle_integration_checks", return_value=[]),
+            patch("agent_merge_queue.cli.promote_integrations", return_value=[]),
+            patch(
+                "agent_merge_queue.cli.command_promote",
+                return_value={"promoted": [], "waiting": [], "blocked": []},
+            ) as promote,
+            patch("agent_merge_queue.cli.freeze_queue", return_value=frozen),
+            redirect_stdout(io.StringIO()),
+        ):
+            result = command_react(client, follow=False, timeout_seconds=10)
+
+        self.assertEqual(result["state"], "complete")
+        client.set_pipeline_control.assert_not_called()
+        promote.assert_called_once()
+
+    def test_reactor_verifies_superseded_deployment_health(self) -> None:
+        old = "a" * 40
+        current = "b" * 40
+        config = parse_config(
+            {
+                "queue": {
+                    "required_checks": ["CI"],
+                    "trusted_actors": ["trusted"],
+                },
+                "pipeline": {
+                    "release_admission": "merged",
+                    "verifications": [
+                        {"name": "Login", "url": "https://example.test/login"}
+                    ],
+                },
+            }
+        )
+        client = Mock()
+        client.config = config
+        client.pipeline_control.return_value = {"state": "running"}
+        client.base_sha.return_value = current
+        client.verified_main_sha.return_value = "f" * 40
+        client.thread_records.return_value = []
+        client.is_ancestor.side_effect = lambda _left, right: right == current
+        client.workflow_runs.return_value = [
+            {
+                "id": 1,
+                "name": "CI",
+                "head_sha": old,
+                "head_branch": "main",
+                "event": "workflow_dispatch",
+                "status": "completed",
+                "conclusion": "success",
+            },
+            {
+                "id": 2,
+                "name": "Deploy",
+                "head_sha": old,
+                "head_branch": "main",
+                "event": "workflow_dispatch",
+                "status": "completed",
+                "conclusion": "success",
+            },
+        ]
+        with (
+            patch(
+                "agent_merge_queue.cli.reconcile_externally_merged_threads",
+                return_value=[],
+            ),
+            patch(
+                "agent_merge_queue.cli.http_verifications",
+                return_value=[{"name": "Login", "passed": False}],
+            ),
+            patch("agent_merge_queue.cli.time.monotonic", side_effect=[0, 1]),
+            patch("agent_merge_queue.cli.time.sleep") as sleep,
+            patch("agent_merge_queue.cli.command_promote") as promote,
+            redirect_stdout(io.StringIO()),
+        ):
+            result = command_react(client, follow=False, timeout_seconds=1)
+
+        self.assertEqual(result["state"], "release-held")
+        self.assertEqual(result["release"]["state"], "verify-failed")
+        client.set_pipeline_control.assert_called_once_with(
+            "paused", f"verify-failed on {old}", main_sha=old
+        )
+        sleep.assert_not_called()
+        promote.assert_not_called()
+
+    def test_reactor_uses_newer_verified_release_as_recovery_boundary(self) -> None:
+        failed = "a" * 40
+        recovered = "b" * 40
+        current = "c" * 40
+        config = parse_config(
+            {
+                "queue": {
+                    "required_checks": ["CI"],
+                    "trusted_actors": ["trusted"],
+                },
+                "pipeline": {"release_admission": "merged"},
+            }
+        )
+        client = Mock()
+        client.config = config
+        client.pipeline_control.return_value = {"state": "running"}
+        client.base_sha.return_value = current
+        client.verified_main_sha.return_value = "f" * 40
+        client.thread_records.return_value = []
+        client.deployment_notifications.return_value = []
+        client.is_ancestor.side_effect = lambda left, right: (
+            right == current or (left == failed and right == recovered)
+        )
+        client.workflow_runs.return_value = [
+            {
+                "id": 1,
+                "name": "CI",
+                "head_sha": failed,
+                "head_branch": "main",
+                "event": "workflow_dispatch",
+                "status": "completed",
+                "conclusion": "success",
+                "created_at": "2026-06-20T00:00:00Z",
+            },
+            {
+                "id": 2,
+                "name": "Deploy",
+                "head_sha": failed,
+                "head_branch": "main",
+                "event": "workflow_dispatch",
+                "status": "completed",
+                "conclusion": "failure",
+                "created_at": "2026-06-20T00:01:00Z",
+            },
+            {
+                "id": 3,
+                "name": "CI",
+                "head_sha": recovered,
+                "head_branch": "main",
+                "event": "workflow_dispatch",
+                "status": "completed",
+                "conclusion": "success",
+                "created_at": "2026-06-20T00:02:00Z",
+            },
+            {
+                "id": 4,
+                "name": "Deploy",
+                "head_sha": recovered,
+                "head_branch": "main",
+                "event": "workflow_dispatch",
+                "status": "completed",
+                "conclusion": "success",
+                "created_at": "2026-06-20T00:03:00Z",
+            },
+        ]
+        frozen = FreezeResult(None, [], [], [], [])
+        with (
+            patch(
+                "agent_merge_queue.cli.reconcile_externally_merged_threads",
+                return_value=[],
+            ),
+            patch(
+                "agent_merge_queue.cli.command_follow",
+                return_value={"state": "verified", "main_sha": recovered},
+            ) as follow,
+            patch("agent_merge_queue.cli.settle_integration_checks", return_value=[]),
+            patch("agent_merge_queue.cli.promote_integrations", return_value=[]),
+            patch(
+                "agent_merge_queue.cli.command_promote",
+                return_value={"promoted": [], "waiting": [], "blocked": []},
+            ) as promote,
+            patch("agent_merge_queue.cli.freeze_queue", return_value=frozen),
+            redirect_stdout(io.StringIO()),
+        ):
+            result = command_react(client, follow=False, timeout_seconds=10)
+
+        self.assertEqual(result["state"], "complete")
+        self.assertEqual(follow.call_args.args[0].base_sha(), recovered)
+        client.set_pipeline_control.assert_not_called()
+        promote.assert_called_once()
+
+    def test_reactor_finalizes_verified_release_before_merged_mode_drain(
+        self,
+    ) -> None:
+        sha = "a" * 40
+        config = parse_config(
+            {
+                "queue": {
+                    "required_checks": ["CI"],
+                    "trusted_actors": ["trusted"],
+                },
+                "pipeline": {"release_admission": "merged"},
+            }
+        )
+        client = Mock()
+        client.config = config
+        client.pipeline_control.return_value = {"state": "running"}
+        client.base_sha.return_value = sha
+        client.verified_main_sha.return_value = None
+        client.thread_records.return_value = [
+            {"phase": "merged", "merge_sha": sha, "pull_request": 1}
+        ]
+        client.is_ancestor.return_value = True
+        client.workflow_runs.return_value = [
+            {
+                "id": 1,
+                "name": "CI",
+                "head_sha": sha,
+                "status": "completed",
+                "conclusion": "success",
+            },
+            {
+                "id": 2,
+                "name": "Deploy",
+                "head_sha": sha,
+                "status": "completed",
+                "conclusion": "success",
+            },
+        ]
+        frozen = FreezeResult(None, [], [], [], [])
+        with (
+            patch(
+                "agent_merge_queue.cli.reconcile_externally_merged_threads",
+                return_value=[],
+            ),
+            patch(
+                "agent_merge_queue.cli.command_follow",
+                return_value={
+                    "state": "verified",
+                    "main_sha": sha,
+                    "thread_notifications": [{"notification_id": "receipt"}],
+                },
+            ) as follow,
+            patch("agent_merge_queue.cli.settle_integration_checks", return_value=[]),
+            patch("agent_merge_queue.cli.promote_integrations", return_value=[]),
+            patch(
+                "agent_merge_queue.cli.command_promote",
+                return_value={"promoted": [], "waiting": [], "blocked": []},
+            ),
+            patch("agent_merge_queue.cli.freeze_queue", return_value=frozen),
+            redirect_stdout(io.StringIO()),
+        ):
+            result = command_react(client, follow=False, timeout_seconds=10)
+
+        self.assertEqual(result["state"], "complete")
+        follow.assert_called_once_with(
+            client,
+            timeout_seconds=10,
+            poll_seconds=10,
+            json_output=False,
+            emit=False,
+            admit_gate="merged",
+        )
         client.record_verified_main.assert_not_called()
 
     def test_release_repair_claim_creates_one_deterministic_lease(self) -> None:
@@ -3290,6 +3901,53 @@ class QueueCoreTest(unittest.TestCase):
         merge.assert_called_once()
         self.assertEqual(result["merged"][0]["number"], 1)
         self.assertEqual(result["next_batch"], [2])
+
+    def test_drain_merged_mode_lands_independent_batches_back_to_back(self) -> None:
+        first_entry = entry(1, "a.py")
+        later_entry = entry(2, "b.py")
+        first = FreezeResult(
+            batch={"batch_id": "first"},
+            queue=[first_entry],
+            blocked_queue=[],
+            next_batch=[later_entry],
+            overlap_groups=[],
+        )
+        second = FreezeResult(
+            batch={"batch_id": "second"},
+            queue=[later_entry],
+            blocked_queue=[],
+            next_batch=[],
+            overlap_groups=[],
+        )
+        client = Mock()
+        client.config = parse_config(
+            {
+                "queue": {
+                    "required_checks": ["CI"],
+                    "trusted_actors": ["trusted"],
+                },
+                "pipeline": {"release_admission": "merged"},
+            }
+        )
+        with (
+            patch(
+                "agent_merge_queue.cli.freeze_queue",
+                side_effect=[first, second],
+            ) as freeze,
+            patch(
+                "agent_merge_queue.cli.command_merge", return_value="m" * 40
+            ) as merge,
+            redirect_stdout(io.StringIO()),
+        ):
+            result = command_drain(client, json_output=True)
+
+        self.assertEqual(freeze.call_count, 2)
+        self.assertEqual(merge.call_count, 2)
+        self.assertEqual(result["batch_ids"], ["first", "second"])
+        self.assertEqual(
+            [value["number"] for value in result["merged"]],
+            [1, 2],
+        )
 
     def test_reenqueue_toggles_label_to_wake_event_coordinator(self) -> None:
         value = entry(1)
@@ -6055,6 +6713,7 @@ class QueueCoreTest(unittest.TestCase):
                     "trusted_actors": ["trusted"],
                     "coordinator_actors": ["coordinator"],
                 },
+                "pipeline": {"release_admission": "verified"},
                 "integration": {"mode": "all"},
             }
         )

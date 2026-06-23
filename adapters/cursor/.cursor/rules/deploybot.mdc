@@ -15,6 +15,10 @@ the stable Cursor thread ID, never prompts or transcripts. Refresh intent only
 after replacement-head review. Only the coordinator may react, integrate,
 drain, follow, pause, or resume repaired work.
 
+Honor `pipeline.release_admission`. In `merged` mode, admit the next independent
+ready PR immediately after a healthy merge while release events continue CI,
+deployment, and health tracking. A later failure pauses future merges normally.
+
 Immediately before asking the user to unpause or take repair action, call
 `pipeline_status` again and suppress the request if durable state is already
 running or the release advanced. The original deploy instruction authorizes the

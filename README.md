@@ -11,11 +11,11 @@ integration PRs, follows `main` through production, and pauses after failures.
 
 ## Install
 
-Install the reviewed `v0.2.24` source commit directly from GitHub:
+Install the reviewed `v0.2.25` source commit directly from GitHub:
 
 ```bash
 python3 -m pip install \
-  'deploybot-merge-queue[mcp] @ git+https://github.com/Forward-Future/DeployBot.git@73004ea7c9dcb81e7f1281c0687aea0897d1571d'
+  'deploybot-merge-queue[mcp] @ git+https://github.com/Forward-Future/DeployBot.git@12c6c03aa76a553fa4068279baa29e90a30bbeb1'
 deploybot init
 ```
 
@@ -90,12 +90,15 @@ completions, and completed external check suites. Keep its `workflows` list
 aligned with `pipeline.ci_workflows`. A five-minute scheduled reconciliation
 rereads all durable state in case GitHub concurrency coalesces the last pending
 event in a burst. The privileged worker never checks out or executes
-pull-request code. The Action follows releases by default so the same serialized
-worker can dispatch deployment when GitHub suppresses the `workflow_run` event
-for token-dispatched CI. Pin the Action to the full reviewed release commit:
+pull-request code. The Action advances releases to the configured admission
+gate. In the default `merged` mode it returns after each healthy observation,
+leaving completion to later release events and keeping the serialized merge
+worker free. It can still dispatch deployment when GitHub suppresses the
+`workflow_run` event for token-dispatched CI. Pin the Action to the full reviewed
+release commit:
 
 ```yaml
-- uses: Forward-Future/DeployBot@73004ea7c9dcb81e7f1281c0687aea0897d1571d
+- uses: Forward-Future/DeployBot@12c6c03aa76a553fa4068279baa29e90a30bbeb1
 ```
 
 The Action uses GitHub's built-in workflow token. GitHub intentionally does not
@@ -141,6 +144,13 @@ workflow name, base branch, head SHA, event, status, and conclusion to match the
 expected successful exact-main CI run. The deployment must still pull the
 current base branch and stop if it no longer equals `ci_sha`.
 
+The deployment workflow must also acquire the repository's shared deployment
+lock, fetch the base branch again after acquiring it, and coalesce superseded
+requests onto that newest integrated SHA. It must never deploy an older SHA after
+a newer one, and it keeps the lock through production health verification. These
+release rules are unchanged by `release_admission = "merged"`; only merge
+admission becomes asynchronous.
+
 The workflow bot and each person allowed to request deployment must be
 explicitly listed:
 
@@ -172,11 +182,11 @@ work, and creates integration PRs when configured. New batches contain at most
 `integration.max_batch_size` entries; later FIFO work remains in the next batch.
 A larger indivisible source-overlap or dependency closure is the sole exception:
 it ships alone, never mixed with unrelated work.
-After any merge, admission stays closed until the cumulative exact-main release
-is verified live, preventing newer merges from starving an older deployment.
-Set `pipeline.release_admission = "ci-passed"` to reopen admission as soon as
-exact-main CI is green—deploy and health checks keep following in the
-background—when higher merge throughput is worth a larger failure blast radius.
+By default, `pipeline.release_admission = "merged"`: after one healthy merge,
+DeployBot immediately admits the next independent ready PR or batch. Exact-main
+CI, deployment, and health checks keep tracking asynchronously, and a later real
+failure pauses future merges. Use `ci-passed` to wait for exact-main CI before
+admitting more work, or `verified` to wait until the cumulative revision is live.
 Draft status and incomplete
 checks or reviews remain waiting states; they do not create a repair latch. A
 conflict, failed gate, unresolved review, manual block, or stale authorized head
@@ -269,7 +279,7 @@ ending the PR-opening-thread response.
 [pipeline]
 ci_workflows = ["CI"]
 deploy_workflows = ["Deploy"]
-batch_settle_seconds = 15
+batch_settle_seconds = 0
 ci_failure_grace_seconds = 90
 promotion_workers = 4
 hold_merges_while_releasing = true
@@ -279,7 +289,7 @@ merge_to_live_target_minutes = 10
 auto_promote = true
 intent_scope = "head"
 pause_on_failure = true
-release_admission = "verified" # or "ci-passed" for higher merge throughput
+release_admission = "merged" # or "ci-passed" / "verified" for stricter admission
 
 [[pipeline.verifications]]
 name = "Login"
