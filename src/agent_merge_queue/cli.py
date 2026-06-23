@@ -15,7 +15,7 @@ import subprocess
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable
@@ -5654,31 +5654,79 @@ def superseded_release_failure(
             or str(run.get("head_branch")) == client.config.base_branch
         )
     )
-    for main_sha in sorted(candidates):
+    states: dict[str, dict[str, Any]] = {}
+    for main_sha in candidates:
         if main_sha in {current_main_sha, recovered_main_sha}:
             continue
         if not client.is_ancestor(main_sha, current_main_sha):
             continue
         if verified_main_sha and client.is_ancestor(main_sha, verified_main_sha):
             continue
-        value = release_state(
+        states[main_sha] = release_state(
             main_sha=main_sha,
             runs=workflow_runs,
             config=client.config.pipeline,
         )
-        if value["state"] == "verified" and client.config.pipeline.verifications:
-            deadline = time.monotonic() + timeout_seconds
-            while True:
-                checks = http_verifications(client.config.pipeline)
-                if all(item["passed"] for item in checks):
-                    break
-                if time.monotonic() >= deadline:
-                    return {
-                        **value,
-                        "state": "verify-failed",
-                        "verifications": checks,
-                    }
-                time.sleep(poll_seconds)
+
+    verified_candidates = [
+        main_sha for main_sha, value in states.items() if value["state"] == "verified"
+    ]
+    newest_verified = [
+        main_sha
+        for main_sha in verified_candidates
+        if not any(
+            main_sha != other and client.is_ancestor(main_sha, other)
+            for other in verified_candidates
+        )
+    ]
+    effective_verified_sha: str | None = None
+    if newest_verified:
+        effective_verified_sha = max(
+            newest_verified,
+            key=lambda main_sha: str(
+                (states[main_sha].get("latest_deploy") or {}).get("created_at") or ""
+            ),
+        )
+
+        class FixedBaseReleaseClient:
+            def __init__(self, wrapped: GitHub, base_sha: str) -> None:
+                self._wrapped = wrapped
+                self._base_sha = base_sha
+                self.config = replace(
+                    wrapped.config,
+                    pipeline=replace(
+                        wrapped.config.pipeline,
+                        pause_on_failure=False,
+                    ),
+                )
+
+            def base_sha(self) -> str:
+                return self._base_sha
+
+            def __getattr__(self, name: str) -> Any:
+                return getattr(self._wrapped, name)
+
+        finalized = command_follow(
+            FixedBaseReleaseClient(client, effective_verified_sha),
+            timeout_seconds=timeout_seconds,
+            poll_seconds=poll_seconds,
+            json_output=False,
+            emit=False,
+            admit_gate="verified",
+        )
+        if finalized.get("state") != "verified":
+            return finalized
+
+    def failure_time(value: dict[str, Any]) -> str:
+        run = value.get("latest_deploy") or value.get("latest_ci") or {}
+        return str(run.get("updated_at") or run.get("created_at") or "")
+
+    for main_sha, value in sorted(
+        states.items(), key=lambda item: failure_time(item[1]), reverse=True
+    ):
+        if effective_verified_sha and client.is_ancestor(
+            main_sha, effective_verified_sha
+        ):
             continue
         if value["state"] == "deploy-failed":
             if str((value.get("latest_deploy") or {}).get("conclusion") or "") == (
