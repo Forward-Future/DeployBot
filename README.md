@@ -345,10 +345,15 @@ commit SHA so an older score can never authorize a replacement head.
   start an MCP subprocess.
 - Claude Code: install the plugin under `adapters/claude-code`.
 - Cursor: copy the files under `adapters/cursor` or use its MCP configuration.
+  Cursor CLI can power an Astro source checkout by copying
+  `adapters/cursor/.cursor/mcp.astro.json` to `.cursor/mcp.json`; that config
+  launches the local `./packages/agent-merge-queue[mcp]` package instead of the
+  public release.
 - Other clients: connect `deploybot-mcp` over stdio or call the CLI directly.
 
 The Claude Code and Cursor MCP configurations launch the pinned public release
-with `uvx`.
+with `uvx`; the Astro Cursor CLI variant uses the same command against the
+source tree package.
 The `mergeq` and `mergeq-mcp` command aliases remain for compatibility.
 
 ## Command overview
