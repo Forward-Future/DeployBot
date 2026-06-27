@@ -179,6 +179,27 @@ class DeployBotSkillTest(unittest.TestCase):
         self.assertIn("never freeze a", rule)
         self.assertIn("queue merely to inspect it", rule)
 
+    def test_cursor_cli_can_use_astro_source_tree_package(self) -> None:
+        config = json.loads(
+            (
+                ROOT / "adapters" / "cursor" / ".cursor" / "mcp.astro.json"
+            ).read_text(encoding="utf-8")
+        )
+        args = config["mcpServers"]["deploybot"]["args"]
+
+        self.assertEqual(config["mcpServers"]["deploybot"]["command"], "uvx")
+        self.assertIn("./packages/agent-merge-queue[mcp]", args)
+        self.assertIn("deploybot-mcp", args)
+        self.assertNotIn(RELEASE_COMMIT, " ".join(args))
+
+    def test_readme_documents_cursor_cli_for_astro(self) -> None:
+        readme = (ROOT / "README.md").read_text(encoding="utf-8")
+
+        self.assertIn("Cursor CLI", readme)
+        self.assertIn("Astro source checkout", readme)
+        self.assertIn("mcp.astro.json", readme)
+        self.assertIn("./packages/agent-merge-queue[mcp]", readme)
+
     def test_github_workflow_wakes_after_named_ci_finishes(self) -> None:
         workflow = (ROOT / "examples" / "github-workflow.yml").read_text(
             encoding="utf-8"

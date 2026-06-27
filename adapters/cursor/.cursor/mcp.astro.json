@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "deploybot": {
+      "command": "uvx",
+      "args": [
+        "--from",
+        "./packages/agent-merge-queue[mcp]",
+        "deploybot-mcp"
+      ]
+    }
+  }
+}
